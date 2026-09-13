@@ -1,0 +1,82 @@
+schema_version: 1
+# Controlled artifact comparison: QUASAR (QAT) vs Ostfralla.
+# IDENTICAL template for both (CLI froggeric v22.5), identical sampling (1.0/0.95/20),
+# identical emission (post_thinking mirrors thinking => uniform). Only the artifact differs.
+targets:
+  qwen38_api:
+    protocol: openai_chat
+    base_url: http://127.0.0.1:18090/v1
+    model: qwen3.8-27b
+    max_concurrency: 2
+    request:
+      timeout_seconds: 86400
+      retries: 2
+      retry_interval_seconds: 10
+suites:
+  art_quasar:
+    jobs:
+      - id: aime25
+        backend: evalscope
+        dataset: aime25
+        target: qwen38_api
+        max_concurrency: 2
+        generation: &agq
+          temperature: 1.0
+          top_p: 0.95
+          top_k: 20
+          presence_penalty: 0.0
+          frequency_penalty: 0.0
+          max_tokens: 122880
+          seed: 42
+          extra_body:
+            enable_thinking: true
+            min_p: 0.0
+            post_thinking:
+              temperature: 1.0
+              top_p: 0.95
+              top_k: 20
+        backend_args: {judge_strategy: rule, dataset_hub: modelscope}
+      - id: aime26
+        backend: evalscope
+        dataset: aime26
+        target: qwen38_api
+        max_concurrency: 2
+        generation: *agq
+        backend_args: {judge_strategy: rule, dataset_hub: modelscope}
+
+  art_ostfralla:
+    jobs:
+      - id: aime25
+        backend: evalscope
+        dataset: aime25
+        target: qwen38_api
+        max_concurrency: 2
+        generation: &ago
+          temperature: 1.0
+          top_p: 0.95
+          top_k: 20
+          presence_penalty: 0.0
+          frequency_penalty: 0.0
+          max_tokens: 122880
+          seed: 42
+          extra_body:
+            enable_thinking: true
+            min_p: 0.0
+            post_thinking:
+              temperature: 1.0
+              top_p: 0.95
+              top_k: 20
+        backend_args: {judge_strategy: rule, dataset_hub: modelscope}
+      - id: aime26
+        backend: evalscope
+        dataset: aime26
+        target: qwen38_api
+        max_concurrency: 2
+        generation: *ago
+        backend_args: {judge_strategy: rule, dataset_hub: modelscope}
+
+runtime:
+  max_parallel_jobs: 1
+  runs_dir: eval/runs
+  progress: {enabled: true, refresh_seconds: 1, heartbeat_seconds: 900}
+  samples: {retention: all}

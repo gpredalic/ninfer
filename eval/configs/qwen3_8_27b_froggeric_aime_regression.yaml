@@ -1,0 +1,110 @@
+schema_version: 1
+
+# TASK 1 - Regression check for the Ostfralla artifact at temperature 0.7.
+#
+# Artifact: qwen3_8_27b_nvfp4-froggeric.ninfer (Ostfralla nvfp4 weights with the
+# froggeric chat template implanted). Reference: docs/maintainer/kv-nvfp4-yarn.md
+# records NVFP4 (262k) AIME 2025 = 29/30 = 96.7%, and its production
+# configuration for this artifact uses --temperature 0.7 --top-p 0.8.
+#
+# This suite asks ONE question: does the current build still reproduce the
+# reference AIME number on this artifact? It is NOT the post-thinking question.
+#
+# Both arms set post_thinking to mirror the thinking sampler, because the build
+# under test has has_post_thinking=true for registered models. Without that
+# override the answer phase would run at the registered 0.2 preset and the run
+# could never reproduce the pre-feature single-preset behavior.
+#
+#   ref_t07_p80 - temperature 0.7, top_p 0.80 (the documented production sampling)
+#   ref_t07_p95 - temperature 0.7, top_p 0.95 (temperature per the reference,
+#                 top_p per Qwen's thinking recommendation)
+
+targets:
+  qwen38_api:
+    protocol: openai_chat
+    base_url: http://127.0.0.1:18080/v1
+    model: qwen3.8-27b
+    max_concurrency: 2
+    request:
+      timeout_seconds: 86400
+      retries: 2
+      retry_interval_seconds: 10
+
+suites:
+  ref_t07_p80:
+    jobs:
+      - id: aime25
+        backend: evalscope
+        dataset: aime25
+        target: qwen38_api
+        max_concurrency: 2
+        generation: &ref_p80_generation
+          temperature: 0.7
+          top_p: 0.80
+          top_k: 20
+          presence_penalty: 0.0
+          frequency_penalty: 0.0
+          max_tokens: 122880
+          seed: 42
+          extra_body:
+            enable_thinking: true
+            min_p: 0.0
+            post_thinking:
+              temperature: 0.7
+              top_p: 0.80
+              top_k: 20
+              presence_penalty: 0.0
+              frequency_penalty: 0.0
+        backend_args: &aime_backend
+          judge_strategy: rule
+          dataset_hub: modelscope
+      - id: aime26
+        backend: evalscope
+        dataset: aime26
+        target: qwen38_api
+        max_concurrency: 2
+        generation: *ref_p80_generation
+        backend_args: *aime_backend
+
+  ref_t07_p95:
+    jobs:
+      - id: aime25
+        backend: evalscope
+        dataset: aime25
+        target: qwen38_api
+        max_concurrency: 2
+        generation: &ref_p95_generation
+          temperature: 0.7
+          top_p: 0.95
+          top_k: 20
+          presence_penalty: 0.0
+          frequency_penalty: 0.0
+          max_tokens: 122880
+          seed: 42
+          extra_body:
+            enable_thinking: true
+            min_p: 0.0
+            post_thinking:
+              temperature: 0.7
+              top_p: 0.95
+              top_k: 20
+              presence_penalty: 0.0
+              frequency_penalty: 0.0
+        backend_args: *aime_backend
+      - id: aime26
+        backend: evalscope
+        dataset: aime26
+        target: qwen38_api
+        max_concurrency: 2
+        generation: *ref_p95_generation
+        backend_args: *aime_backend
+
+runtime:
+  max_parallel_jobs: 1
+  runs_dir: eval/runs
+  progress:
+    enabled: true
+    refresh_seconds: 1
+    heartbeat_seconds: 900
+  samples:
+    retention: all
