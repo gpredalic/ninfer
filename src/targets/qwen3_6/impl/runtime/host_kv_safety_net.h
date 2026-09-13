@@ -113,6 +113,19 @@ struct HostKVSafetyNetEntry {
 
 
 
+    // Liveness: whether find() has ever matched this entry, and when it last
+    // did. Eviction treats entries that never matched, or that have been
+    // unmatched for longer than the dead TTL, as dead weight (evicted
+    // largest-first — they cost nothing to lose); live entries are evicted
+    // smallest-first (cheapest re-prefill). Updated by find() on the serve
+    // thread; mutable because find() is const.
+
+    mutable bool ever_matched = false;
+
+    mutable std::chrono::steady_clock::time_point last_matched{};
+
+
+
     // Pin flag: when set, the spill's LRU eviction loop skips this entry.
 
     // Used by the restore flow to prevent eviction during the reserve→start
@@ -442,6 +455,24 @@ public:
 
         // an empty net on a root admission is the common no-op case.
 
+        if (best) {
+
+            // Liveness: a hit proves the conversation is alive. Entries that
+
+            // never get here (client compacted the conversation, session died)
+
+            // become dead weight for the eviction loops. (const ref: the
+
+            // liveness fields are mutable.)
+
+            const HostKVSafetyNetEntry& matched = entries_[best->index];
+
+            matched.ever_matched = true;
+
+            matched.last_matched = std::chrono::steady_clock::now();
+
+        }
+
         if (!entries_.empty() || best) {
 
             std::fprintf(stderr,
@@ -486,6 +517,24 @@ public:
         return evictions_.load(std::memory_order_relaxed);
     }
 
+    // Cumulative entries dropped by supersede-on-add (a newer entry for the
+    // same conversation made them redundant). Monotonic; read by /stats.
+    [[nodiscard]] std::uint64_t superseded_count() const noexcept {
+        return superseded_.load(std::memory_order_relaxed);
+    }
+
+    // Dead-TTL for liveness-based eviction (see select_eviction_victim).
+    void set_dead_ttl(std::chrono::seconds ttl) noexcept { dead_ttl_ = ttl; }
+    [[nodiscard]] std::chrono::seconds dead_ttl() const noexcept { return dead_ttl_; }
+
+    // Pick the next eviction victim under the shared two-tier policy
+    // (dead-largest, then live-smallest). The spill loop drives the pinned
+    // phase through allow_pinned.
+    [[nodiscard]] std::optional<std::size_t> select_victim(bool allow_pinned) const noexcept {
+        return select_eviction_victim(entries_, std::chrono::steady_clock::now(), dead_ttl_,
+                                      allow_pinned);
+    }
+
     // Host KV pages and retained state images share ONE host memory budget. The
     // arena is the other tenant, so it is queried live instead of duplicating the
     // limit: neither pool may consume the other's headroom.
@@ -520,37 +569,68 @@ public:
                static_cast<std::size_t>(entry.backend_page_count);
     }
 
-    // Reclaim whole units until `incoming` fits the shared host budget. Eviction is
-    // cost-aware, NOT strict LRU: the smallest unit goes first, because re-prefilling a
-    // large context is far more expensive than re-prefilling a small one, and a large
-    // recent cache is worth keeping. Recency only breaks ties between units of
-    // comparable size. Returns false when the capture cannot be retained at all, so the
-    // caller degrades by not retaining instead of by growing host memory.
+    // Victim selection shared by both eviction loops (retain_state_capture and
+    // the spill's evict loop). Two tiers:
+    //   dead  — never matched, or unmatched for longer than the dead TTL.
+    //           The conversation is gone, so re-prefill cost is ZERO: evict
+    //           the LARGEST dead entry first (frees the most arena). This is
+    //           what reaps stale giants from compacted conversations.
+    //   live  — matched within the TTL. Re-prefill cost scales with context
+    //           length, so evict the SMALLEST first; oldest last-match breaks
+    //           ties. (plan.md's cost model, with liveness as the primary key.)
+    // Pinned entries are candidates only in the spill loop's phase 2
+    // (allow_pinned); they are always live (pinned right after a find hit).
+    [[nodiscard]] static std::optional<std::size_t>
+    select_eviction_victim(const std::vector<HostKVSafetyNetEntry>& entries,
+                           std::chrono::steady_clock::time_point now,
+                           std::chrono::seconds dead_ttl, bool allow_pinned) noexcept {
+        std::optional<std::size_t> dead;
+        std::size_t dead_size = 0;
+        std::optional<std::size_t> live;
+        std::size_t live_size = 0;
+        std::chrono::steady_clock::time_point live_time{};
+        for (std::size_t i = 0; i < entries.size(); ++i) {
+            const HostKVSafetyNetEntry& candidate = entries[i];
+            if (candidate.pinned && !allow_pinned) { continue; }
+            if (!is_complete_unit(candidate)) { continue; }
+            const bool is_dead = !candidate.ever_matched ||
+                                 (now - candidate.last_matched) > dead_ttl;
+            const std::size_t size = unit_context_pages(candidate);
+            if (is_dead) {
+                if (!dead || size > dead_size) { dead = i; dead_size = size; }
+            } else if (!live || size < live_size ||
+                       (size == live_size && candidate.last_matched < live_time)) {
+                live = i;
+                live_size = size;
+                live_time = candidate.last_matched;
+            }
+        }
+        if (dead) { return dead; }
+        return live;
+    }
+
+    // Reclaim whole units until `incoming` fits the shared host budget. Eviction
+    // is cost-aware (see select_eviction_victim): dead weight goes first
+    // (largest), then the smallest live unit. Returns false when the capture
+    // cannot be retained at all, so the caller degrades by not retaining
+    // instead of by growing host memory.
     [[nodiscard]] bool retain_state_capture(std::size_t incoming) noexcept {
         if (state_budget_bytes_ == 0) { return true; }
         if (incoming > state_budget_bytes_) { return false; }
         while (shared_occupied_bytes() + incoming > state_budget_bytes_) {
-            std::size_t victim      = entries_.size();
-            std::size_t victim_cost = 0;
-            for (std::size_t i = 0; i < entries_.size(); ++i) {
-                const HostKVSafetyNetEntry& candidate = entries_[i];
-                if (candidate.pinned || !is_complete_unit(candidate)) { continue; }
-                const std::size_t cost = unit_context_pages(candidate);
-                if (victim == entries_.size() || cost < victim_cost ||
-                    (cost == victim_cost && candidate.created < entries_[victim].created)) {
-                    victim      = i;
-                    victim_cost = cost;
-                }
-            }
-            if (victim == entries_.size()) { return false; }
+            const std::optional<std::size_t> victim =
+                select_eviction_victim(entries_, std::chrono::steady_clock::now(), dead_ttl_,
+                                       /*allow_pinned=*/false);
+            if (!victim) { return false; }
             std::fprintf(stderr,
                          "[host-state-pool] evict=%zu ctx_pages=%zu state_bytes=%zu retained=%zu "
-                         "shared=%zu budget=%zu (smallest-unit-first)\n",
-                         victim, victim_cost, entry_state_bytes(entries_[victim]),
+                         "shared=%zu budget=%zu (dead-largest, then live-smallest)\n",
+                         *victim, unit_context_pages(entries_[*victim]),
+                         entry_state_bytes(entries_[*victim]),
                          state_retained_bytes_, shared_occupied_bytes(), state_budget_bytes_);
             evictions_.fetch_add(1, std::memory_order_relaxed);
-            state_retained_bytes_ -= entry_state_bytes(entries_[victim]);
-            entries_.erase(entries_.begin() + static_cast<std::ptrdiff_t>(victim));
+            state_retained_bytes_ -= entry_state_bytes(entries_[*victim]);
+            entries_.erase(entries_.begin() + static_cast<std::ptrdiff_t>(*victim));
         }
         return true;
     }
@@ -576,6 +656,42 @@ public:
                          incoming_state_bytes, state_retained_bytes_, state_budget_bytes_);
             return;
         }
+
+        // Supersede: an existing entry whose effective prefix is a strict token
+        // prefix of the incoming entry's is redundant — every future match for
+        // it is also a match for the incoming (longer) entry, which find()
+        // prefers. Without this, a growing conversation accumulates one entry
+        // per eviction (30219, 30589, 31251, ...), each carrying a full state
+        // image, until the arena is full of strict-prefix duplicates.
+        const std::span<const TokenId> incoming_prefix =
+            entry.compact_prefix.empty()
+                ? std::span<const TokenId>(entry.ledger.data(), entry.ledger.size())
+                : std::span<const TokenId>(entry.compact_prefix.data(), entry.compact_prefix.size());
+        if (!incoming_prefix.empty()) {
+            for (std::size_t i = entries_.size(); i-- > 0;) {
+                HostKVSafetyNetEntry& old = entries_[i];
+                if (old.pinned) { continue; }  // a restore is in flight on it
+                const std::span<const TokenId> old_prefix =
+                    old.compact_prefix.empty()
+                        ? std::span<const TokenId>(old.ledger.data(), old.ledger.size())
+                        : std::span<const TokenId>(old.compact_prefix.data(),
+                                                  old.compact_prefix.size());
+                if (old_prefix.size() >= incoming_prefix.size()) { continue; }
+                bool is_prefix = true;
+                for (std::size_t t = 0; t < old_prefix.size(); ++t) {
+                    if (old_prefix[t] != incoming_prefix[t]) { is_prefix = false; break; }
+                }
+                if (!is_prefix) { continue; }
+                std::fprintf(stderr,
+                             "[safety-net] supersede: dropping frontier=%u (prefix of %zu) "
+                             "state_bytes=%zu\n",
+                             old.execution_frontier, incoming_prefix.size(),
+                             entry_state_bytes(old));
+                superseded_.fetch_add(1, std::memory_order_relaxed);
+                remove(i);
+            }
+        }
+
         state_retained_bytes_ += incoming_state_bytes;
         entry.entry_id = ++next_entry_id_;
 
@@ -724,6 +840,12 @@ private:
     // Live view of the other tenant of the shared host budget (KV pages).
     const HostKVArena* shared_arena_ = nullptr;
     std::atomic<std::uint64_t> evictions_{0};
+    // Entries dropped by supersede-on-add (a newer entry made them redundant).
+    std::atomic<std::uint64_t> superseded_{0};
+    // An entry unmatched for longer than this is dead weight (evicted
+    // largest-first). 15 minutes: a live conversation matches every turn, so
+    // silence this long means the conversation is gone (compacted, abandoned).
+    std::chrono::seconds dead_ttl_{15 * 60};
 
 };
 

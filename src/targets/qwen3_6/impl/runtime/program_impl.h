@@ -5892,19 +5892,13 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index) no
         // landmine guard in case the protocol ever changes.
         bool pinned_eviction_started = false;
         if (kv_copy_ok) while (host_kv_arena->free_bytes() < needed_total && host_kv_safety_net.size() > 0) {
-            std::optional<std::size_t> victim;
-            std::uint64_t victim_pages = 0;
-            for (std::size_t i = 0; i < host_kv_safety_net.size(); ++i) {
-                // Phase 1: only evict unpinned. Phase 2: also evict pinned.
-                if (!pinned_eviction_started && host_kv_safety_net.at(i).pinned) { continue; }
-                const std::uint64_t pages = static_cast<std::uint64_t>(host_kv_safety_net.at(i).text_page_count)
-                                          + host_kv_safety_net.at(i).backend_page_count;
-                if (!victim || pages < victim_pages ||
-                    (pages == victim_pages && host_kv_safety_net.at(i).created < host_kv_safety_net.at(victim.value()).created)) {
-                    victim = i;
-                    victim_pages = pages;
-                }
-            }
+            // Two-tier victim selection (dead-largest, then live-smallest —
+            // see HostKVSafetyNet::select_eviction_victim). Phase 1: unpinned
+            // only; phase 2: pinned entries too (a pinned victim makes the
+            // in-flight restore's take_pinned() throw, caught upstream as a
+            // root-prefill fallback).
+            const std::optional<std::size_t> victim =
+                host_kv_safety_net.select_victim(pinned_eviction_started);
             if (!victim) {
                 // All unpinned entries exhausted. Start evicting pinned entries.
                 if (!pinned_eviction_started) {
@@ -5919,13 +5913,16 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index) no
                 }
                 break;
             }
-            const bool was_pinned = host_kv_safety_net.at(victim.value()).pinned;
+            const bool was_pinned = host_kv_safety_net.at(*victim).pinned;
             std::fprintf(stderr,
-                         "[safety-spill] evict-smallest: index=%zu pages=%lu pinned=%d remaining=%zu free=%zu\n",
-                         victim.value(), static_cast<unsigned long>(victim_pages),
+                         "[safety-spill] evict: index=%zu pages=%lu pinned=%d remaining=%zu free=%zu\n",
+                         *victim,
+                         static_cast<unsigned long>(
+                             host_kv_safety_net.at(*victim).text_page_count +
+                             host_kv_safety_net.at(*victim).backend_page_count),
                          static_cast<int>(was_pinned),
                          host_kv_safety_net.size() - 1, host_kv_arena->free_bytes());
-            host_kv_safety_net.remove(victim.value());
+            host_kv_safety_net.remove(*victim);
         }
 
         // Check backend capacity (skip if kv_copy_ok is false).
@@ -6399,6 +6396,10 @@ std::uint32_t ProgramImplCore::host_kv_net_entries() const noexcept {
 
 std::uint64_t ProgramImplCore::host_kv_net_state_bytes() const noexcept {
     return host_kv_safety_net.retained_state_bytes();
+}
+
+std::uint64_t ProgramImplCore::host_kv_superseded_count() const noexcept {
+    return host_kv_safety_net.superseded_count();
 }
 
 std::uint64_t ProgramImplCore::host_slot_release_failures() const noexcept {
@@ -10004,7 +10005,8 @@ ReleaseResult ProgramImplCore::release_continuation(ContinuationHandle&& continu
     // work). Spill to the safety net before freeing — if the continuation
     // was actively reused (catalog rotation of a live session), the next
     // request restores from host instead of re-prefilling. If the session
-    // ended, the spilled entry just ages out of the LRU.
+    // ended, the entry is superseded by the conversation's next (larger)
+    // spill, or reaped by liveness-based eviction once it stops matching.
     spill_victim_to_host_kv_safety_net(index);
     release_continuation_slot(index);
     advance_resource_revision();

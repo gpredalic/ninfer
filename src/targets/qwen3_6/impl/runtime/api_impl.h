@@ -334,6 +334,11 @@ std::uint64_t Program<Variant>::host_kv_net_state_bytes() const noexcept {
 }
 
 template <>
+std::uint64_t Program<Variant>::host_kv_superseded_count() const noexcept {
+    return impl_ ? impl_->host_kv_superseded_count() : 0;
+}
+
+template <>
 std::uint64_t Program<Variant>::host_slot_release_failures() const noexcept {
     return impl_ ? impl_->host_slot_release_failures() : 0;
 }

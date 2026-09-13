@@ -733,6 +733,9 @@ public:
     // Host-KV safety-net gauges: entry count and retained state-image bytes.
     [[nodiscard]] std::uint32_t host_kv_net_entries() const noexcept;
     [[nodiscard]] std::uint64_t host_kv_net_state_bytes() const noexcept;
+    // Cumulative entries dropped by supersede-on-add (a newer entry for the
+    // same conversation made them redundant).
+    [[nodiscard]] std::uint64_t host_kv_superseded_count() const noexcept;
     // release() refusals in noexcept teardown paths (monotonic): each one
     // orphans the state object and its slots.
     [[nodiscard]] std::uint64_t host_slot_release_failures() const noexcept;

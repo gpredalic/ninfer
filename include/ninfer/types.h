@@ -895,6 +895,8 @@ struct RuntimeStats {
     // (the net's heap state images, distinct from the host state pool slots).
     std::uint32_t host_kv_net_entries     = 0;
     std::uint64_t host_kv_net_state_bytes = 0;
+    // Cumulative entries dropped by supersede-on-add (monotonic).
+    std::uint64_t host_kv_superseded = 0;
     // release() refusals in noexcept teardown paths (monotonic): each one
     // orphans the state object and its slots.
     std::uint64_t host_slot_release_failures = 0;

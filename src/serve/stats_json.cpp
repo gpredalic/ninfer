@@ -112,6 +112,7 @@ std::string format_stats_json(const StatsSnapshot& s) {
          json{{"single_alloc_failures", s.scheduler.host_kv_single_alloc_failures},
               {"compactions", s.scheduler.host_kv_compactions},
               {"evictions", s.scheduler.host_kv_evictions},
+              {"superseded", s.scheduler.host_kv_superseded},
               {"net_entries", s.scheduler.host_kv_net_entries},
               {"net_state_bytes", s.scheduler.host_kv_net_state_bytes}}},
         {"load",

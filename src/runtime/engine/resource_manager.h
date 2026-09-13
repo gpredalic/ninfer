@@ -1133,6 +1133,7 @@ public:
         out.state_pending_host_slots              = program.state_pending_host_slots();
         out.host_kv_net_entries                   = program.host_kv_net_entries();
         out.host_kv_net_state_bytes               = program.host_kv_net_state_bytes();
+        out.host_kv_superseded                    = program.host_kv_superseded_count();
         out.host_slot_release_failures            = program.host_slot_release_failures();
         out.historical_fork_hits            = context_stats_.historical_fork_hits;
         out.actual_context_transfer_seconds = context_stats_.actual_context_transfer_seconds;

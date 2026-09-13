@@ -583,6 +583,8 @@ public:
     // bytes (the net's heap state images, distinct from the host state pool).
     [[nodiscard]] std::uint32_t host_kv_net_entries() const noexcept;
     [[nodiscard]] std::uint64_t host_kv_net_state_bytes() const noexcept;
+    // Cumulative entries dropped by supersede-on-add (for /stats).
+    [[nodiscard]] std::uint64_t host_kv_superseded_count() const noexcept;
     // release() refusals in noexcept teardown paths (for /stats): each one
     // orphans the object and its slots.
     [[nodiscard]] std::uint64_t host_slot_release_failures() const noexcept;
