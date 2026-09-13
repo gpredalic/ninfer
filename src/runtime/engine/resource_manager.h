@@ -1121,6 +1121,11 @@ public:
         out.host_kv_single_alloc_failures = program.host_kv_single_alloc_failures();
         out.host_kv_compactions           = program.host_kv_compaction_count();
         out.host_kv_evictions             = program.host_kv_eviction_count();
+        out.materialize_state_slot_alloc_failures = program.materialize_state_slot_alloc_failures();
+        out.materialize_kv_page_alloc_failures    = program.materialize_kv_page_alloc_failures();
+        out.checkpoint_device_count               = program.checkpoint_device_count();
+        out.checkpoint_host_only_count            = program.checkpoint_host_only_count();
+        out.checkpoint_device_state_slots         = program.checkpoint_device_state_slots();
         out.historical_fork_hits            = context_stats_.historical_fork_hits;
         out.actual_context_transfer_seconds = context_stats_.actual_context_transfer_seconds;
 

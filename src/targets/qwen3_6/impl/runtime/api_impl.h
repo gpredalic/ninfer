@@ -273,6 +273,31 @@ std::uint64_t Program<Variant>::host_kv_eviction_count() const noexcept {
     return impl_ ? impl_->host_kv_eviction_count() : 0;
 }
 
+template <>
+std::uint64_t Program<Variant>::materialize_state_slot_alloc_failures() const noexcept {
+    return impl_ ? impl_->materialize_state_slot_alloc_failures() : 0;
+}
+
+template <>
+std::uint64_t Program<Variant>::materialize_kv_page_alloc_failures() const noexcept {
+    return impl_ ? impl_->materialize_kv_page_alloc_failures() : 0;
+}
+
+template <>
+std::uint32_t Program<Variant>::checkpoint_device_count() const noexcept {
+    return impl_ ? impl_->checkpoint_residency().device_count : 0;
+}
+
+template <>
+std::uint32_t Program<Variant>::checkpoint_host_only_count() const noexcept {
+    return impl_ ? impl_->checkpoint_residency().host_only_count : 0;
+}
+
+template <>
+std::uint32_t Program<Variant>::checkpoint_device_state_slots() const noexcept {
+    return impl_ ? impl_->checkpoint_residency().device_state_slots : 0;
+}
+
 
 template <>
 std::optional<ResourcePlan<Variant>>

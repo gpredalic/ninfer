@@ -567,6 +567,16 @@ public:
     [[nodiscard]] std::uint64_t host_kv_single_alloc_failures() const noexcept;
     [[nodiscard]] std::uint64_t host_kv_compaction_count() const noexcept;
     [[nodiscard]] std::uint64_t host_kv_eviction_count() const noexcept;
+    // Materialization allocation failures by resource (for /stats).
+    [[nodiscard]] std::uint64_t materialize_state_slot_alloc_failures() const noexcept;
+    [[nodiscard]] std::uint64_t materialize_kv_page_alloc_failures() const noexcept;
+    [[nodiscard]] StateImageStore::CheckpointResidency checkpoint_residency() const noexcept;
+    // Overcommit guard: demote coldest demotable checkpoints to host until the
+    // device state pool can satisfy `needed_device_slots`. Returns the number
+    // demoted. Called at the materialization reservation point, where the
+    // pressure planner's modeled (but uncommitted) demotions would otherwise
+    // leave the pool full.
+    [[nodiscard]] std::uint32_t demote_checkpoints_to_make_room(std::uint32_t needed_device_slots);
 
     [[nodiscard]] std::optional<AdmissionCandidate> seal_materialization(
         const AdmissionCandidate& admission, const PreparedPromptData& prompt,

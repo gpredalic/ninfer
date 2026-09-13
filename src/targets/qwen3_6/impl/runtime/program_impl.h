@@ -4659,6 +4659,39 @@ void ProgramImplCore::prepare_consumed_source(MaterializationTransaction& transa
     (void)checked_resource_difference(details.demand.final_removed, removed);
 }
 
+std::uint32_t ProgramImplCore::demote_checkpoints_to_make_room(std::uint32_t needed_device_slots) {
+    if (state_store == nullptr || host_state_images == nullptr) { return 0; }
+    std::uint32_t demoted = 0;
+    for (;;) {
+        const std::uint32_t free_slots =
+            state_store->device_capacity() - state_store->device_occupied();
+        if (free_slots >= needed_device_slots) { break; }
+        const std::optional<StateImageHandle> candidate =
+            state_store->coldest_demotable_checkpoint();
+        if (!candidate) { break; }
+        std::optional<StateImageTransfer> transfer =
+            state_store->begin_device_to_host(*candidate, device.transfer_stream);
+        if (!transfer) { break; }  // Host pool full or the candidate changed
+        try {
+            // Synchronous demotion: the device slot is released at publication,
+            // so the D2H copy must complete first (the safety-net spill uses the
+            // same pattern).
+            CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+            state_store->publish_transfer(std::move(*transfer), false);
+            ++demoted;
+        } catch (...) {
+            state_store->abort_transfer(std::move(*transfer));
+            break;
+        }
+    }
+    if (demoted > 0) {
+        std::fprintf(stderr,
+                     "[relief] demoted %u checkpoint state(s) to host (needed %u device slot(s))\n",
+                     demoted, needed_device_slots);
+    }
+    return demoted;
+}
+
 void ProgramImplCore::prepare_materialization(MaterializationTransaction& transaction) {
     if (transaction.prepared || !transaction.plan ||
         transaction.destination.value >= max_concurrency ||
@@ -4701,6 +4734,14 @@ void ProgramImplCore::prepare_materialization(MaterializationTransaction& transa
     }
 
     std::uint32_t state_count = demand.reservation_added.device.state_slots;
+    // Overcommit guard: the pressure planner's modeled plan may project a
+    // demotion the physical path never commits (search-budget exhaustion),
+    // leaving this materialization to reserve slots into a full device pool —
+    // the parallel-large-session bad_alloc. Perform the same relief
+    // deterministically here. state_count bounds the new reservations below
+    // (the source's own slot is restored/forked in place; each branch adds at
+    // most one destination).
+    (void)demote_checkpoints_to_make_room(state_count);
     std::optional<StateImageHandle> host_state_restore;
     std::optional<StateImageHandle> host_state_fork_destination;
     if (source_state != nullptr || shared_state != nullptr) {
@@ -6234,6 +6275,7 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index) no
         // An entry needs at least one state image for restore. Prefer the
         // endpoint state; if missing (state store evicted the endpoint),
         // fall back to the checkpoint state as the restore state.
+        bool endpoint_fallback = false;
         if (entry.state_bytes == 0 || entry.state_host.empty()) {
             // Endpoint state missing — fall back to the checkpoint state so the unit
             // still carries a state image (an entry without one is never retained).
@@ -6244,6 +6286,7 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index) no
                 entry.checkpoint_valid = false;
                 entry.checkpoint_state_bytes = 0;
                 entry.execution_frontier = checkpoint_frontier;
+                endpoint_fallback = true;
                 std::fprintf(stderr,
                              "[safety-spill] FALLBACK: using checkpoint state as endpoint "
                              "(index=%u frontier=%u ckpt_frontier=%u)\n",
@@ -6263,11 +6306,18 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index) no
                          "KV and state are one atomic unit, nothing retained\n",
                          index, sequence.execution_frontier);
         } else {
+            // Log the capture outcome (checkpoint_valid/checkpoint_frontier are the
+            // pre-fallback values: whether a checkpoint was captured at spill time).
+            // fallback=1 means the endpoint state was missing and the captured
+            // checkpoint was consumed as the restore state, so the entry's execution
+            // frontier is the (earlier) checkpoint frontier while the ledger keeps
+            // the full endpoint length.
             std::fprintf(stderr,
                          "[safety-spill] OK: index=%u frontier=%u ckpt_valid=%d ckpt_frontier=%u "
-                         "ledger=%zu identity=%zu\n",
+                         "fallback=%d ledger=%zu identity=%zu\n",
                          index, entry.execution_frontier, static_cast<int>(checkpoint_valid),
-                         checkpoint_frontier, entry.ledger.size(), entry.prefix_identity.size());
+                         checkpoint_frontier, static_cast<int>(endpoint_fallback),
+                         entry.ledger.size(), entry.prefix_identity.size());
             host_kv_safety_net.add(std::move(entry));
         }
     } catch (const std::exception& e) {
@@ -6301,6 +6351,22 @@ std::uint64_t ProgramImplCore::host_kv_compaction_count() const noexcept {
 
 std::uint64_t ProgramImplCore::host_kv_eviction_count() const noexcept {
     return host_kv_safety_net.eviction_count();
+}
+
+std::uint64_t ProgramImplCore::materialize_state_slot_alloc_failures() const noexcept {
+    return state_store ? state_store->state_slot_alloc_failures() : 0;
+}
+
+std::uint64_t ProgramImplCore::materialize_kv_page_alloc_failures() const noexcept {
+    std::uint64_t failures = decoder->text_kv.page_pool().reservation_failures();
+    if (const qwen3_6::PagedKVCache* backend = backend_kv_cache()) {
+        failures += backend->page_pool().reservation_failures();
+    }
+    return failures;
+}
+
+StateImageStore::CheckpointResidency ProgramImplCore::checkpoint_residency() const noexcept {
+    return state_store ? state_store->checkpoint_residency() : StateImageStore::CheckpointResidency{};
 }
 
 ProgramImplCore::PhysicalReleaseResult

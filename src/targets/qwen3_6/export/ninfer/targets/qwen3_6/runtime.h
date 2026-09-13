@@ -712,6 +712,15 @@ public:
     [[nodiscard]] std::uint64_t host_kv_single_alloc_failures() const noexcept;
     [[nodiscard]] std::uint64_t host_kv_compaction_count() const noexcept;
     [[nodiscard]] std::uint64_t host_kv_eviction_count() const noexcept;
+    // Materialization allocation failures by resource (for /stats): state-slot
+    // exhaustion (device state pool full) is the parallel-large-session bad_alloc
+    // signature; KV-page exhaustion rules the page pool in or out.
+    [[nodiscard]] std::uint64_t materialize_state_slot_alloc_failures() const noexcept;
+    [[nodiscard]] std::uint64_t materialize_kv_page_alloc_failures() const noexcept;
+    // Live checkpoint residency (gauge): how many device state slots checkpoints pin.
+    [[nodiscard]] std::uint32_t checkpoint_device_count() const noexcept;
+    [[nodiscard]] std::uint32_t checkpoint_host_only_count() const noexcept;
+    [[nodiscard]] std::uint32_t checkpoint_device_state_slots() const noexcept;
 
     [[nodiscard]] std::optional<ResourcePlan<Variant>>
     seal_identity(const AdmissionCandidate<Variant>& candidate, const PreparedPrompt& prompt);

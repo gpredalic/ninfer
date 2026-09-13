@@ -867,6 +867,18 @@ struct RuntimeStats {
     std::uint64_t host_kv_single_alloc_failures = 0;
     std::uint64_t host_kv_compactions           = 0;
     std::uint64_t host_kv_evictions             = 0;
+    // Materialization allocation failures by resource (monotonic): the plan
+    // projected feasibility, but the physical reservation ran out. State-slot
+    // exhaustion (device state pool full) is the 2026-09 parallel-large-session
+    // bad_alloc signature; KV-page and host-arena failures rule the others in
+    // or out.
+    std::uint64_t materialize_state_slot_alloc_failures = 0;
+    std::uint64_t materialize_kv_page_alloc_failures    = 0;
+    // Checkpoint residency (gauge): live checkpoint state images and the
+    // device slots they pin.
+    std::uint32_t checkpoint_device_count       = 0;
+    std::uint32_t checkpoint_host_only_count    = 0;
+    std::uint32_t checkpoint_device_state_slots = 0;
     std::uint32_t shared_active_references             = 0;
     std::uint64_t historical_fork_hits                 = 0;
     double actual_context_transfer_seconds             = 0.0;

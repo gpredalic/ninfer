@@ -233,6 +233,14 @@ std::uint32_t DeviceKVPagePool::available_pages() const noexcept {
     return capacity_pages() - allocated_pages_ - reserved_pages_;
 }
 
+std::uint64_t DeviceKVPagePool::reservation_failures() const noexcept {
+    return reservation_failures_.load(std::memory_order_relaxed);
+}
+
+void DeviceKVPagePool::count_reservation_failure() noexcept {
+    reservation_failures_.fetch_add(1, std::memory_order_relaxed);
+}
+
 std::size_t DeviceKVPagePool::plane_count() const noexcept { return planes_.size(); }
 
 const Tensor& DeviceKVPagePool::plane(std::size_t index) const { return planes_.at(index); }
@@ -251,7 +259,11 @@ DeviceKVPagePool::contiguous_run_count(std::span<const DeviceKVPageHandle> pages
 }
 
 std::optional<DeviceKVPageReservation> DeviceKVPagePool::reserve(std::uint32_t pages) noexcept {
-    if (pages == 0 || pages > available_pages()) { return std::nullopt; }
+    if (pages == 0) { return std::nullopt; }
+    if (pages > available_pages()) {
+        count_reservation_failure();
+        return std::nullopt;
+    }
     reserved_pages_ += pages;
     return DeviceKVPageReservation(*this, pages);
 }
@@ -267,7 +279,10 @@ bool DeviceKVPagePool::can_resize_reservation(const DeviceKVPageReservation& res
 
 void DeviceKVPagePool::resize_reservation(DeviceKVPageReservation& reservation,
                                           std::uint32_t new_reserved_pages) {
-    if (!can_resize_reservation(reservation, new_reserved_pages)) { throw std::bad_alloc(); }
+    if (!can_resize_reservation(reservation, new_reserved_pages)) {
+        count_reservation_failure();
+        throw std::bad_alloc();
+    }
     reserved_pages_    = reserved_pages_ - reservation.pages_ + new_reserved_pages;
     reservation.pages_ = new_reserved_pages;
 }
@@ -695,7 +710,10 @@ reserve_device_kv_page_bundle(std::span<const DeviceKVPageReservationRequest> re
                 throw std::invalid_argument("Paged KV bundle names the same pool twice");
             }
         }
-        if (request.pages > request.pool->available_pages()) { throw std::bad_alloc(); }
+        if (request.pages > request.pool->available_pages()) {
+            request.pool->count_reservation_failure();
+            throw std::bad_alloc();
+        }
     }
 
     std::vector<DeviceKVPageReservation> reservations;

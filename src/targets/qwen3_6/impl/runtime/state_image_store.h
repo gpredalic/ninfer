@@ -141,6 +141,59 @@ public:
         return host_ == nullptr ? 0U : host_->occupied();
     }
 
+    // Live checkpoint state images and the device slots they pin (for /stats).
+    // Checkpoints are the device-state relief the pressure planner can demote
+    // to host; this gauge shows how much of the device pool they hold.
+    struct CheckpointResidency {
+        std::uint32_t device_count       = 0;  // CheckpointImmutable with a device replica
+        std::uint32_t host_only_count    = 0;  // CheckpointImmutable with only a host replica
+        std::uint32_t device_state_slots = 0;  // device slots held by checkpoint images
+    };
+    [[nodiscard]] CheckpointResidency checkpoint_residency() const noexcept {
+        CheckpointResidency out;
+        for (const Object& object : objects_) {
+            if (object.role != StateImageRole::CheckpointImmutable) { continue; }
+            if (object.device_slot) {
+                ++out.device_count;
+                ++out.device_state_slots;
+            } else if (object.host_slot) {
+                ++out.host_only_count;
+            }
+        }
+        return out;
+    }
+
+    // Overcommit guard (coldest-first): the least-recently-frozen demotable
+    // checkpoint — CheckpointImmutable with a device replica, no host replica,
+    // no pending transfer, not pinned. The materialization relief path demotes
+    // these to host to free device slots when the pool is full. Active decode
+    // states (ActiveMutable) are never candidates; the store's physical gates
+    // (reserve_device_to_host) remain authoritative at demotion time.
+    [[nodiscard]] std::optional<StateImageHandle> coldest_demotable_checkpoint() const noexcept {
+        std::optional<StateImageHandle> best;
+        std::uint64_t best_epoch = 0;
+        for (std::size_t index = 0; index < objects_.size(); ++index) {
+            const Object& object = objects_[index];
+            if (object.role != StateImageRole::CheckpointImmutable || !object.device_slot ||
+                object.host_slot || has_pending_replica(object) ||
+                object.source_pins == std::numeric_limits<std::uint32_t>::max()) {
+                continue;
+            }
+            if (!best || object.content_epoch < best_epoch) {
+                best = StateImageHandle(this, static_cast<std::uint32_t>(index), object.generation);
+                best_epoch = object.content_epoch;
+            }
+        }
+        return best;
+    }
+
+    // Device state-slot allocation attempts that returned nothing because the
+    // pool was exhausted (for /stats). This is the direct signature of the
+    // 6/6 device-state-pool-full bad_alloc under parallel large sessions.
+    [[nodiscard]] std::uint64_t state_slot_alloc_failures() const noexcept {
+        return state_slot_alloc_failures_;
+    }
+
     [[nodiscard]] std::optional<StateImageHandle> reserve_destination() noexcept {
         return allocate(StateImageRole::ReservedDestination, true);
     }
@@ -654,6 +707,7 @@ private:
                                                            bool with_device) noexcept {
         if (free_object_count_ == 0 || role == StateImageRole::Free ||
             (with_device && free_device_count_ == 0)) {
+            ++state_slot_alloc_failures_;
             return std::nullopt;
         }
         const std::uint32_t index = free_objects_[--free_object_count_];
@@ -719,6 +773,7 @@ private:
     std::vector<std::int32_t> free_device_slots_;
     std::uint32_t free_object_count_  = 0;
     std::uint32_t free_device_count_  = 0;
+    std::uint64_t state_slot_alloc_failures_ = 0;
     std::uint64_t next_content_epoch_ = 0;
     std::uint64_t next_transfer_id_   = 0;
 };
