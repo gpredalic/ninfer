@@ -1669,6 +1669,21 @@ std::optional<qwen3_6::detail::PressureDecision> ProgramImplCore::inspect_pressu
             change = endpoint_drop;
         } else if (residual.device.state_slots != 0 &&
                    residency == StateReplicaResidency::DeviceOnly && host_state_images != nullptr) {
+            // Physical gate: model a demote only when the host pool can satisfy
+            // it. A free slot satisfies it directly; a dual-resident
+            // checkpoint's redundant host replica can be freed on demand
+            // (make_host_slot_available, hooked into reserve_device_to_host).
+            // Demotes modeled earlier in this option list each consume one net
+            // slot, so account for them cumulatively — without this, a plan
+            // could seal more demotes than the pool can ever satisfy, and the
+            // execution would throw (the parallel-large-session bad_alloc).
+            const std::int64_t host_headroom =
+                static_cast<std::int64_t>(host_state_images->capacity() -
+                                         host_state_images->occupied()) +
+                static_cast<std::int64_t>(state_store->residency_histogram().dual_resident) -
+                (static_cast<std::int64_t>(extension_effect.added.host.state_slots) -
+                 static_cast<std::int64_t>(extension_effect.removed.host.state_slots));
+            if (host_headroom <= 0) { return false; }
             change = endpoint_demote;
             ++option.effect.added.host.state_slots;
             append_pressure_transfer(option, state_transfer_requirement(
@@ -5617,7 +5632,14 @@ void ProgramImplCore::prepare_pressure_work(MaterializationTransaction::Pressure
             if (!source) { throw std::logic_error("pressure State transfer has no source"); }
             std::optional<StateImageTransfer> transfer =
                 state_store->begin_device_to_host(*source, device.transfer_stream);
-            if (!transfer) { throw std::bad_alloc(); }
+            if (!transfer) {
+                // Controlled failure: the pool state changed after planning
+                // (no free slot and no dual-resident replica to free). The
+                // outer catch converts this into a graceful abort-to-root-
+                // prefill instead of a worker OOM.
+                throw std::logic_error(
+                    "pressure relief unavailable: host state pool full (state demote)");
+            }
             change.transfer.emplace(std::move(*transfer));
         }
     }
@@ -5669,7 +5691,13 @@ void ProgramImplCore::prepare_pressure_work(MaterializationTransaction::Pressure
         if (!host_kv_extents) { throw std::logic_error("Host KV extent store is unavailable"); }
         std::optional<HostKVExtentReservation> reserved =
             host_kv_extents->prepare(pages, change.pages);
-        if (!reserved) { throw std::bad_alloc(); }
+        if (!reserved) {
+            // Controlled failure: the arena cannot take the demoted pages
+            // (fragmentation beyond compaction, or capacity). The outer catch
+            // converts this into a graceful abort-to-root-prefill.
+            throw std::logic_error(
+                "pressure relief unavailable: host KV arena (KV demote)");
+        }
         if (change.sources.size() != change.pages.size()) {
             throw std::logic_error("pressure KV source backing was not prepared");
         }
@@ -6739,6 +6767,20 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
                         }
                     });
             }
+        } catch (const std::logic_error& e) {
+            (void)cudaStreamSynchronize(device.transfer_stream);
+            for_each_pending_pressure(
+                [&](MaterializationTransaction::PressureWork& work) { abort_pressure_work(work); });
+            if (std::strstr(e.what(), "pressure relief unavailable") != nullptr) {
+                // A modeled relief action could not execute (pool state changed
+                // after planning). Degrade, don't OOM: abort this materialization
+                // so the engine re-queues the request as a root prefill.
+                std::fprintf(stderr,
+                             "[materialize] %s — aborting to root prefill\n", e.what());
+                abort_transaction();
+                return out;
+            }
+            throw;
         } catch (...) {
             (void)cudaStreamSynchronize(device.transfer_stream);
             for_each_pending_pressure(

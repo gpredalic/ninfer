@@ -259,9 +259,13 @@ public:
         }
 
         const Clock::time_point search_started = Clock::now();
-        const std::uint64_t search_budget_ns =
-            std::min<std::uint64_t>(5'000'000ULL, incumbent.cost.total_ns / 20U);
-        const std::uint64_t guided_watchdog_ns = search_budget_ns;
+        // No time budget: the search terminates on its structural conditions
+        // (queue exhaustion, model-optimal, value-of-next-expansion, the
+        // 4096-target budget, expansion capacity). The old fixed 5 ms cap
+        // (min(5ms, incumbent/20)) did not grow with problem size, so under
+        // load 83-100% of searches exhausted it and sealed whatever
+        // incumbent happened to be seeded — the over-commit that produced
+        // bad_alloc. Planning elapsed time is still reported per request.
         std::uint64_t maximum_step_ns          = 0;
         std::uint32_t optional_targets         = 0;
         std::uint32_t guided_assessments       = 0;
@@ -455,7 +459,6 @@ public:
                   });
         for (const IdentityRoot& root : closure_order) {
             if (!candidate_needs_seed(root.candidate_index) ||
-                elapsed_ns(search_started, Clock::now()) >= guided_watchdog_ns ||
                 optional_targets >= kTargetBudget) {
                 continue;
             }
@@ -480,7 +483,6 @@ public:
         // candidate and can no longer let a shallow Root path starve a deeper reuse path.
         while (has_open_seed() && !guided_.empty() &&
                guided_assessments < kGuidedAssessmentBudget) {
-            if (elapsed_ns(search_started, Clock::now()) >= guided_watchdog_ns) { break; }
             const GuidedEntry next = guided_pop();
             if (!candidate_needs_seed(next.candidate_index) || contains(expanded_, next.target)) {
                 continue;
@@ -509,7 +511,6 @@ public:
                 maximum_step_ns = std::max(maximum_step_ns, elapsed_ns(step_started, Clock::now()));
             }
             if (!exact || !candidate_needs_seed(next.candidate_index)) { continue; }
-            if (elapsed_ns(search_started, Clock::now()) >= guided_watchdog_ns) { break; }
             const Clock::time_point step_started = Clock::now();
             if (!expand_target(*exact)) { break; }
             maximum_step_ns = std::max(maximum_step_ns, elapsed_ns(step_started, Clock::now()));
@@ -537,13 +538,6 @@ public:
             if (next_bound > incumbent.cost.total_ns) {
                 stop_reason   = MaterializationStopReason::ModelOptimal;
                 model_optimal = true;
-                break;
-            }
-            const std::uint64_t elapsed = elapsed_ns(search_started, Clock::now());
-            if (elapsed >= search_budget_ns) {
-                stop_reason      = MaterializationStopReason::TimeBudget;
-                model_optimal    = false;
-                budget_exhausted = true;
                 break;
             }
             const std::uint64_t possible_improvement =
