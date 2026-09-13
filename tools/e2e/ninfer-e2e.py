@@ -825,6 +825,8 @@ def main():
     p.add_argument("--max-output-tokens", type=int, default=48)
     p.add_argument("--serve-log", default="/home/zenz/ninfer-serve.log")
     p.add_argument("--timeout", type=int, default=120)
+    p.add_argument("--start-phase", type=int, default=1,
+                   help="run phases N..11 (for split runs across separate e2e server windows)")
     args = p.parse_args()
 
     # Verify we're running against the test server, not production.
@@ -858,7 +860,23 @@ def main():
     print(f"Server config OK: host-kv={host_kv / 1024**3:.1f} GiB, KV pages={kv_pages}")
 
     all_verdicts = []
+    phases = (phase_1, phase_2, phase_3, phase_4, phase_5, phase_6, phase_7,
+              phase_8, phase_9, phase_10, phase_11)
+    for i, phase_fn in enumerate(phases, start=1):
+        if i < args.start_phase:
+            print(f"=== Phase {i}: skipped (--start-phase {args.start_phase}) ===")
+            continue
+        result = phase_fn(args)
+        if result is None:
+            return 1  # phase aborted
+        all_verdicts.extend(result)
+        for pn, v in result:
+            print(f"  [{pn}] {v}")
+    return print_summary(all_verdicts)
 
+
+def phase_1(args):
+    all_verdicts = []
     # Phase 1: pressure — 4 sessions, basic safety net
     print("\n=== Phase 1: pressure (4 sessions, 8 rounds) ===")
     log_off = count_log_lines(args.serve_log)
@@ -869,12 +887,16 @@ def main():
         errors = run_round(s1, r, args.timeout)
         if errors:
             for n, e in errors: print(f"  ERROR {n}: {e}")
-            print("ABORT: phase 1 failed"); return 1
+            print("ABORT: phase 1 failed"); return None
     stats1 = get_stats(args)
     log1 = parse_serve_log(args.serve_log, log_off)
     for v in evaluate("pressure", s1, stats0, stats1, log1):
         all_verdicts.append(("pressure", v))
+    return all_verdicts
 
+
+def phase_2(args):
+    all_verdicts = []
     # Phase 2: mixed — 1 big + 3 small, eviction order
     print("\n=== Phase 2: mixed (1 BIG + 3 small, 10 rounds) ===")
     log_off = count_log_lines(args.serve_log)
@@ -903,7 +925,11 @@ def main():
     log2 = parse_serve_log(args.serve_log, log_off)
     for v in evaluate("mixed", s2, stats0, stats1, log2):
         all_verdicts.append(("mixed", v))
+    return all_verdicts
 
+
+def phase_3(args):
+    all_verdicts = []
     # Phase 3: trash — 10 sessions, graceful degradation (no crash)
     print("\n=== Phase 3: trash (10 sessions, 6 rounds) ===")
     log_off = count_log_lines(args.serve_log)
@@ -928,7 +954,11 @@ def main():
     log3 = parse_serve_log(args.serve_log, log_off)
     for v in evaluate("trash", s3, stats0, stats1, log3, expect_trash=True):
         all_verdicts.append(("trash", v))
+    return all_verdicts
 
+
+def phase_4(args):
+    all_verdicts = []
     # Phase 4: thinking — session-key fallback with rewrite checkpoint
     print("\n=== Phase 4: thinking (3 sessions, 6 rounds, reasoning mode) ===")
     log_off = count_log_lines(args.serve_log)
@@ -996,7 +1026,11 @@ def main():
         cold = sum(1 for s in s4 for t in s.turns if t["turn"] > 1 and t["wall_s"] > 60)
         if cold > 0:
             all_verdicts.append(("thinking", f"WARN: {cold} cold-starts in thinking mode (session-key fallback may not have fired)"))
+    return all_verdicts
 
+
+def phase_5(args):
+    all_verdicts = []
     # Phase 5: checkpoint-advance — single session, verify frontier advances
     print("\n=== Phase 5: checkpoint-advance (1 session, 8 turns) ===")
     log_off = count_log_lines(args.serve_log)
@@ -1047,7 +1081,11 @@ def main():
         all_verdicts.append(("checkpoint-advance", f"PASS: 0 cold-starts across {len(s5[0].turns)} turns"))
     elif cold > 0:
         all_verdicts.append(("checkpoint-advance", f"FAIL: {cold} cold-starts — checkpoint not reused"))
+    return all_verdicts
 
+
+def phase_6(args):
+    all_verdicts = []
     # Phase 6: tool-calling — multi-turn with tools, simulating Claude Code
     print("\n=== Phase 6: tool-calling (1 session, 6 turns, tools) ===")
     log_off = count_log_lines(args.serve_log)
@@ -1075,7 +1113,11 @@ def main():
         all_verdicts.append(("tool-calling", f"PASS: 0 cold-starts across {len(s6[0].turns)} tool-call turns"))
     elif cold > 0:
         all_verdicts.append(("tool-calling", f"WARN: {cold} cold-starts during tool-calling"))
+    return all_verdicts
 
+
+def phase_7(args):
+    all_verdicts = []
     # Phase 7: responses-tools — Responses API tool-calling with checkpoint reuse
     print("\n=== Phase 7: responses-tools (1 session, 5 turns, Responses API) ===")
     log_off = count_log_lines(args.serve_log)
@@ -1094,7 +1136,7 @@ def main():
             errors = run_round(s7, r, args.timeout)
             if errors:
                 for n, e in errors: print(f"  ERROR {n}: {e}")
-                print("ABORT: phase 7 failed"); return 1
+                print("ABORT: phase 7 failed"); return None
     stats1 = get_stats(args)
     log7 = parse_serve_log(args.serve_log, log_off)
     for v in evaluate("responses-tools", s7, stats0, stats1, log7):
@@ -1104,7 +1146,11 @@ def main():
         all_verdicts.append(("responses-tools", f"PASS: 0 cold-starts across {len(s7[0].turns)} Responses API turns"))
     elif cold > 0:
         all_verdicts.append(("responses-tools", f"WARN: {cold} cold-starts in Responses API"))
+    return all_verdicts
 
+
+def phase_8(args):
+    all_verdicts = []
     # Phase 8: reasoning-effort — verify tier mapping (high, minimal, max, low, medium)
     print("\n=== Phase 8: reasoning-effort (5 effort levels) ===")
     log_off = count_log_lines(args.serve_log)
@@ -1115,7 +1161,11 @@ def main():
     log8 = parse_serve_log(args.serve_log, log_off)
     for v in evaluate("reasoning-effort", [tester], stats0, stats1, log8):
         all_verdicts.append(("reasoning-effort", v))
+    return all_verdicts
 
+
+def phase_9(args):
+    all_verdicts = []
     # Phase 9: concurrent — 2 sessions + title-gen, verify no cross-session destruction
     print("\n=== Phase 9: concurrent (2 sessions + title-gen, 6 rounds) ===")
     log_off = count_log_lines(args.serve_log)
@@ -1150,7 +1200,11 @@ def main():
     log9 = parse_serve_log(args.serve_log, log_off)
     for v in evaluate("concurrent", all_sessions_9, stats0, stats1, log9):
         all_verdicts.append(("concurrent", v))
+    return all_verdicts
 
+
+def phase_10(args):
+    all_verdicts = []
     # Phase 10: thinking-sig — verify signature skip when preserve_thinking=false
     print("\n=== Phase 10: thinking-sig (4 requests) ===")
     log_off = count_log_lines(args.serve_log)
@@ -1161,7 +1215,11 @@ def main():
     log10 = parse_serve_log(args.serve_log, log_off)
     for v in evaluate("thinking-sig", [sig_tester], stats0, stats1, log10):
         all_verdicts.append(("thinking-sig", v))
+    return all_verdicts
 
+
+def phase_11(args):
+    all_verdicts = []
     # Phase 11: demotion — 3 sessions, large prompts, verify checkpoint demotion
     print("\n=== Phase 11: demotion (3 sessions, 5 rounds, verify host demotion) ===")
     log_off = count_log_lines(args.serve_log)
@@ -1191,7 +1249,10 @@ def main():
         all_verdicts.append(("demotion", f"PASS: 0 cold-starts across {sum(len(s.turns) for s in s11)} turns"))
     elif cold > 0:
         all_verdicts.append(("demotion", f"WARN: {cold} cold-starts — demotion may not have prevented all re-prefills"))
+    return all_verdicts
 
+
+def print_summary(all_verdicts):
     # Summary
     print("\n=== FINAL VERDICTS ===")
     for pn, v in all_verdicts:
