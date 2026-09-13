@@ -284,6 +284,16 @@ std::uint64_t Program<Variant>::materialize_kv_page_alloc_failures() const noexc
 }
 
 template <>
+std::uint64_t Program<Variant>::materialize_kv_page_alloc_failures_main() const noexcept {
+    return impl_ ? impl_->materialize_kv_page_alloc_failures_main() : 0;
+}
+
+template <>
+std::uint64_t Program<Variant>::materialize_kv_page_alloc_failures_backend() const noexcept {
+    return impl_ ? impl_->materialize_kv_page_alloc_failures_backend() : 0;
+}
+
+template <>
 std::uint32_t Program<Variant>::checkpoint_device_count() const noexcept {
     return impl_ ? impl_->checkpoint_residency().device_count : 0;
 }
@@ -296,6 +306,36 @@ std::uint32_t Program<Variant>::checkpoint_host_only_count() const noexcept {
 template <>
 std::uint32_t Program<Variant>::checkpoint_device_state_slots() const noexcept {
     return impl_ ? impl_->checkpoint_residency().device_state_slots : 0;
+}
+
+template <>
+std::uint32_t Program<Variant>::state_dual_resident_count() const noexcept {
+    return impl_ ? impl_->residency_histogram().dual_resident : 0;
+}
+
+template <>
+std::uint32_t Program<Variant>::state_active_with_host_count() const noexcept {
+    return impl_ ? impl_->residency_histogram().active_with_host : 0;
+}
+
+template <>
+std::uint32_t Program<Variant>::state_pending_host_slots() const noexcept {
+    return impl_ ? impl_->residency_histogram().pending_host_slots : 0;
+}
+
+template <>
+std::uint32_t Program<Variant>::host_kv_net_entries() const noexcept {
+    return impl_ ? impl_->host_kv_net_entries() : 0;
+}
+
+template <>
+std::uint64_t Program<Variant>::host_kv_net_state_bytes() const noexcept {
+    return impl_ ? impl_->host_kv_net_state_bytes() : 0;
+}
+
+template <>
+std::uint64_t Program<Variant>::host_slot_release_failures() const noexcept {
+    return impl_ ? impl_->host_slot_release_failures() : 0;
 }
 
 

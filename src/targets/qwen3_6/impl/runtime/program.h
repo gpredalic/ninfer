@@ -23,6 +23,7 @@
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <unordered_map>
 #include <cstdint>
@@ -570,7 +571,24 @@ public:
     // Materialization allocation failures by resource (for /stats).
     [[nodiscard]] std::uint64_t materialize_state_slot_alloc_failures() const noexcept;
     [[nodiscard]] std::uint64_t materialize_kv_page_alloc_failures() const noexcept;
+    // Per-pool KV reservation failures: main (attention) vs backend (MTP/DFlash)
+    // — the summed counter cannot say which pool is binding.
+    [[nodiscard]] std::uint64_t materialize_kv_page_alloc_failures_main() const noexcept;
+    [[nodiscard]] std::uint64_t materialize_kv_page_alloc_failures_backend() const noexcept;
     [[nodiscard]] StateImageStore::CheckpointResidency checkpoint_residency() const noexcept;
+    // Full state-slot residency census (for /stats): explains host-pool occupancy
+    // including the classes checkpoint_residency() cannot see.
+    [[nodiscard]] StateImageStore::ResidencyHistogram residency_histogram() const noexcept;
+    // Host-KV safety-net gauges (for /stats): entry count and retained state-image
+    // bytes (the net's heap state images, distinct from the host state pool).
+    [[nodiscard]] std::uint32_t host_kv_net_entries() const noexcept;
+    [[nodiscard]] std::uint64_t host_kv_net_state_bytes() const noexcept;
+    // release() refusals in noexcept teardown paths (for /stats): each one
+    // orphans the object and its slots.
+    [[nodiscard]] std::uint64_t host_slot_release_failures() const noexcept;
+    // release() with leak accounting: the noexcept teardown paths drop the
+    // handle regardless, so a refusal orphans the object — count and log it.
+    void try_release_state_image(StateImageHandle handle, const char* context) noexcept;
     // Overcommit guard: demote coldest demotable checkpoints to host until the
     // device state pool can satisfy `needed_device_slots`. Returns the number
     // demoted. Called at the materialization reservation point, where the
@@ -761,6 +779,11 @@ private:
     std::uint64_t resource_revision_            = 1;
     std::uint32_t pressure_planning_generation_ = 0;
     bool pressure_planning_active_              = false;
+    // release() refusals in the noexcept teardown paths: each one orphans the
+    // object (and its device/host slots) because the handle is dropped anyway.
+    // Counted so the leak surfaces in /stats instead of being silently
+    // swallowed.
+    std::atomic<std::uint64_t> host_slot_release_failures_{0};
 
     struct PressurePageScratchSlot {
         std::uint32_t generation     = 0;

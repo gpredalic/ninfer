@@ -874,11 +874,30 @@ struct RuntimeStats {
     // or out.
     std::uint64_t materialize_state_slot_alloc_failures = 0;
     std::uint64_t materialize_kv_page_alloc_failures    = 0;
+    // Per-pool KV reservation failures: the summed counter cannot say which
+    // pool (main attention vs MTP/DFlash backend) is binding.
+    std::uint64_t materialize_kv_page_alloc_failures_main    = 0;
+    std::uint64_t materialize_kv_page_alloc_failures_backend = 0;
     // Checkpoint residency (gauge): live checkpoint state images and the
     // device slots they pin.
     std::uint32_t checkpoint_device_count       = 0;
     std::uint32_t checkpoint_host_only_count    = 0;
     std::uint32_t checkpoint_device_state_slots = 0;
+    // State-slot residency census (gauge): the host-pool occupancy classes that
+    // checkpoint residency cannot see. dual_resident = objects holding both a
+    // device and a host replica (invisible inside checkpoint_device_count);
+    // active_with_host = thawed ActiveMutables holding a host replica (no code
+    // path drops those); pending_host_slots = in-flight D2H transfers.
+    std::uint32_t state_dual_resident_count    = 0;
+    std::uint32_t state_active_with_host_count = 0;
+    std::uint32_t state_pending_host_slots     = 0;
+    // Host-KV safety-net gauges: entry count and retained state-image bytes
+    // (the net's heap state images, distinct from the host state pool slots).
+    std::uint32_t host_kv_net_entries     = 0;
+    std::uint64_t host_kv_net_state_bytes = 0;
+    // release() refusals in noexcept teardown paths (monotonic): each one
+    // orphans the state object and its slots.
+    std::uint64_t host_slot_release_failures = 0;
     std::uint32_t shared_active_references             = 0;
     std::uint64_t historical_fork_hits                 = 0;
     double actual_context_transfer_seconds             = 0.0;

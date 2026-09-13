@@ -717,10 +717,25 @@ public:
     // signature; KV-page exhaustion rules the page pool in or out.
     [[nodiscard]] std::uint64_t materialize_state_slot_alloc_failures() const noexcept;
     [[nodiscard]] std::uint64_t materialize_kv_page_alloc_failures() const noexcept;
+    // Per-pool KV reservation failures: main (attention) vs backend (MTP/DFlash).
+    [[nodiscard]] std::uint64_t materialize_kv_page_alloc_failures_main() const noexcept;
+    [[nodiscard]] std::uint64_t materialize_kv_page_alloc_failures_backend() const noexcept;
     // Live checkpoint residency (gauge): how many device state slots checkpoints pin.
     [[nodiscard]] std::uint32_t checkpoint_device_count() const noexcept;
     [[nodiscard]] std::uint32_t checkpoint_host_only_count() const noexcept;
     [[nodiscard]] std::uint32_t checkpoint_device_state_slots() const noexcept;
+    // State-slot residency census (gauge): the host-pool occupancy classes that
+    // checkpoint residency cannot see — dual-resident (Both) checkpoints,
+    // ActiveMutables holding a host replica, and in-flight host transfers.
+    [[nodiscard]] std::uint32_t state_dual_resident_count() const noexcept;
+    [[nodiscard]] std::uint32_t state_active_with_host_count() const noexcept;
+    [[nodiscard]] std::uint32_t state_pending_host_slots() const noexcept;
+    // Host-KV safety-net gauges: entry count and retained state-image bytes.
+    [[nodiscard]] std::uint32_t host_kv_net_entries() const noexcept;
+    [[nodiscard]] std::uint64_t host_kv_net_state_bytes() const noexcept;
+    // release() refusals in noexcept teardown paths (monotonic): each one
+    // orphans the state object and its slots.
+    [[nodiscard]] std::uint64_t host_slot_release_failures() const noexcept;
 
     [[nodiscard]] std::optional<ResourcePlan<Variant>>
     seal_identity(const AdmissionCandidate<Variant>& candidate, const PreparedPrompt& prompt);

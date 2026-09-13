@@ -163,6 +163,41 @@ public:
         return out;
     }
 
+    // Complete residency census: every object holding a committed or in-flight
+    // replica, by class. checkpoint_residency() only sees CheckpointImmutable;
+    // this accounts for the hidden classes — dual-resident (Both) checkpoints,
+    // thawed ActiveMutables holding a host replica, and in-flight transfers —
+    // so the host pool occupancy can be fully explained:
+    // host_slots + pending_host_slots == host_->occupied().
+    struct ResidencyHistogram {
+        std::uint32_t device_slots         = 0;  // committed device replicas
+        std::uint32_t host_slots           = 0;  // committed host replicas
+        std::uint32_t pending_device_slots = 0;  // in-flight H2D/D2D destinations
+        std::uint32_t pending_host_slots   = 0;  // in-flight D2H destinations
+        std::uint32_t dual_resident        = 0;  // objects holding both committed replicas
+        std::uint32_t active_with_host     = 0;  // ActiveMutables holding a host replica
+        std::uint32_t host_only            = 0;  // objects with only a committed host replica
+    };
+    [[nodiscard]] ResidencyHistogram residency_histogram() const noexcept {
+        ResidencyHistogram out;
+        for (const Object& object : objects_) {
+            if (object.role == StateImageRole::Free) { continue; }
+            if (object.device_slot) { ++out.device_slots; }
+            if (object.host_slot) {
+                ++out.host_slots;
+                if (object.device_slot) {
+                    ++out.dual_resident;
+                    if (object.role == StateImageRole::ActiveMutable) { ++out.active_with_host; }
+                } else {
+                    ++out.host_only;
+                }
+            }
+            if (object.pending_device_slot) { ++out.pending_device_slots; }
+            if (object.pending_host_slot) { ++out.pending_host_slots; }
+        }
+        return out;
+    }
+
     // Overcommit guard (coldest-first): the least-recently-frozen demotable
     // checkpoint — CheckpointImmutable with a device replica, no host replica,
     // no pending transfer, not pinned. The materialization relief path demotes
@@ -341,6 +376,47 @@ public:
         return true;
     }
 
+    // Why release() would refuse this handle (bitmask) — diagnostic for the
+    // orphan path: a swallowed release() failure leaves the object (and its
+    // device/host slots) unreachable. Bit 0: checkpoint references, bit 1:
+    // source pins, bit 2: destination pinned, bit 3: pending replica.
+    [[nodiscard]] std::uint32_t release_blockers(StateImageHandle handle) const noexcept {
+        if (!valid(handle)) { return 0; }
+        const Object& object = objects_[handle.index_];
+        std::uint32_t blockers = 0;
+        if (object.checkpoint_references != 0) { blockers |= 1U; }
+        if (object.source_pins != 0) { blockers |= 2U; }
+        if (object.destination_pinned) { blockers |= 4U; }
+        if (has_pending_replica(object)) { blockers |= 8U; }
+        return blockers;
+    }
+
+    // Free one host slot for a demote when the pool is full: drop the host
+    // replica of the coldest dual-resident (Both) checkpoint. The device
+    // replica is kept, so the unit stays complete (the standing invariant);
+    // the dropped copy is the redundant duplicate created by
+    // keep_source_replica restores. HostOnly objects are never candidates —
+    // their host slot is the only state half, and dropping it would leave an
+    // invalid unit. Returns 1 on success, 0 when no Both checkpoint is clean.
+    std::uint32_t make_host_slot_available() noexcept {
+        if (host_ == nullptr) { return 0; }
+        std::optional<StateImageHandle> best;
+        std::uint64_t best_epoch = 0;
+        for (std::size_t index = 0; index < objects_.size(); ++index) {
+            const Object& object = objects_[index];
+            if (object.role != StateImageRole::CheckpointImmutable || !object.device_slot ||
+                !object.host_slot || object.source_pins != 0 ||
+                object.destination_pinned || has_pending_replica(object)) {
+                continue;
+            }
+            if (!best || object.content_epoch < best_epoch) {
+                best = StateImageHandle(this, static_cast<std::uint32_t>(index), object.generation);
+                best_epoch = object.content_epoch;
+            }
+        }
+        return best && drop_host_replica(*best) ? 1U : 0U;
+    }
+
     // Transfers the Device replica to a new logical identity while the old immutable identity
     // keeps its Host replica. This is the zero-copy preserving branch for a Both source.
     void split_device_replica_identity(StateImageHandle source, StateImageHandle destination) {
@@ -489,7 +565,15 @@ public:
             return std::nullopt;
         }
         std::optional<qwen3_6::HostStateSlotHandle> target = host_->allocate();
-        if (!target) { return std::nullopt; }
+        if (!target) {
+            // Pool full: free one slot from a redundant dual-resident replica
+            // and retry. Without this, a saturated pool (invisible Both
+            // checkpoints) blocks every demote and forces full {KV+state}
+            // evictions to the host arena instead.
+            if (make_host_slot_available() == 0) { return std::nullopt; }
+            target = host_->allocate();
+            if (!target) { return std::nullopt; }
+        }
         const std::uint64_t transfer = next_transfer();
         object.pending_host_slot     = *target;
         object.transfer_id           = transfer;

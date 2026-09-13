@@ -1123,9 +1123,17 @@ public:
         out.host_kv_evictions             = program.host_kv_eviction_count();
         out.materialize_state_slot_alloc_failures = program.materialize_state_slot_alloc_failures();
         out.materialize_kv_page_alloc_failures    = program.materialize_kv_page_alloc_failures();
+        out.materialize_kv_page_alloc_failures_main    = program.materialize_kv_page_alloc_failures_main();
+        out.materialize_kv_page_alloc_failures_backend = program.materialize_kv_page_alloc_failures_backend();
         out.checkpoint_device_count               = program.checkpoint_device_count();
         out.checkpoint_host_only_count            = program.checkpoint_host_only_count();
         out.checkpoint_device_state_slots         = program.checkpoint_device_state_slots();
+        out.state_dual_resident_count             = program.state_dual_resident_count();
+        out.state_active_with_host_count          = program.state_active_with_host_count();
+        out.state_pending_host_slots              = program.state_pending_host_slots();
+        out.host_kv_net_entries                   = program.host_kv_net_entries();
+        out.host_kv_net_state_bytes               = program.host_kv_net_state_bytes();
+        out.host_slot_release_failures            = program.host_slot_release_failures();
         out.historical_fork_hits            = context_stats_.historical_fork_hits;
         out.actual_context_transfer_seconds = context_stats_.actual_context_transfer_seconds;
 
@@ -2882,7 +2890,10 @@ private:
     void observe_transfer(const ContextTransferObservation& observation) noexcept {
         const double seconds = static_cast<double>(observation.elapsed_ns) * 1.0e-9;
         context_stats_.actual_context_transfer_seconds += seconds;
-        const std::uint64_t bytes = observation.units;
+        // State observations carry units as an image COUNT; units_bytes (when set)
+        // is the true byte size. Typed-KV observations carry units as bytes.
+        const std::uint64_t bytes =
+            observation.units_bytes != 0 ? observation.units_bytes : observation.units;
         switch (observation.resource) {
         case ContextResourceClass::State:
             switch (observation.direction) {

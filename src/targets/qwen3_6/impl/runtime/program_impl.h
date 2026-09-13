@@ -1190,11 +1190,19 @@ runtime::ContextTransferObservation ProgramImplCore::context_transfer_observatio
         elapsed_ns >= static_cast<double>(std::numeric_limits<std::uint64_t>::max())
             ? std::numeric_limits<std::uint64_t>::max()
             : std::max<std::uint64_t>(1, static_cast<std::uint64_t>(elapsed_ns + 0.5));
+    // State observations carry units as an image count; units_bytes is the true
+    // transferred size so the byte counters in /stats are bytes, not counts.
+    // (this->: the state_images parameter is the image count, not the pool.)
+    const std::uint64_t state_transfer_bytes =
+        (resource == runtime::ContextResourceClass::State && this->state_images != nullptr)
+            ? state_images * this->state_images->host_layout().image_bytes
+            : 0;
     return runtime::ContextTransferObservation{
         .resource  = resource,
         .direction = direction,
         .units =
             resource == runtime::ContextResourceClass::State ? state_images : work.payload_bytes,
+        .units_bytes = state_transfer_bytes,
         .page_count = page_count,
         .work       = work,
         .elapsed_ns = measured_ns,
@@ -4478,11 +4486,11 @@ void ProgramImplCore::release_materialization_staging(
         transaction.root_text_address.reset();
     }
     if (transaction.state_fork_destination) {
-        if (state_store) { (void)state_store->release(*transaction.state_fork_destination); }
+        try_release_state_image(*transaction.state_fork_destination, "staging-fork-dest");
         transaction.state_fork_destination.reset();
     }
     for (std::size_t index = 0; index < transaction.reserved_state_count; ++index) {
-        if (state_store) { (void)state_store->release(transaction.reserved_states[index]); }
+        try_release_state_image(transaction.reserved_states[index], "staging-reserved");
         transaction.reserved_states[index] = {};
     }
     transaction.reserved_state_count = 0;
@@ -6365,8 +6373,46 @@ std::uint64_t ProgramImplCore::materialize_kv_page_alloc_failures() const noexce
     return failures;
 }
 
+std::uint64_t ProgramImplCore::materialize_kv_page_alloc_failures_main() const noexcept {
+    return decoder->text_kv.page_pool().reservation_failures();
+}
+
+std::uint64_t ProgramImplCore::materialize_kv_page_alloc_failures_backend() const noexcept {
+    if (const qwen3_6::PagedKVCache* backend = backend_kv_cache()) {
+        return backend->page_pool().reservation_failures();
+    }
+    return 0;
+}
+
 StateImageStore::CheckpointResidency ProgramImplCore::checkpoint_residency() const noexcept {
     return state_store ? state_store->checkpoint_residency() : StateImageStore::CheckpointResidency{};
+}
+
+StateImageStore::ResidencyHistogram ProgramImplCore::residency_histogram() const noexcept {
+    return state_store ? state_store->residency_histogram()
+                       : StateImageStore::ResidencyHistogram{};
+}
+
+std::uint32_t ProgramImplCore::host_kv_net_entries() const noexcept {
+    return static_cast<std::uint32_t>(host_kv_safety_net.size());
+}
+
+std::uint64_t ProgramImplCore::host_kv_net_state_bytes() const noexcept {
+    return host_kv_safety_net.retained_state_bytes();
+}
+
+std::uint64_t ProgramImplCore::host_slot_release_failures() const noexcept {
+    return host_slot_release_failures_.load(std::memory_order_relaxed);
+}
+
+void ProgramImplCore::try_release_state_image(StateImageHandle handle, const char* context) noexcept {
+    if (!state_store || !state_store->valid(handle)) { return; }
+    if (state_store->release(handle)) { return; }
+    host_slot_release_failures_.fetch_add(1, std::memory_order_relaxed);
+    std::fprintf(stderr,
+                 "[state-lease] LEAK: release refused (%s) blockers=%u "
+                 "(bit0=refs bit1=pins bit2=dest_pinned bit3=pending)\n",
+                 context, state_store->release_blockers(handle));
 }
 
 ProgramImplCore::PhysicalReleaseResult
@@ -8803,6 +8849,12 @@ void ProgramImplCore::abort_active_capture(ActiveCaptureTransaction& transaction
             try {
                 if (transaction.state_placement == qwen3_6::CaptureStatePlacement::HostSnapshot) {
                     (void)state_store->release(transaction.destination_state);
+                    // A torn publish (snapshot published, split failed) leaves the
+                    // source as a Both checkpoint; the thaw below would turn it
+                    // into an ActiveMutable holding a host replica that no path
+                    // ever drops. Drop the redundant host replica while the
+                    // source is still a checkpoint (a clean abort has none).
+                    (void)state_store->drop_host_replica(transaction.source_state);
                 } else {
                     if (sequence.state.fork_pending &&
                         sequence.state.read == transaction.source_state &&
@@ -10671,6 +10723,22 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                         page_offset += alloc_pages;
                     }
                     text_kv_addresses->commit_frontier(sequence.kv->text, restore_frontier);
+                    // Record the H2D restore for byte accounting — the safety-net
+                    // restore path previously never observed its transfers, so
+                    // main_kv_h2d_bytes stayed 0 despite successful restores.
+                    if (const HostKVPageLayout* layout =
+                            host_kv_arena
+                                ? host_kv_arena->layout_for(
+                                      text_kv_pages->physical_pool().geometry())
+                                : nullptr) {
+                        auto observation = context_transfer_observation(
+                            runtime::ContextResourceClass::MainKV,
+                            runtime::ContextTransferDirection::HostToDevice, TransferWork{},
+                            text_pages);
+                        observation.units     = layout->page_stride * text_pages;
+                        observation.units_bytes = observation.units;
+                        transaction.transfer_observations.push_back(std::move(observation));
+                    }
                 }
             }
 
@@ -10701,6 +10769,19 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                         backend_page_offset += alloc_pages;
                     }
                     backend_kv_addresses->commit_frontier(*sequence.kv->backend, backend_frontier);
+                    if (const HostKVPageLayout* layout =
+                            host_kv_arena
+                                ? host_kv_arena->layout_for(
+                                      backend_kv_pages->physical_pool().geometry())
+                                : nullptr) {
+                        auto observation = context_transfer_observation(
+                            runtime::ContextResourceClass::BackendKV,
+                            runtime::ContextTransferDirection::HostToDevice, TransferWork{},
+                            backend_pages);
+                        observation.units     = layout->page_stride * backend_pages;
+                        observation.units_bytes = observation.units;
+                        transaction.transfer_observations.push_back(std::move(observation));
+                    }
                 }
             }
 
@@ -10727,6 +10808,14 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                     .data = state_src.data(),
                     .layout = &state_images->host_layout()};
                 state_images->copy_from_host(state_view, slot_num, device.transfer_stream);
+                // The net entry's state image is a heap buffer, not a host-pool
+                // slot — observe it explicitly so state_h2d_bytes counts it.
+                auto observation = context_transfer_observation(
+                    runtime::ContextResourceClass::State,
+                    runtime::ContextTransferDirection::HostToDevice, TransferWork{}, 0, 1);
+                observation.units     = state_src_bytes;
+                observation.units_bytes = state_src_bytes;
+                transaction.transfer_observations.push_back(std::move(observation));
             } else {
                 transaction.host_kv_restore_frontier = 0;
             }
@@ -11272,18 +11361,18 @@ void ProgramImplCore::release_sequence_state(SequenceState& sequence) noexcept {
         }
     } catch (...) {}
 
-    const auto releasable = [&](StateImageHandle handle) { return state_store->valid(handle); };
-    if (releasable(sequence.state.write)) { (void)state_store->release(sequence.state.write); }
-    if (!sequence.state_source_retained && sequence.state.read != sequence.state.write &&
-        releasable(sequence.state.read)) {
-        (void)state_store->release(sequence.state.read);
+    // A refused release() orphans the object (pinned/referenced, handle dropped
+    // anyway): try_release_state_image counts it so the leak surfaces in /stats.
+    try_release_state_image(sequence.state.write, "endpoint-write");
+    if (!sequence.state_source_retained && sequence.state.read != sequence.state.write) {
+        try_release_state_image(sequence.state.read, "endpoint-read");
     }
     if (sequence.rewrite_state) {
         const StateImageHandle handle = *sequence.rewrite_state;
         const bool duplicates_binding =
             handle == sequence.state.write ||
             (!sequence.state_source_retained && handle == sequence.state.read);
-        if (!duplicates_binding && releasable(handle)) { (void)state_store->release(handle); }
+        if (!duplicates_binding) { try_release_state_image(handle, "rewrite"); }
     }
     for (std::size_t index = 0; index < sequence.long_anchors.size(); ++index) {
         const StateImageHandle handle = sequence.long_anchors[index].state;
@@ -11293,7 +11382,7 @@ void ProgramImplCore::release_sequence_state(SequenceState& sequence) noexcept {
         for (std::size_t previous = 0; !duplicate && previous < index; ++previous) {
             duplicate = sequence.long_anchors[previous].state == handle;
         }
-        if (!duplicate && releasable(handle)) { (void)state_store->release(handle); }
+        if (!duplicate) { try_release_state_image(handle, "long-anchor"); }
     }
     if (sequence.reserved_state) {
         const StateImageHandle handle = *sequence.reserved_state;
@@ -11303,7 +11392,7 @@ void ProgramImplCore::release_sequence_state(SequenceState& sequence) noexcept {
         for (const LongAnchorCheckpoint& anchor : sequence.long_anchors) {
             duplicate = duplicate || anchor.state == handle;
         }
-        if (!duplicate && releasable(handle)) { (void)state_store->release(handle); }
+        if (!duplicate) { try_release_state_image(handle, "reserved"); }
     }
     sequence.state          = {};
     sequence.rewrite_state  = std::nullopt;
