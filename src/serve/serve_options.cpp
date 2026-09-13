@@ -84,7 +84,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] "
            "[--tolerant-tool-calls] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
-           "[--frequency-penalty F] [--seed N] [--greedy]\n"
+           "[--frequency-penalty F] [--seed N] [--greedy] [--post-thinking-temperature F]\n"
            "       serves OpenAI Responses/Chat Completions and Anthropic Messages endpoints\n"
            "       --default-max-tokens defaults to " +
            std::to_string(kDefaultMaxTokens) +
@@ -120,6 +120,9 @@ std::string serve_usage_text(const char* argv0) {
            "       --weights-profile PROFILE: auto (default) | qwen36-nvfp4 | qwen38-nvfp4 | qwen36-groupwise-int | qwen38-groupwise-int\n"
            "server flags and request fields override individual values.\n"
            "       --greedy forces temperature 0 (exact argmax).\n"
+           "       --post-thinking-temperature F sets the post-thinking (post-reasoning) "
+           "temperature; unset (default) leaves the model's registered post-thinking preset "
+           "in force. Request post_thinking fields still win.\n"
            "       --rope-scaling-factor applies YaRN position scaling (1.0 = disabled); "
            "extends effective context by the factor.\n"
            "       --rope-scaling-original-context is the YaRN ramp threshold (default 262144).\n";
@@ -330,6 +333,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--temperature") {
             options.sampling_overrides.temperature =
                 parse_float_in(require_value("--temperature"), "temperature", 0.0f, 2.0f);
+        } else if (arg == "--post-thinking-temperature") {
+            options.post_thinking_temperature = parse_float_in(
+                require_value("--post-thinking-temperature"), "post-thinking-temperature", 0.0f, 2.0f);
         } else if (arg == "--top-p") {
             options.sampling_overrides.top_p =
                 parse_float_in(require_value("--top-p"), "top-p", 0.0f, 1.0f);

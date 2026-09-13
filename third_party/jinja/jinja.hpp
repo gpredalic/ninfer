@@ -389,27 +389,10 @@ inline std::string to_python_string(const json& val) {
     if (val.is_object()) {
         std::string res = "{";
 
+        // The nlohmann backend is ordered_json, so iteration is key insertion
+        // order — the order Python's dict repr uses.
         std::vector<std::string> keys;
         for (json::const_iterator it = val.begin(); it != val.end(); ++it) keys.push_back(it.key());
-
-        auto get_prio = [](const std::string& k) -> int {
-            if (k == "type") return 1;
-            if (k == "function") return 2;
-            if (k == "name") return 3;
-            if (k == "description") return 4;
-            if (k == "parameters") return 5;
-            if (k == "properties") return 6;
-            if (k == "required") return 7;
-            if (k == "enum") return 8;
-            return 100;
-        };
-
-        std::sort(keys.begin(), keys.end(), [&](const std::string& a, const std::string& b){
-            int pa = get_prio(a);
-            int pb = get_prio(b);
-            if (pa != pb) return pa < pb;
-            return a < b;
-        });
 
         bool first = true;
         for (const auto& key : keys) {
@@ -1139,7 +1122,9 @@ struct FilterExpr : Expr {
     json evaluate(Context& context) override {
         json val = left->evaluate(context);
         if (name == "tojson") {
-             // jinja2 semantics: sort_keys=True, separators (", ", ": "), ensure_ascii=False
+             // Match the tojson filter transformers registers for chat templates:
+             // key insertion order, separators (", ", ": "). (Scalars use the
+             // ujson dump, which matches nlohmann's default.)
              std::function<std::string(const json&)> ser = [&](const json& v) -> std::string {
                  if (v.is_null()) { return "null"; }
                  if (v.is_boolean()) { return v.get<bool>() ? "true" : "false"; }
@@ -1155,22 +1140,15 @@ struct FilterExpr : Expr {
                      return out + "]";
                  }
                  if (!v.is_object()) { return v.dump(); }
-                 // Serialize the members as plain strings before sorting: the JSON
-                 // wrappers are reference-like, so sorting wrappers in place would
-                 // assign through them and corrupt the underlying documents.
-                 std::vector<std::pair<std::string, std::string>> members;
-                 for (auto it = v.begin(); it != v.end(); ++it) {
-                     members.emplace_back(it.key(), ser(it.value()));
-                 }
-                 std::sort(members.begin(), members.end(),
-                           [](const auto& x, const auto& y) { return x.first < y.first; });
+                 // The nlohmann backend is ordered_json, so iteration is key
+                 // insertion order — the order a Python dict yields.
                  std::string out = "{";
                  bool first = true;
-                 for (const auto& m : members) {
+                 for (auto it = v.begin(); it != v.end(); ++it) {
                      if (!first) out += ", ";
-                     out += json(m.first).dump();
+                     out += json(it.key()).dump();
                      out += ": ";
-                     out += m.second;
+                     out += ser(it.value());
                      first = false;
                  }
                  return out + "}";

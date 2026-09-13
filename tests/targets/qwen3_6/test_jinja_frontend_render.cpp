@@ -353,6 +353,49 @@ int main() {
             failures += check_invariants(label, rendered);
         }
     }
+
+    // Regression: the generation suffix must yield a rewrite checkpoint. The vendored jinja
+    // engine records standalone string literals with no leaf parts, so the suffix detection
+    // must accept parts-empty literal prints — otherwise rewrite_checkpoint is never set and
+    // the safety net cannot capture a checkpoint (no cache reuse on evicted-session
+    // follow-ups). Every registered template's suffix is standalone literals.
+    for (const auto& identity : identities) {
+        const std::string template_source =
+            read_file(NINFER_SOURCE_DIR "/tests/fixtures/frontend/" + std::string(identity.file));
+        const fi::JinjaChatTemplate compiled = fi::JinjaChatTemplate::compile(template_source);
+        std::vector<fi::ChatMessage> messages;
+        fi::ChatMessage user;
+        user.role = ninfer::ChatRole::User;
+        user.parts.push_back(fi::ChatPart::text_part("hello"));
+        messages.push_back(std::move(user));
+        fi::ChatRenderOptions options;
+        options.add_generation_prompt = true;
+        options.enable_thinking       = true;
+        const std::string label = std::string(identity.semantics) + "/generation-suffix";
+        fi::RenderedChat rendered;
+        try {
+            rendered = compiled.render(messages, options);
+        } catch (const std::exception& error) {
+            failures += fail(label + " threw: " + error.what());
+            continue;
+        }
+        if (!rendered.rewrite_checkpoint) {
+            failures += fail(label + " has no rewrite checkpoint for the generation suffix");
+            continue;
+        }
+        if (rendered.rewrite_checkpoint->offset > rendered.text.size()) {
+            failures += fail(label + " rewrite checkpoint offset beyond the rendered text");
+            continue;
+        }
+        const std::string tail = rendered.text.substr(rendered.rewrite_checkpoint->offset);
+        if (tail.find("<|im_start|>assistant") == std::string::npos &&
+            tail.find("<think>") == std::string::npos) {
+            failures += fail(label + " rewrite checkpoint offset does not precede the "
+                                     "generation suffix");
+            continue;
+        }
+        ++checked;
+    }
     if (failures == 0) {
         std::cout << "ok (" << checked << " renders, " << skipped << " skipped)\n";
     }

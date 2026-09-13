@@ -23,10 +23,16 @@ constexpr std::string_view kVisionEnd       = "<|vision_end|>";
 constexpr std::string_view kImagePad        = "<|image_pad|>";
 constexpr std::string_view kVideoPad        = "<|video_pad|>";
 
+// OpenAI's "developer" role is a system-level instruction. Every registered chat
+// template renders it as a system block: the Qwen-family templates have no
+// developer branch (they raise 'Unexpected message role.'), and the froggeric
+// template folds developer into its is_system check and emits the same system
+// tag. Lowering here keeps every registered template correct and lets the API
+// surface keep accepting the role.
 std::string_view role_name(ChatRole role) {
     switch (role) {
-    case ChatRole::System: return "system";
-    case ChatRole::Developer: return "developer";
+    case ChatRole::System:
+    case ChatRole::Developer: return "system";
     case ChatRole::User: return "user";
     case ChatRole::Assistant: return "assistant";
     case ChatRole::Tool: return "tool";
@@ -532,12 +538,17 @@ RenderedChat JinjaChatTemplate::render(const std::vector<ChatMessage>& messages,
             RewriteCheckpointByteSpec{RewriteCheckpointKind::ResponseReplay, iteration.begin};
     } else if (options.add_generation_prompt) {
         // The generation suffix is replaceable as a unit; its own prints give the prologue
-        // frontiers.
+        // frontiers. A suffix print is a string constant: either a single string-literal
+        // leaf, or a standalone literal — the vendored engine records those with no leaf
+        // parts, and every registered template's suffix is standalone literals.
         std::optional<std::size_t> suffix_begin;
         for (const auto& print : trace.prints) {
-            if (print.begin < loop_end || print.parts.size() != 1U) { continue; }
-            const auto& part = print.parts.front();
-            if (!part.expr.empty() && part.expr.front() != '"') { continue; }
+            if (print.begin < loop_end) { continue; }
+            const bool literal =
+                (print.parts.size() == 1U &&
+                 (print.parts.front().expr.empty() || print.parts.front().expr.front() == '"')) ||
+                (print.parts.empty() && !print.expr.empty() && print.expr.front() == '"');
+            if (!literal) { continue; }
             if (!suffix_begin) { suffix_begin = print.begin; }
             if (print.end > print.begin) { rendered.rewrite_execution_boundaries.push_back(print.end); }
         }

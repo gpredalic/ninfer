@@ -144,6 +144,16 @@ ninfer_add_test(ninfer_qwen3_6_jinja_vision_mapping_test
 target_include_directories(ninfer_qwen3_6_jinja_vision_mapping_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/impl)
+# Asserts the rendered prompt is prefix-stable across turns: rendering the
+# conversation without its last message yields a byte-prefix of the full render,
+# which is what the context cache needs to re-use the prefix.
+ninfer_add_test(ninfer_qwen3_6_jinja_prefix_stability_test
+  SOURCES targets/qwen3_6/test_jinja_prefix_stability.cpp
+  NEEDS_SOURCE_DIR
+  LIBRARIES ninfer_engine ninfer_core)
+target_include_directories(ninfer_qwen3_6_jinja_prefix_stability_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/impl)
 ninfer_add_test(ninfer_qwen3_6_runtime_mechanisms_test
   SOURCES targets/qwen3_6/test_runtime_mechanisms.cpp
   LIBRARIES ninfer_engine ninfer_core)
