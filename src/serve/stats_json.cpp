@@ -76,6 +76,7 @@ std::string format_stats_json(const StatsSnapshot& s) {
               {"materialize_kv_page_alloc_failures", s.scheduler.materialize_kv_page_alloc_failures},
               {"materialize_kv_page_alloc_failures_main", s.scheduler.materialize_kv_page_alloc_failures_main},
               {"materialize_kv_page_alloc_failures_backend", s.scheduler.materialize_kv_page_alloc_failures_backend},
+              {"materialize_kv_defers", s.scheduler.materialize_kv_defers},
               {"checkpoint_device_count", s.scheduler.checkpoint_device_count},
               {"checkpoint_host_only_count", s.scheduler.checkpoint_host_only_count},
               {"checkpoint_device_state_slots", s.scheduler.checkpoint_device_state_slots},

@@ -554,6 +554,34 @@ public:
         return 0;
     }
 
+    // Stats accessors read by populate_runtime_stats (the fake reports no activity).
+    [[nodiscard]] std::uint64_t host_kv_single_alloc_failures() const noexcept { return 0; }
+    [[nodiscard]] std::uint64_t host_kv_compaction_count() const noexcept { return 0; }
+    [[nodiscard]] std::uint64_t host_kv_eviction_count() const noexcept { return 0; }
+    [[nodiscard]] std::uint64_t materialize_state_slot_alloc_failures() const noexcept {
+        return 0;
+    }
+    [[nodiscard]] std::uint64_t materialize_kv_page_alloc_failures() const noexcept {
+        return 0;
+    }
+    [[nodiscard]] std::uint64_t materialize_kv_page_alloc_failures_main() const noexcept {
+        return 0;
+    }
+    [[nodiscard]] std::uint64_t materialize_kv_page_alloc_failures_backend() const noexcept {
+        return 0;
+    }
+    [[nodiscard]] std::uint64_t materialize_kv_defers() const noexcept { return 0; }
+    [[nodiscard]] std::uint32_t checkpoint_device_count() const noexcept { return 0; }
+    [[nodiscard]] std::uint32_t checkpoint_host_only_count() const noexcept { return 0; }
+    [[nodiscard]] std::uint32_t checkpoint_device_state_slots() const noexcept { return 0; }
+    [[nodiscard]] std::uint32_t state_dual_resident_count() const noexcept { return 0; }
+    [[nodiscard]] std::uint32_t state_active_with_host_count() const noexcept { return 0; }
+    [[nodiscard]] std::uint32_t state_pending_host_slots() const noexcept { return 0; }
+    [[nodiscard]] std::uint32_t host_kv_net_entries() const noexcept { return 0; }
+    [[nodiscard]] std::uint64_t host_kv_net_state_bytes() const noexcept { return 0; }
+    [[nodiscard]] std::uint64_t host_kv_superseded_count() const noexcept { return 0; }
+    [[nodiscard]] std::uint64_t host_slot_release_failures() const noexcept { return 0; }
+
     [[nodiscard]] bool isolated_request_feasible(const FakeRequestBasePlan& base) const noexcept {
         return base.isolated_feasible;
     }

@@ -878,6 +878,10 @@ struct RuntimeStats {
     // pool (main attention vs MTP/DFlash backend) is binding.
     std::uint64_t materialize_kv_page_alloc_failures_main    = 0;
     std::uint64_t materialize_kv_page_alloc_failures_backend = 0;
+    // Materializations whose device-KV reservation demand did not fit the current pool
+    // occupancy and were deferred to a later engine tick instead of throwing bad_alloc
+    // into the worker OOM handler (monotonic).
+    std::uint64_t materialize_kv_defers = 0;
     // Checkpoint residency (gauge): live checkpoint state images and the
     // device slots they pin.
     std::uint32_t checkpoint_device_count       = 0;

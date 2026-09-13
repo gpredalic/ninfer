@@ -542,6 +542,7 @@ class Monitor:
                 "state_transfers": stats.get("state_transfers"),
                 "pressure": stats.get("pressure"),
                 "cache_reuse": stats.get("cache_reuse"),
+                "host_kv": stats.get("host_kv"),
             }
             # Compute per-tick deltas from cumulative counters
             kt = stats.get("kv_transfers", {})
@@ -1022,6 +1023,13 @@ function render(d){
     return bar([{pct:p,color:c,label:k.replace(/_selections/g,'').replace(/_/g,' ')}]).replace('<div class="bar">','<div class="bar" style="margin:1px 0">');
   }).join(''):'<div class="empty">no cache reuse data</div>';
   const sbe=pr.search_budget_exhaustions||0,srch=pr.searches||0;
+  const slotFail=pr.materialize_state_slot_alloc_failures||0;
+  const kvMainFail=pr.materialize_kv_page_alloc_failures_main||0;
+  const kvBkFail=pr.materialize_kv_page_alloc_failures_backend||0;
+  const relFail=pr.host_slot_release_failures||0;
+  const ckptDev=pr.checkpoint_device_count||0,ckptHost=pr.checkpoint_host_only_count||0;
+  const dual=pr.state_dual_resident_count||0,actHost=pr.state_active_with_host_count||0,pendHost=pr.state_pending_host_slots||0;
+  const failColor=v=>v>0?'#f85149':'var(--muted)';
   $('pressure').innerHTML=
     '<div style="font-size:12px;color:var(--muted);margin-bottom:4px">Pressure (cumulative)</div>'+
     '<div style="font-size:13px;margin-bottom:4px">'+
@@ -1030,9 +1038,22 @@ function render(d){
     '<span style="color:#d29922">degrade:'+dg+'</span> · '+
     '<span style="color:#f85149">fallback:'+fb+'</span> · '+
     '<span style="color:#d29922">ckpt_drop:'+cd+'</span></div>'+
-    '<div style="font-size:13px;margin-bottom:8px">'+
+    '<div style="font-size:13px;margin-bottom:4px">'+
     '<span style="color:#d29922">searches:'+srch+'</span> · '+
     '<span style="color:#f85149">budget_exhaust:'+sbe+'</span></div>'+
+    '<div style="font-size:12px;margin-bottom:4px">'+
+    '<span style="color:var(--muted)">alloc fails — </span>'+
+    '<span style="color:'+failColor(slotFail)+'">slot:'+slotFail+'</span> · '+
+    '<span style="color:'+failColor(kvMainFail)+'">kv_main:'+kvMainFail+'</span> · '+
+    '<span style="color:'+failColor(kvBkFail)+'">kv_backend:'+kvBkFail+'</span> · '+
+    '<span style="color:'+failColor(relFail)+'">release_leak:'+relFail+'</span></div>'+
+    '<div style="font-size:12px;margin-bottom:8px">'+
+    '<span style="color:var(--muted)">state residency — </span>'+
+    '<span>ckpt_dev:'+ckptDev+'</span> · '+
+    '<span>ckpt_host:'+ckptHost+'</span> · '+
+    '<span style="color:'+failColor(dual)+'">dual:'+dual+'</span> · '+
+    '<span style="color:'+failColor(actHost)+'">active_host:'+actHost+'</span> · '+
+    '<span>pend_host:'+pendHost+'</span></div>'+
     '<div style="font-size:12px;color:var(--muted);margin-bottom:4px">Cache reuse paths</div>'+
     crBar+
     '<div style="font-size:12px;color:var(--muted);margin-top:6px">reused prompt tokens: '+rpt.toLocaleString()+'</div>';
@@ -1090,11 +1111,15 @@ function renderKvBars(latest){
   const pgPct=mpg?pg/mpg*100:0,bpgPct=mpg?bpg/mpg*100:0;
   const budget=mem.host_kv_capacity_bytes||0,used=mem.host_kv_occupied_bytes||0;
   const usedPct=budget?used/budget*100:0;
+  const hk=latest.stats?.host_kv||{};
+  const netBytes=hk.net_state_bytes||0;
   let h='<div style="font-size:12px;color:var(--muted);margin-bottom:4px">device KV: '+pg+' / '+mpg+' pages ('+pgPct.toFixed(0)+'%) · payload: '+gb(mem.kv_payload_bytes||0)+'</div>';
   h+=bar([{pct:pgPct,color:C.kv[0],label:'used'},{pct:100-pgPct,color:'#30363d',label:'free'}]);
   h+='<div style="font-size:12px;color:var(--muted);margin:8px 0 4px">host KV: '+gb(used)+' / '+gb(budget)+' ('+usedPct.toFixed(0)+'%)</div>';
   if(budget>0){
     h+=bar([{pct:usedPct,color:C.kv[2],label:'used'},{pct:100-usedPct,color:'#30363d',label:'free'}]);
+    h+='<div style="font-size:12px;color:var(--muted);margin:6px 0 2px">safety net: '+(hk.net_entries||0)+' entries · '+(netBytes/1073741824).toFixed(2)+' GB state · superseded '+(hk.superseded||0)+'</div>';
+    h+='<div style="font-size:12px;color:var(--muted)">arena: '+(hk.evictions||0)+' evictions · '+(hk.compactions||0)+' compactions · '+(hk.single_alloc_failures||0)+' alloc fails</div>';
   } else {
     h+='<div class="empty">host KV cache disabled</div>';
   }

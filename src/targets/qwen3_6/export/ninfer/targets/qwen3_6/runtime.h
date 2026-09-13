@@ -720,6 +720,9 @@ public:
     // Per-pool KV reservation failures: main (attention) vs backend (MTP/DFlash).
     [[nodiscard]] std::uint64_t materialize_kv_page_alloc_failures_main() const noexcept;
     [[nodiscard]] std::uint64_t materialize_kv_page_alloc_failures_backend() const noexcept;
+    // Materializations deferred to a later engine tick because their device-KV reservation
+    // demand did not fit the current pool occupancy (monotonic).
+    [[nodiscard]] std::uint64_t materialize_kv_defers() const noexcept;
     // Live checkpoint residency (gauge): how many device state slots checkpoints pin.
     [[nodiscard]] std::uint32_t checkpoint_device_count() const noexcept;
     [[nodiscard]] std::uint32_t checkpoint_host_only_count() const noexcept;

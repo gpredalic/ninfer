@@ -575,6 +575,9 @@ public:
     // — the summed counter cannot say which pool is binding.
     [[nodiscard]] std::uint64_t materialize_kv_page_alloc_failures_main() const noexcept;
     [[nodiscard]] std::uint64_t materialize_kv_page_alloc_failures_backend() const noexcept;
+    // Materializations deferred to a later engine tick because their device-KV reservation
+    // demand did not fit the current pool occupancy (monotonic; for /stats).
+    [[nodiscard]] std::uint64_t materialize_kv_defers() const noexcept;
     [[nodiscard]] StateImageStore::CheckpointResidency checkpoint_residency() const noexcept;
     // Full state-slot residency census (for /stats): explains host-pool occupancy
     // including the classes checkpoint_residency() cannot see.
@@ -727,6 +730,10 @@ public:
     std::unique_ptr<HostKVExtentStore> host_kv_extents;
     HostKVSafetyNet host_kv_safety_net;
     std::uint64_t safety_net_restore_count_ = 0;
+    // Materializations whose device-KV reservation demand did not fit the current pool
+    // occupancy and were deferred to a later engine tick instead of throwing bad_alloc
+    // (monotonic; read by /stats from the serve thread).
+    std::atomic<std::uint64_t> materialize_kv_defers_{0};
 
     // Checkpoint state is retained only inside a complete {attention KV + GDN state}
     // unit held by the safety net; there is no state-only capture. The old
@@ -1058,7 +1065,10 @@ private:
                  const SequenceState* source, const SharedPrefixState* shared_source,
                  std::optional<runtime::CheckpointRef> checkpoint, bool must_retain_private_source);
     [[nodiscard]] StartResult start_request(MaterializationTransaction& transaction);
-    void prepare_materialization(MaterializationTransaction& transaction);
+    // Returns false (deferring, with the transaction unmutated) when the transaction's
+    // device-KV reservation demand does not fit the current pool occupancy; the caller
+    // then returns InProgress and retries on a later engine tick.
+    [[nodiscard]] bool prepare_materialization(MaterializationTransaction& transaction);
     void enqueue_materialization_transfers(MaterializationTransaction& transaction);
     void record_materialization_transfer_observations(MaterializationTransaction& transaction);
     void publish_materialization_transfers(MaterializationTransaction& transaction);

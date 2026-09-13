@@ -4715,7 +4715,7 @@ std::uint32_t ProgramImplCore::demote_checkpoints_to_make_room(std::uint32_t nee
     return demoted;
 }
 
-void ProgramImplCore::prepare_materialization(MaterializationTransaction& transaction) {
+bool ProgramImplCore::prepare_materialization(MaterializationTransaction& transaction) {
     if (transaction.prepared || !transaction.plan ||
         transaction.destination.value >= max_concurrency ||
         !requests[transaction.destination.value].prefill || !transaction.source_prepared) {
@@ -4754,6 +4754,37 @@ void ProgramImplCore::prepare_materialization(MaterializationTransaction& transa
     if (source_state != nullptr && resident_resources(*source_state).device.state_slots == 0 &&
         resident_resources(*source_state).host.state_slots == 0) {
         throw std::logic_error("materialization source has no resident state");
+    }
+
+    // Device-KV capacity fit gate: this transaction's reservation demand is known up front
+    // (demand.reservation_added — the planner's reservation-level physical delta) and the
+    // pools' current physical occupancy is known, so a reservation that cannot fit now is
+    // deferred to a later engine tick (the caller returns InProgress) instead of throwing
+    // std::bad_alloc into the worker OOM handler. Pressure work (demotes/evictions) frees
+    // pages across ticks, so each retry re-runs this gate against lower occupancy. The check
+    // is pure: on a defer nothing is mutated, so the next tick re-prepares identically
+    // (pinned safety-net entry, plan, and pressure bookkeeping all stay intact).
+    {
+        const DeviceKVPagePool& text_pool = text_kv_pages->physical_pool();
+        if (text_pool.available_pages() < demand.reservation_added.device.main_kv_pages) {
+            materialize_kv_defers_.fetch_add(1, std::memory_order_relaxed);
+            std::fprintf(stderr,
+                         "[materialize] KV capacity defer: need %u pages, free %u, deferring\n",
+                         demand.reservation_added.device.main_kv_pages,
+                         text_pool.available_pages());
+            return false;
+        }
+        if (backend_kv_pages) {
+            const DeviceKVPagePool& backend_pool = backend_kv_pages->physical_pool();
+            if (backend_pool.available_pages() < demand.reservation_added.device.backend_kv_pages) {
+                materialize_kv_defers_.fetch_add(1, std::memory_order_relaxed);
+                std::fprintf(stderr,
+                             "[materialize] KV capacity defer (backend): need %u pages, free %u, deferring\n",
+                             demand.reservation_added.device.backend_kv_pages,
+                             backend_pool.available_pages());
+                return false;
+            }
+        }
     }
 
     std::uint32_t state_count = demand.reservation_added.device.state_slots;
@@ -4986,6 +5017,7 @@ void ProgramImplCore::prepare_materialization(MaterializationTransaction& transa
     transaction.prepared = true;
     requests[lane].prefill->elapsed_seconds +=
         std::chrono::duration<double>(Clock::now() - prepare_started).count();
+    return true;
 }
 
 void ProgramImplCore::prepare_prefix_forks(MaterializationTransaction& transaction) {
@@ -6409,6 +6441,10 @@ std::uint64_t ProgramImplCore::materialize_kv_page_alloc_failures_backend() cons
     return 0;
 }
 
+std::uint64_t ProgramImplCore::materialize_kv_defers() const noexcept {
+    return materialize_kv_defers_.load(std::memory_order_relaxed);
+}
+
 StateImageStore::CheckpointResidency ProgramImplCore::checkpoint_residency() const noexcept {
     return state_store ? state_store->checkpoint_residency() : StateImageStore::CheckpointResidency{};
 }
@@ -6894,6 +6930,16 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
         return out;
     }
 
+    // Sample the live cancellation flag here (not just the latched one): a
+    // transaction deferring on the KV fit gate returns before the post-prepare
+    // cancellation check, so without this a cancel arriving during the defer
+    // would not abort the transaction until it eventually fit.
+    if (cancellation.requested()) { transaction.cancel_pending = true; }
+    if (transaction.cancel_pending) {
+        abort_transaction();
+        return out;
+    }
+
     // Safety-net re-find: after pressure work (eviction + spill) completes,
     // a safety-net entry may now exist that wasn't there at reserve time.
     // The original safety-find ran before the spill; if it missed and the
@@ -6924,7 +6970,12 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
     }
 
     if (!transaction.prepared) {
-        prepare_materialization(transaction);
+        if (!prepare_materialization(transaction)) {
+            // Device-KV demand cannot fit the current pool occupancy: retry on a later
+            // engine tick. Transaction state is untouched, so the retry is identical.
+            out.status = runtime::ContextTransactionStatus::InProgress;
+            return out;
+        }
         enqueue_materialization_transfers(transaction);
         if (transaction.transfer_submitted) {
             out.status = runtime::ContextTransactionStatus::InProgress;
@@ -6987,7 +7038,12 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
         // fail this ONE request instead of nuking the worker.
         try {
             if (!transaction.prepared) {
-                prepare_materialization(transaction);
+                if (!prepare_materialization(transaction)) {
+                    // Still no room after the first OOM: defer to a later tick instead of
+                    // failing the request (transaction state is untouched).
+                    out.status = runtime::ContextTransactionStatus::InProgress;
+                    return out;
+                }
                 enqueue_materialization_transfers(transaction);
                 if (transaction.transfer_submitted) {
                     out.status = runtime::ContextTransactionStatus::InProgress;
@@ -7045,6 +7101,22 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
             transaction.plan->impl_->reuse = ReusePath::Root;
             transaction.plan->impl_->has_source = false;
             transaction.plan->impl_->reuse_base = 0;
+            // The plan is now a root materialization, but its demand still describes the
+            // evicted source path (a small reservation delta). Reset it to the root vector
+            // so the prepare-time fit gate — and the publication's active-entitlement check —
+            // see the full root entitlement demand instead of the stale source delta.
+            const detail::PhysicalResources root_demand{.device = {
+                .active_lanes     = 1,
+                .state_slots      = 1,
+                .main_kv_pages    = transaction.plan->impl_->text_kv_page_entitlement,
+                .backend_kv_pages = transaction.plan->impl_->backend_kv_page_entitlement,
+            }};
+            transaction.plan->impl_->demand = detail::PhysicalDemand{
+                .active_entitlement       = root_demand,
+                .reservation_added        = root_demand,
+                .physical_peak_additional = root_demand,
+                .final_added              = root_demand,
+            };
         }
         // Reset plan-level prefix fork flags so enqueue_materialization_transfers
         // doesn't call prepare_prefix_forks for the (now root) plan.
@@ -7080,7 +7152,13 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
             }
         }
         if (!transaction.prepared) {
-            prepare_materialization(transaction);
+            if (!prepare_materialization(transaction)) {
+                // Root (possibly safety-net restore) demand cannot fit the current pool
+                // occupancy: defer to a later tick. The pinned safety-net entry and the
+                // root plan are preserved, so the retry is identical.
+                out.status = runtime::ContextTransactionStatus::InProgress;
+                return out;
+            }
             enqueue_materialization_transfers(transaction);
             if (transaction.transfer_submitted) {
                 out.status = runtime::ContextTransactionStatus::InProgress;

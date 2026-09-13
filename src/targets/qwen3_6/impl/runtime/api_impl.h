@@ -294,6 +294,11 @@ std::uint64_t Program<Variant>::materialize_kv_page_alloc_failures_backend() con
 }
 
 template <>
+std::uint64_t Program<Variant>::materialize_kv_defers() const noexcept {
+    return impl_ ? impl_->materialize_kv_defers() : 0;
+}
+
+template <>
 std::uint32_t Program<Variant>::checkpoint_device_count() const noexcept {
     return impl_ ? impl_->checkpoint_residency().device_count : 0;
 }
