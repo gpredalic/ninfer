@@ -88,6 +88,18 @@ Still open from the jinja line (carried, not on the serving path):
 > to the front, free space becomes one contiguous extent) before the allocation
 > retries. The `/stats` fragmentation metrics below are implemented. **Still open:**
 > the real-scenario evaluation on the GPU box.
+>
+> **Status (2026-09-13, evening):** the single-session arena-fill regression is
+> fixed on `docs/prune-plan` (commits `1fd9d08c`…`15d6361c`): safety-net
+> supersede-on-add + liveness-based eviction (dead-largest, then live-smallest),
+> host-state-pool saturation unblocked (`make_host_slot_available` drops the
+> coldest dual-resident replica; HostOnly never droppable), torn-HostSnapshot
+> orphan fix, the A* planner's 5 ms time budget removed (structural termination
+> only), the state-demotion model/physical gap closed (demotes modeled only when
+> the host pool can satisfy them), and pressure-relief failures converted from
+> uncaught `bad_alloc` to a controlled abort-to-root-prefill. Remaining: deploy
+> (one-command e2e swap) + `--device-state-slots 5` headroom in the serve config,
+> then the 4-session live-load acceptance run.
 
 Production testing under extreme pressure (single 371k-token session, 1016
 messages, arena exhausted to 14MB free) revealed two issues in the host KV
