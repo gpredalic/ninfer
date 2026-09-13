@@ -49,7 +49,7 @@ Details: [docs/maintainer/kv-nvfp4-yarn.md](docs/maintainer/kv-nvfp4-yarn.md)
 >
 > **Use QUASAR or Ostfralla artifacts instead.** Both maintain quality at a
 > significantly smaller size (~17.5 GB vs 23.7 GB):
-> - [QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4](https://huggingface.co/QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4/)
+> - [MirkoCovizzi/Qwen3.8-27B-QUASAR-NVFP4-NInfer](https://huggingface.co/MirkoCovizzi/Qwen3.8-27B-QUASAR-NVFP4-NInfer/tree/16ccfe7c18f232fd44c56a61e05678ad9bbd711c)
 > - [Ostfralla/Qwen3.8-27B-NVFP4-NInfer](https://huggingface.co/Ostfralla/Qwen3.8-27B-NVFP4-NInfer)
 
 This fork works with any Qwen3.8-27B NVFP4 `.ninfer` artifact from QUASAR or
@@ -160,7 +160,8 @@ Download a compatible QUASAR or Ostfralla artifact with the Hugging Face CLI:
 
 ```bash
 # QUASAR (recommended — smaller, tuned for agentic workloads)
-hf download QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4 \
+hf download MirkoCovizzi/Qwen3.8-27B-QUASAR-NVFP4-NInfer \
+  --revision 16ccfe7c18f232fd44c56a61e05678ad9bbd711c \
   --local-dir models
 
 # Ostfralla (abliterated variant)
@@ -396,7 +397,7 @@ The published artifacts are derived from
 [Qwen/Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B). This fork uses QUASAR and
 Ostfralla NVFP4 artifacts for Qwen3.8-27B, which maintain quality at a significantly smaller
 size than the upstream maintainer's artifact:
-[QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4](https://huggingface.co/QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4/)
+[MirkoCovizzi/Qwen3.8-27B-QUASAR-NVFP4-NInfer](https://huggingface.co/MirkoCovizzi/Qwen3.8-27B-QUASAR-NVFP4-NInfer/tree/16ccfe7c18f232fd44c56a61e05678ad9bbd711c)
 and
 [Ostfralla/Qwen3.8-27B-NVFP4-NInfer](https://huggingface.co/Ostfralla/Qwen3.8-27B-NVFP4-NInfer).
 The Qwen3.8-27B NVFP4 weights are derived from
