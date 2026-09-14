@@ -12,24 +12,18 @@ The governing invariant for all of it is the standing plan below.
 
 Prioritized. "Now" = the active thread; the rest are queued follow-ups.
 
-### 1. State-lease wedge — triage → fix  (NOW — top priority)
-The bug actively forcing user restarts. On the fixed binary (livelock gone:
-0 defers / 0 OOM / 0 bad_alloc), the server still wedged at 13:28:57 on 2026-09-14:
-`waiting=1, running=0, materializing=0` for 4+ min, never admitting req 150.
-- [x] **Triage (confirmed):** the wedge is a *silent* stall — no admission error or
-      exception fired (0 "isolated-feasible", 0 "exceeds KV capacity", 0 queue-timeout
-      in the window). Signature of `try_admit_one` returning `None` (blocked head,
-      resources never free), not an error path. `[state-lease] LEAK: release refused
-      (rewrite) blockers=1` fired on nearly every thinking turn (12× in the window),
-      3× immediately after req 149 completed, right before the wedge.
-- [ ] **Root-cause:** confirm the leaked rewrite state slot keeps a lane/slot
-      logically occupied so `inspect_admission` never returns Ready for the waiting
-      head. Trace where `checkpoint_references` on a rewrite state is incremented
-      (capture) and never decremented.
-- [ ] **Fix:** drop the stale `checkpoint_references` before the rewrite release
-      (sequence-clear path, `program_impl.h:11565–11574`), or balance the capture
-      path. Verify: a thinking session no longer wedges; `host_slot_release_failures`
-      stays 0.
+### 1. State-lease wedge — RESOLVED (2026-09-14, `fc5d0cf3`)
+The bug actively forcing user restarts. Root cause: the "state-lease LEAK" is a
+false alarm (every refused release has `shared_refs=1` — the image legitimately
+backs a live shared prefix). The real bug: the H2D state restore needs a NEW
+device slot but the pool is full, and the only relief is demand-driven (no-op
+when the stale planner model adds 0 state slots) → "no resident state" → root
+fallback → adopt contract error → retry loop. **Fix:** demote the coldest
+demotable checkpoint before each H2D restore attempt (both sites). Verified:
+prod 0 errors post-deploy; e2e phase 12 (new regression phase) 5/5 PASS.
+Follow-ups: planner-side demand for the H2D slot when source is HostOnly;
+right-size the pool for thinking sessions + shared prefixes (6 + 2 > 8 is
+structurally over-committed); rename the misleading LEAK label.
 
 ### 2. Strip-collapse fix — `--strip-thinking-cache`  (after #1)
 Re-prefill only the 7 RoPE-bound attention layers after a thinking-strip; restore
