@@ -25,8 +25,14 @@ net), or torn apart mid-eviction:
 
 **Unity is the main goal.** Fix the split and the follow-up list collapses.
 
-## Status (2026-09-15, 00:20 redeploy)
+## Status (2026-09-15, 00:24 redeploy)
 
+- **P1.4 true-orphan leak fixed** (`29df794f`): the recurring
+  `LEAK (orphan)` (3 today, all `endpoint-write ckpt_refs=1 shared_refs=0
+  DeviceOnly`, each after an error-burst recovery) — a publish-abort
+  restores the recycled write destination with refs=1 set directly, and no
+  path ever released that reference. Now recorded in
+  `SequenceState::recycled_write_state` and released at teardown.
 - **00:10:52–00:10:55: `runtime Begin summary differs from committed
   admission` — req 21 and 23 (the user's live session, erroring every
   turn).** A source-based admission (shortlist HIT, reuse 107472/108487)
@@ -145,10 +151,20 @@ development. Each is verified with the P0 e2e gate + the live journal.
       freed only 77 (535→612) because victims' pages are shared with the
       live shared prefix; per-victim relief is nearly inert against a
       shared-prefix-pinned pool. See P1.5.
-- [ ] **P1.4 — true-orphan leak.** First `LEAK (orphan)` (`shared_refs=0`,
-      `endpoint-write`, `ckpt_refs=1`) — recurring. Trace the unbalanced
-      retain/release pair on the endpoint-write checkpoint-reference path.
-      *Exit:* 0 `LEAK (orphan)` lines.
+- [x] **P1.4 — true-orphan leak.** `29df794f`. Root-caused: a private
+      capture with `recycles_private_state` recycles the rewrite image as the
+      fork destination (refs=0); when the publish **aborts** (worker recovery
+      mid-materialization — the 20:41:53 error burst), the destination is
+      restored via `restore_recycled_checkpoint`, which sets refs=1 directly;
+      the fork_pending reset only fires for in-place writers, so for a
+      private fork `state.write` still points at the restored image — and no
+      path ever releases that reference (it was never created by a
+      `retain_checkpoint_reference` call). Fix: record the restored handle in
+      `SequenceState::recycled_write_state` at the abort-restore site and
+      release it in `release_sequence_state` (handle-match + refs!=0 guards).
+      *Exit:* 0 `LEAK (orphan)` lines — 3 today, all pre-fix, all
+      `endpoint-write ckpt_refs=1 shared_refs=0 DeviceOnly`, each following
+      an error-burst recovery; verify in the live window.
 - [ ] **P1.5 — the device-KV pool is structurally over-committed; make relief
       effective.** Quantified 22:28: a 267k-token request (req 25) needed
       4684 pages; the pool had 535 free; 7 idle-continuation demotions
