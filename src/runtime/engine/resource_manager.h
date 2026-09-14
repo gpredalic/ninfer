@@ -2536,9 +2536,17 @@ private:
                         if (retained_private_source) { ++source.active_references; }
                     } else {
                         // Root-fallback acknowledgement (summary-less Retained):
-                        // the logical entry survives restorable — keep it
-                        // Catalogued with its prior summary, no reference bump.
-                        source.state = CatalogState::Catalogued;
+                        // the source's physical state was evicted before restore
+                        // and the program released its continuation slot (recycled
+                        // as the root destination), so the entry no longer holds a
+                        // live capability. Retire it: the publication slot IS this
+                        // slot (ConsumedToActive was planned), and a stale handle
+                        // would fail the publication check ("active publication
+                        // cell retained an inactive capability"). Restorability
+                        // lives in the host-KV safety net, which is separate and
+                        // survives.
+                        erase_session_if_owner(source.id);
+                        clear_catalog_entry(source);
                     }
                 } else if (result.source->disposition == ClaimDisposition::ConsumedToActive) {
                     erase_session_if_owner(source.id);
