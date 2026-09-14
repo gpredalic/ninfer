@@ -20,10 +20,14 @@ device slot but the pool is full, and the only relief is demand-driven (no-op
 when the stale planner model adds 0 state slots) → "no resident state" → root
 fallback → adopt contract error → retry loop. **Fix:** demote the coldest
 demotable checkpoint before each H2D restore attempt (both sites). Verified:
-prod 0 errors post-deploy; e2e phase 12 (new regression phase) 5/5 PASS.
-Follow-ups: planner-side demand for the H2D slot when source is HostOnly;
-right-size the pool for thinking sessions + shared prefixes (6 + 2 > 8 is
-structurally over-committed); rename the misleading LEAK label.
+prod 0 errors 14:50–15:03 (reqs 8–16 all healthy); e2e phase 12 (new regression
+phase) 5/5 PASS. **The engine no longer wedges.** One request error still
+surfaced at 15:05 (req 17): a legitimate source-eviction fallback whose abort
+terminal hit the adopt contract (task #6) — the request errored instead of
+cancelling cleanly, but the engine kept serving (reqs 18–21 healthy after).
+Follow-ups: task #6 (adopt contract); planner-side demand for the H2D slot when
+source is HostOnly; right-size the pool for thinking sessions + shared prefixes
+(6 + 2 > 8 is structurally over-committed); rename the misleading LEAK label.
 
 ### 2. Strip-collapse fix — `--strip-thinking-cache`  (after #1)
 Re-prefill only the 7 RoPE-bound attention layers after a thinking-strip; restore
@@ -47,16 +51,41 @@ long sessions slow. Only worth it if the perf cost matters; investigate the
 `rewrite_checkpoint_invalid` ckpt-miss clusters (spills without a checkpoint can't
 back a fast private restore).
 
-### 5. 120s fit-gate deadline — live validation
-Verified by review + unit tests, but untested under real saturation (the e2e pool
-never pins at 100%, so the deadline never fires there). It gets its first live
-exercise the next time a pool saturates — watch the journal for
-`[materialize] KV defer deadline exceeded` and confirm the request aborts cleanly
-(other sessions preserved) instead of stalling.
+### 5. 120s fit-gate deadline — live validation — DONE (2026-09-14)
+Verified by review + unit tests, and now **live**: the deadline fired 5× today
+(13:44:40, 14:18, 14:43, 14:48, 15:05) under real pool saturation — each time
+`[materialize] KV defer deadline exceeded (120s) — aborting request, other
+sessions preserved`, with the engine continuing to serve other requests and no
+crash. The bounded-defer fix (`cb0f245c`) is confirmed working in production.
+Note (15:05): when the deadline abort follows a root fallback (`has_source=false`),
+the Aborted terminal still goes through `adopt_materialization_progress` and
+throws "private source result is missing" → the request surfaces as an error
+instead of a clean cancel. That is the open adopt-contract task below.
+
+### 6. Adopt contract: no-source terminals must not error the request (OPEN)
+The last piece of the 2026-09-14 chain. `adopt_materialization_progress`
+(`resource_manager.h:2505`) requires `result.source` whenever the claim record
+has a `source_slot` — but a legitimate root fallback (source evicted: "no
+resident state") sets `has_source=false`, so the terminal carries no source,
+and adopt throws. Observed 15:05:30: source evicted → root fallback → KV defer
+→ 120s deadline abort → adopt throws → `req 17 error` (instead of a clean
+cancel). The engine itself was fine (other sessions preserved). Fix: on a
+terminal with no source (Aborted, or Published-after-fallback), adopt should
+release the source claim gracefully (revert to Catalogued if the slot is still
+valid, else free it) instead of throwing. Requires care: the fallback recycles
+the source's physical continuation slot as the root destination, so the RM
+must not later release it twice.
 
 ## Known issues / follow-ups
 
 ### State-lease leak on rewrite state → entitlement mismatch (filed 2026-09-14)
+
+**STATUS: RESOLVED 2026-09-14 (`fc5d0cf3`). The "leak" was a false alarm — see the
+14:45 update below for the confirmed root cause (shared-prefix retention + missing
+H2D relief) and the fix. The orphan-leak hypothesis in the body of this entry was
+DISPROVEN (every observed refusal has `shared_refs=1`, i.e. a legitimate live
+shared-prefix reference, not an orphan). The investigation history is kept below
+for reference.**
 
 **Symptom (from the 2026-09-13 attention-loss forensics, session f3f780aa):** on a
 subagent conversation (23k→217k tokens) under device-KV pressure, the journal
