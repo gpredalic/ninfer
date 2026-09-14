@@ -44,12 +44,50 @@ run: 4 FAILs, all `rewrite_checkpoint_invalid`, while forced-thinking phase 4 wa
 100%). Force reasoning in phases 5/6 like phase 4 does (`s.args.thinking_mode = True`
 + `reasoning: {effort: low}` in the payload) — ~5 lines in `tools/e2e/ninfer-e2e.py`.
 
-### 4. Chase the 93 mid-conversation `reuse=root` re-prefills
-The 2026-09-14 e2e had 93 mid-conversation roots (2.0M tokens re-prefilled from
-scratch). Known net-accumulation / ckpt-miss territory — the same class that made
-long sessions slow. Only worth it if the perf cost matters; investigate the
-`rewrite_checkpoint_invalid` ckpt-miss clusters (spills without a checkpoint can't
-back a fast private restore).
+### 4. Mid-conversation `reuse=root` re-prefills — INVESTIGATED (2026-09-14)
+Reconstructed from the request log (the 12:55 e2e run + today's prod traffic).
+The "93" was an undercount: e2e had **156** mid-conversation roots (2.78M tokens,
+all full roots, cache=0); prod had **119** (12.17M actual re-prefill tokens).
+
+**Prod split (the 75 true full roots, 11.88M tokens):**
+- 27 / 3.78M — restart-induced: the conversation's first turn in a fresh instance
+  (state wiped by the ~15 restarts of the error loop). **Gone with the adopt-fix
+  deploy** (0 errors since 20:04; no more restarts expected).
+- 48 / 8.10M — **mid-instance losses**: an earlier turn existed in the same
+  instance, yet the state was gone. Concentrated in the 6–8 largest conversations
+  (200k–400k-token long-running agent sessions), every turn, 1–4 min apart.
+- Plus 44 safety-net roots (cache>0): private continuation evicted, shared-prefix
+  safety net restored — cheap in tokens (0.29M) but 19s H2D ttft vs ~1.7s normal.
+
+**Mechanism (same in e2e and prod):** the host *state-slot* pool is the binding
+constraint, not host-KV bytes. Each state image is ~147 MiB; prod runs
+`--host-state-slots 24` (≈3.5 GiB of state). With 3+ concurrent large
+conversations (each holding turn-closure + checkpoint + anchor images) plus
+shared prefixes, the pool saturates (hs sawtooths 0→24→0 in the throughput log);
+LRU then evicts a live conversation's continuation before its next turn arrives
+(the user takes 1–4 min between turns). Next turn: no candidate → `no_pressure`,
+`targets_evaluated=1`, full root prefill. e2e (8 slots / 4 GiB) is the same
+mechanism at higher pressure, plus dead-phase catalog bloat that exhausts the
+planner's 4096-target budget (`budget_exhausted=True`, `stop_reason=
+expansion_capacity`) — a secondary symptom, not the cause.
+Journal confirms the safety-net path: `safety-net HIT after source eviction`
+(frontier restored, 19s ttft) and `ckpt-miss: reason=rewrite_checkpoint_invalid`
+(spills without a valid checkpoint can't back a fast private restore — the
+original hypothesis, confirmed; ties to task #3).
+
+**Follow-ups (new, from this investigation):**
+- [ ] #4a Right-size / protect the state pool: per-active-session minimum
+      guarantee (≥2 slots: turn-closure + checkpoint) so an interactive session's
+      continuation can't be LRU-evicted by another session's capture; or raise
+      `--host-state-slots` (147 MiB/slot — 48 slots ≈ 7 GiB RAM). Overlaps
+      follow-up #1b.
+- [ ] #4b Idle-aware retention: weight `RecentPrivate` by last-activity recency
+      (a session that responded <10 min ago is "interactive", not dead).
+- [ ] #4c Retry detection: identical prompt re-sent within ~60s (seen 3× at
+      16:36–16:46, 385k tokens each; 2× at 19:45–19:46, 400k each) re-prefills
+      from scratch — ~2.5M tokens of pure retry waste today.
+- [ ] #4d Planner: prune long-idle / dead owners from the search space so a
+      bloated catalog doesn't burn the full 4096-target budget (e2e symptom).
 
 ### 5. 120s fit-gate deadline — live validation — DONE (2026-09-14)
 Verified by review + unit tests, and now **live**: the deadline fired 5× today
@@ -62,7 +100,7 @@ the Aborted terminal still goes through `adopt_materialization_progress` and
 throws "private source result is missing" → the request surfaces as an error
 instead of a clean cancel. That is the open adopt-contract task below.
 
-### 6. Adopt contract: no-source terminals must not error the request (OPEN)
+### 6. Adopt contract: no-source terminals must not error the request — DONE (2026-09-14, `f6a5bec3` + `b60c37eb`)
 The last piece of the 2026-09-14 chain. `adopt_materialization_progress`
 (`resource_manager.h:2505`) requires `result.source` whenever the claim record
 has a `source_slot` — but a legitimate root fallback (source evicted: "no
@@ -75,6 +113,12 @@ release the source claim gracefully (revert to Catalogued if the slot is still
 valid, else free it) instead of throwing. Requires care: the fallback recycles
 the source's physical continuation slot as the root destination, so the RM
 must not later release it twice.
+**Shipped:** `f6a5bec3` (reader side: RM adopt block + summary-less Retained
+acknowledgement) + `b60c37eb` (writer side: the fallback catch sets
+`source_fallback_retained` — without it the fix was inert). Built clean,
+deployed 20:04:47 (PID 155184). Post-deploy: 7 "no resident state" fallbacks,
+**0** "private source result is missing" (was 38 in the prior 6h). The fallback
+now completes the request on the slow path instead of erroring.
 
 ## Known issues / follow-ups
 
