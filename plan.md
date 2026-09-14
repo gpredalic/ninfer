@@ -25,7 +25,7 @@ net), or torn apart mid-eviction:
 
 **Unity is the main goal.** Fix the split and the follow-up list collapses.
 
-## Status (2026-09-14, 23:34 redeploy)
+## Status (2026-09-14, 00:15 redeploy)
 
 - **23:00–23:10 episode → 23:12 manual restart.** `materializing=1`
   sustained 22:59:45–23:03:35 (+23:08:25–23:09:30), engine ticker degraded
@@ -34,18 +34,37 @@ net), or torn apart mid-eviction:
   generation cannot be serialized"). The 5548-page demand exceeded free
   pages even if every idle-continuation demotion succeeded — the pool is
   structurally over-committed for this working set (P1.5).
-- **The wedge sentinel never fired** (three compounding defects; v2 fixes
-  all, `478054b9`). The running process had the pre-fix detection (bash does
-  not reload on-disk edits — the service was restarted to load v2); the old
-  detection required `materializing=0`; and a poll with no journal line
-  reset the timer while a wedged engine goes silent or degrades. v2 polls
-  HTTP /stats first, journal as fallback, and HOLDs an armed timer through
-  silence.
+- **The wedge sentinel fired twice** (22:56:12 restart #1, 23:12:04
+  restart #2 — both class-A `w≥1` wedges; the 23:12:04 stop was the
+  sentinel, not manual). The user-experienced "sentinel not working" was
+  the **class-B `m=1` blind spot** (22:40–22:52, 22:59–23:09 stalls — v1
+  required `materializing=0`), plus two v1 weaknesses: a poll with no
+  journal line reset the timer while a wedged engine degrades its ticker
+  to 25–30s, and on-disk edits never reach the running process (bash
+  parses the loop at startup). v2 (`478054b9`) fixes all three: /stats
+  primary, journal fallback, armed timer held through silence.
+- **The 23:10:21 wedge root-caused and fixed** (`20213d4b`): req 21's
+  120s-defer abort released its slot (generation++); the client retry
+  (req 22) hit a catalog entry still holding the old handle;
+  `inspect_admission` threw `admission source continuation is stale`; the
+  worker's logic_error recovery left the request pending but the one-shot
+  `admission_check_pending` signal was already consumed →
+  `should_attempt_admission` false forever → `waiting=1`, GPU 0%, until
+  the sentinel restarted at 23:12:04. Same mechanism as the 13:28:57
+  wedge (req 150, 4+ min unadmitted). Fix: recoverable worker exceptions
+  re-arm the admission check (bounded fail-all after 8 consecutive
+  recoveries), and a stale admission candidate is now skipped (inspect
+  MISS) instead of throwing.
 - **Relief ranking fix deployed** (`a53db4b4`): victims ranked by *unique*
   resident pages (text + backend), batched 3/tick — the 22:28 class
   (demote 29k mapped pages, free 77) now targets what a release actually
   frees. Helps marginal fits; cannot by itself fix the 23:09 episode
   (needs the prefix-scale lever — P1.5c/d).
+- **P0.3 applied** (`--host-state-slots 48`, verified live): the 23:09
+  episode's upstream cause was state-pool saturation (24/24) — the
+  incoming 323k-token request's checkpoint was evicted at admission, so
+  selection demanded a full-root 5548 pages instead of the ~24k-token
+  delta the shortlist showed at abort time.
 - Earlier (post-deploy 20:04 / restart 20:46): `private source result is
   missing` 44 → 0 (adopt fix); P1.1 `inactive capability` cleared
   (`81933c0a`); P1.3 stall relief in place (`47406f79`); 3 sporadic error
@@ -61,10 +80,15 @@ net), or torn apart mid-eviction:
       `tools/e2e/ninfer-e2e.py`. `8530a45b`. *Exit:* two consecutive full e2e
       runs with 0 `rewrite_checkpoint_invalid` flaps. **This makes e2e a
       trustworthy gate for the P1 fixes.**
-- [ ] **P0.2 — retry detection** (old #4c). Identical prompt re-sent within ~60s
-      re-prefills from scratch (~2.5M tokens of pure retry waste today). Detect
-      the repeat, serve from the just-completed continuation.
-      *Exit:* e2e retry scenario; 0 full re-prefills on repeated prompts.
+- [ ] **P0.2 — retry detection** (old #4c). **Re-scoped 00:15:** the 23:10
+      episode showed the content-keyed shortlist already serves an
+      identical re-sent prompt (`[shortlist] HIT reuse_tokens=295509` on
+      req 22, the retry after req 21's abort) — no full re-prefill. The
+      observed retry waste was the *wedge→restart* cycle (retry hangs →
+      restart → cold re-prefill), which `20213d4b` addresses. *Exit:* after
+      a live window on the fixed binary, check the request log for genuine
+      same-prompt re-prefills (`reuse=root` within ~60s of an identical
+      prompt); build the hash-ring detector only if the data shows them.
 - [x] **P0.3 — state-pool stopgap** (old #1b-lite). `--host-state-slots 24→48`
       in `~/.config/ninfer.conf` (147 MiB/slot → ~7 GiB RAM). Applied 23:55,
       verified `host_state_capacity_slots: 48`. Justified by the 23:09
@@ -131,19 +155,33 @@ development. Each is verified with the P0 e2e gate + the live journal.
       with `waiting≥1` or `materializing≥1` (the 13:28:57 wedge: req 150 never
       admitted for 4+ min; the 15:15–15:32 stall: `materializing=1` for ~15
       min; the 22:59–23:10 stall: `materializing=1` 3.5+ min, ticker degraded
-      to 25–30s). Both pre-fix, both unverified-gone. The wedge sentinel
+      to 25–30s). Both pre-fix, both unverified-gone. **Root cause of the
+      class-A wedge found and fixed (`20213d4b`, 00:15):** a recoverable
+      worker exception during admission (e.g. `admission source continuation
+      is stale` after an abort recycled the slot) consumed the one-shot
+      `admission_check_pending` signal; recovery left the request pending but
+      never re-armed the signal, so `should_attempt_admission` returned false
+      forever — `waiting=1`, GPU 0%, until restart (23:10:21→23:12:04; same
+      mechanism as 13:28:57). Fix: recoverable catches re-arm
+      `request_admission_check()` (bounded fail-all after 8 consecutive
+      recoveries) and a stale admission candidate is skipped (inspect MISS)
+      instead of throwing. The wedge sentinel
       (`tools/monitor/wedge-sentinel.sh`, now the standalone
       `ninfer-wedge-sentinel.service`) is the tripwire: it restarts after 90s
       of that state (3-in-30-min cap) — **every firing is a timestamped data
-      point to investigate, and the goal is zero firings.** v2 (`478054b9`)
-      after the 23:12 episode: /stats primary, journal fallback, armed timer
-      held through engine silence (v1 reset on a missing line and ran stale
-      code — bash does not reload on-disk edits). *Exit:* (a) the
+      point to investigate, and the goal is zero firings.** v1 fired twice
+      (22:56:12, 23:12:04 — both class-A); the user-experienced gap was the
+      class-B `m=1` blind spot. v2 (`478054b9`) after the 23:12 episode:
+      /stats primary, journal fallback, armed timer held through engine
+      silence (v1 reset on a missing line and ran stale code — bash does not
+      reload on-disk edits). *Exit:* (a) the
       15:15 stall class is diagnosed (what state holds `materializing`
       without progress, and why admission stops promoting); (b) every stuck
       state has a bounded progress guarantee — it progresses or the request
-      fails within a deadline (the 120s-defer pattern generalized); (c) 0
-      sentinel firings over a full day of live use.
+      fails within a deadline (the 120s-defer pattern generalized) —
+      **shipped for the admission-wedge class by `20213d4b` (re-arm + bounded
+      fail-all); verify in a live window**; (c) 0 sentinel firings over a
+      full day of live use.
 
 *P1 exit criteria:* a 1-hour saturated window (3 concurrent large
 conversations) with **0 request errors, 0 deadline aborts, no restart.**
