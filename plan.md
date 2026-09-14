@@ -8,6 +8,123 @@ cache-shedding work.
 
 The governing invariant for all of it is the standing plan below.
 
+## Open tasks (2026-09-14)
+
+Prioritized. "Now" = the active thread; the rest are queued follow-ups.
+
+### 1. State-lease wedge — triage → fix  (NOW — top priority)
+The bug actively forcing user restarts. On the fixed binary (livelock gone:
+0 defers / 0 OOM / 0 bad_alloc), the server still wedged at 13:28:57 on 2026-09-14:
+`waiting=1, running=0, materializing=0` for 4+ min, never admitting req 150.
+- [x] **Triage (confirmed):** the wedge is a *silent* stall — no admission error or
+      exception fired (0 "isolated-feasible", 0 "exceeds KV capacity", 0 queue-timeout
+      in the window). Signature of `try_admit_one` returning `None` (blocked head,
+      resources never free), not an error path. `[state-lease] LEAK: release refused
+      (rewrite) blockers=1` fired on nearly every thinking turn (12× in the window),
+      3× immediately after req 149 completed, right before the wedge.
+- [ ] **Root-cause:** confirm the leaked rewrite state slot keeps a lane/slot
+      logically occupied so `inspect_admission` never returns Ready for the waiting
+      head. Trace where `checkpoint_references` on a rewrite state is incremented
+      (capture) and never decremented.
+- [ ] **Fix:** drop the stale `checkpoint_references` before the rewrite release
+      (sequence-clear path, `program_impl.h:11565–11574`), or balance the capture
+      path. Verify: a thinking session no longer wedges; `host_slot_release_failures`
+      stays 0.
+
+### 2. Strip-collapse fix — `--strip-thinking-cache`  (after #1)
+Re-prefill only the 7 RoPE-bound attention layers after a thinking-strip; restore
+the 21 GDN/SSM layers from the position-independent state image. Design is in the
+"Strip-Thinking-Cache" section below. 4× faster cancellation, ~80× less arena.
+- [ ] Scope the implementation (spill path, state-image restore, device-KV free,
+      new CLI flag, identity/entitlement interaction).
+- [ ] Implement + e2e-verify.
+
+### 3. Make e2e checkpoint assertions deterministic
+Phases 5/6 (checkpoint-advance, tool-calling) assert rewrite-checkpoint hits but the
+base `Session` doesn't force thinking — so they flap on model mood (the 2026-09-14
+run: 4 FAILs, all `rewrite_checkpoint_invalid`, while forced-thinking phase 4 was
+100%). Force reasoning in phases 5/6 like phase 4 does (`s.args.thinking_mode = True`
++ `reasoning: {effort: low}` in the payload) — ~5 lines in `tools/e2e/ninfer-e2e.py`.
+
+### 4. Chase the 93 mid-conversation `reuse=root` re-prefills
+The 2026-09-14 e2e had 93 mid-conversation roots (2.0M tokens re-prefilled from
+scratch). Known net-accumulation / ckpt-miss territory — the same class that made
+long sessions slow. Only worth it if the perf cost matters; investigate the
+`rewrite_checkpoint_invalid` ckpt-miss clusters (spills without a checkpoint can't
+back a fast private restore).
+
+### 5. 120s fit-gate deadline — live validation
+Verified by review + unit tests, but untested under real saturation (the e2e pool
+never pins at 100%, so the deadline never fires there). It gets its first live
+exercise the next time a pool saturates — watch the journal for
+`[materialize] KV defer deadline exceeded` and confirm the request aborts cleanly
+(other sessions preserved) instead of stalling.
+
+## Known issues / follow-ups
+
+### State-lease leak on rewrite state → entitlement mismatch (filed 2026-09-14)
+
+**Symptom (from the 2026-09-13 attention-loss forensics, session f3f780aa):** on a
+subagent conversation (23k→217k tokens) under device-KV pressure, the journal
+showed, in the same window:
+
+- `[state-lease] LEAK: release refused (rewrite) blockers=1` (21:55:14)
+- `materialized sequence does not match its active entitlement` — **29×**, mostly
+  22:30–22:43, 12+ in a row on the subagent conversation
+- `retained materialization source is unavailable` — 5×
+
+Each entitlement failure aborts the materialization and forces a clean root
+re-prefill (slow, not wrong — no corrupted output was ever delivered).
+
+**Code locations:**
+- The leak: `ProgramImplCore::try_release_state_image` (`program_impl.h:6517`).
+  `release()` refuses when `release_blockers(handle) != 0`; `blockers=1` is
+  **bit 0 = `checkpoint_references != 0`** (`state_image_store.h:383`). So the
+  rewrite state image still holds checkpoint references when the sequence-clear
+  path releases it.
+- The release site: the sequence-clear block (`program_impl.h:11565–11574`)
+  releases `sequence.rewrite_state` via `try_release_state_image(handle, "rewrite")`
+  *after* dropping checkpoint references for `long_anchors` (11555–11562) — but it
+  does **not** drop `checkpoint_references` on the rewrite state itself before
+  releasing it. If the rewrite state was captured as a checkpoint whose reference
+  was never released, the release is refused and the state slot leaks.
+- The symptom: the entitlement check (`program_impl.h:8007`) compares
+  `resident_resources(sequence)` (actual) against `details.demand.active_entitlement`
+  (planned). A leaked, still-occupied state slot shifts actual occupancy away from
+  the plan → mismatch → abort → root re-prefill → repeat.
+
+**Hypothesis (to confirm):** the rewrite state image retains `checkpoint_references`
+that should have been dropped when the checkpoint was consumed/superseded, so the
+sequence-clear release is refused (leak), and the leaked slot is what breaks the
+entitlement match. The leak is the likely root; the entitlement mismatch is the
+symptom.
+
+**To investigate:**
+1. Trace where `checkpoint_references` on a rewrite state is incremented
+   (checkpoint capture) and where it should be decremented — find the path that
+   leaves it non-zero at sequence-clear time.
+2. Confirm the correlation: does the entitlement mismatch fire only when a
+   preceding `[state-lease] LEAK … (rewrite)` occurred on the same sequence?
+3. Decide the fix: drop the stale `checkpoint_references` before the rewrite
+   release, or make the entitlement check tolerate a known-leaked slot, or fix the
+   capture path so the reference is balanced.
+
+**Consequence (bounded):** slow re-prefills and reduced state-slot headroom, not
+silent corruption. ~~Lower priority than the strip-collapse fix~~ — see update below.
+
+**2026-09-14 13:30 update — this is the ACTIVE WEDGE CAUSE, top priority.** On the
+fixed binary (livelock gone: 0 defers / 0 OOM / 0 bad_alloc in the 13:05–13:33
+window), the server still wedged and forced a user restart. The journal shows the
+`[state-lease] LEAK: release refused (rewrite) blockers=1` firing on **nearly every
+turn** (12× in the window), and **3 of them fired immediately after req 149
+completed (13:28:53.146) — right before the engine wedged at 13:28:57** and sat at
+`waiting=1, running=0, materializing=0` for 4+ minutes, never admitting req 150.
+So the leak is not just "slower re-prefills": a refused rewrite-state release is
+leaving a lane/slot in a state the admission loop won't promote the next request
+from. **This is the bug the user keeps hitting.** Investigate the admission path:
+does a leaked state slot keep a lane logically occupied so `request_admission_check`
+never admits the waiting request? This supersedes the "lower priority" note above.
+
 ## Standing plan — a cache unit is {KV + state}, atomically (invariant for every phase)
 
 A context-cache unit is **the attention KV and the GDN recurrent state together**.
