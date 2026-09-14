@@ -100,6 +100,26 @@ Still open from the jinja line (carried, not on the serving path):
 > uncaught `bad_alloc` to a controlled abort-to-root-prefill. Remaining: deploy
 > (one-command e2e swap) + `--device-state-slots 5` headroom in the serve config,
 > then the 4-session live-load acceptance run.
+>
+> **Status (2026-09-14):** deployed and verified. The device-KV fit gate
+> (`cdaae981`) shipped, but its defer was unbounded: a demand that never fits
+> retried on every ~1ms engine tick with no timeout (materializing requests are
+> exempt from the pending timeout, and the gate runs before any relief work),
+> and it logged on every defer (~1000 lines/s). Under a saturated pool this
+> livelocked the engine (540k defer lines in 21 min, 3 SIGKILL-after-timeout
+> server deaths). Fixed in `cb0f245c`: first defer starts a 120 s deadline
+> (`MaterializationTransaction::kv_defer_first`); on expiry the progress tick
+> aborts the request (Aborted → engine completes it as cancelled, other
+> sessions preserved — same fail-one-request semantics as the OOM-retry path);
+> defer log rate-limited to free-page progress + 5 s heartbeat. Full 11-phase
+> e2e on the fixed binary: 43 PASS / 27 WARN / 4 FAIL, **zero bad_alloc, zero
+> defers, zero deadline aborts** (the gate never fired under e2e load — the
+> deadline is the safety net for the saturated case). The 4 FAILs are
+> checkpoint-capture assertions in phases 5/6 that depend on the model
+> spontaneously thinking (no rewrite checkpoint was generated on those turns —
+> forced-thinking phase 4 captured 100%); model non-determinism, not a server
+> regression. Monitor sidecar now reads the journal (cursor-based), journald
+> persists to /var/log/journal (2G cap).
 
 Production testing under extreme pressure (single 371k-token session, 1016
 messages, arena exhausted to 14MB free) revealed two issues in the host KV
