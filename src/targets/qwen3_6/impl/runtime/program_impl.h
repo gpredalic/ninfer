@@ -7403,6 +7403,12 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
             requests[dest_lane].prefill->base = 0;
             requests[dest_lane].prefill->cursor = 0;
             requests[dest_lane].prefill->reuse = ReusePath::Root;
+            // The MTP bridge staged for the evicted source's suffix is outside
+            // any suffix of a pure root prefill — the first prefill step would
+            // throw "staged MTP bridge is outside the reusable suffix" (the
+            // 00:53:34/01:09:53 class). Clear it; if a safety-net restore is
+            // found below, it is re-staged for the restored base.
+            requests[dest_lane].prefill->mtp_bridge = MtpBridgeMode::None;
         }
         // Try the safety net: the evicted source's KV and state may have
         // been spilled to host. If found, the restore path in start_sequence
@@ -7420,6 +7426,17 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
                     std::fprintf(stderr,
                                  "[materialize] safety-net HIT after source eviction: frontier=%u checkpoint=%d\n",
                                  match->reuse_tokens, static_cast<int>(match->checkpoint));
+                } else if (transaction.plan && transaction.plan->impl_) {
+                    // No safety-net entry: a pure root prefill from token 0 has
+                    // no reusable suffix, so the MTP bridge staged for the
+                    // original source-based plan is invalid — a BeforeSuffix
+                    // bridge with base==0 throws "staged MTP bridge is outside
+                    // the reusable suffix" on the first prefill step (the
+                    // 00:53:34/01:09:53 class). Clear it; MTP speculation
+                    // starts cold this turn and is re-staged by the next
+                    // capture. (With a restore, the bridge is re-targeted at
+                    // runtime via staged.base + the restored tail_hidden.)
+                    transaction.plan->impl_->mtp_bridge = MtpBridgeMode::None;
                 }
             }
         }
@@ -12652,36 +12669,49 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
         if (staged.mtp_bridge == MtpBridgeMode::BeforeSuffix) {
             if (staged.cursor != staged.base || staged.base == 0 ||
                 staged.cursor >= staged.prompt_tokens) {
-                throw std::logic_error("staged MTP bridge is outside the reusable suffix");
-            }
-            mark_workspace_usage(workspace_plan.mtp_prefill);
-            const Tensor& previous_hidden = sequence.tail_hidden;
-            const schedule::MtpBridgeInput bridge{
-                .previous_hidden = &previous_hidden,
-                .position        = checked_i32(staged.base - 1, "MTP bridge position"),
-                .rope_position   = [&, this] {
-                    auto rp = prompt_rope_position(staged.prompt, staged.base - 1);
-                    for (int axis = 0; axis < 3; ++axis) {
-                        rp[axis] = yarn_scale_position(rp[axis], rope_scaling_original_context,
-                                                       rope_scaling_factor);
-                    }
-                    return rp;
-                }(),
-            };
-            if (staged.vision) {
-                schedule::mtp_bridge_multimodal(schedule_state, staged.prompt, *staged.vision,
-                                                bridge);
+                // A stale bridge: the reusable-suffix boundary moved after the
+                // bridge was staged — a root fallback after source eviction
+                // (base reset to 0), or a safety-net restore that advanced the
+                // base past the staged bridge position. Degrade gracefully:
+                // drop the MTP bridge and prefill without it instead of failing
+                // the request and tripping a worker recovery. MTP speculation
+                // still runs (prepare_mtp is independent), just without the
+                // warm-started bridge for this turn.
+                std::fprintf(stderr,
+                             "[mtp] dropping stale bridge (cursor=%u base=%u prompt=%u) — "
+                             "prefilling without MTP bridge\n",
+                             staged.cursor, staged.base, staged.prompt_tokens);
+                staged.mtp_bridge = MtpBridgeMode::None;
             } else {
-                Tensor bridge_token = io.mtp->target_input_ids.slice(0, 0, 1);
-                const TokenId token = staged.prompt.token_ids[staged.base];
-                CUDA_CHECK(cudaMemcpyAsync(bridge_token.data, &token, sizeof(token),
-                                           cudaMemcpyHostToDevice, device.stream));
-                schedule::mtp_bridge_and_propose(schedule_state, bridge_token, previous_hidden,
-                                                 bridge.position, bridge.rope_position, false);
+                mark_workspace_usage(workspace_plan.mtp_prefill);
+                const Tensor& previous_hidden = sequence.tail_hidden;
+                const schedule::MtpBridgeInput bridge{
+                    .previous_hidden = &previous_hidden,
+                    .position        = checked_i32(staged.base - 1, "MTP bridge position"),
+                    .rope_position   = [&, this] {
+                        auto rp = prompt_rope_position(staged.prompt, staged.base - 1);
+                        for (int axis = 0; axis < 3; ++axis) {
+                            rp[axis] = yarn_scale_position(rp[axis], rope_scaling_original_context,
+                                                           rope_scaling_factor);
+                        }
+                        return rp;
+                    }(),
+                };
+                if (staged.vision) {
+                    schedule::mtp_bridge_multimodal(schedule_state, staged.prompt, *staged.vision,
+                                                    bridge);
+                } else {
+                    Tensor bridge_token = io.mtp->target_input_ids.slice(0, 0, 1);
+                    const TokenId token = staged.prompt.token_ids[staged.base];
+                    CUDA_CHECK(cudaMemcpyAsync(bridge_token.data, &token, sizeof(token),
+                                               cudaMemcpyHostToDevice, device.stream));
+                    schedule::mtp_bridge_and_propose(schedule_state, bridge_token, previous_hidden,
+                                                     bridge.position, bridge.rope_position, false);
+                }
+                sequence.mtp_kv_valid = staged.base;
+                commit_sequence_kv(sequence, sequence.text_kv_valid, sequence.mtp_kv_valid);
+                staged.mtp_bridge = MtpBridgeMode::None;
             }
-            sequence.mtp_kv_valid = staged.base;
-            commit_sequence_kv(sequence, sequence.text_kv_valid, sequence.mtp_kv_valid);
-            staged.mtp_bridge = MtpBridgeMode::None;
         }
 
         if (staged.cursor < staged.prompt_tokens) {
