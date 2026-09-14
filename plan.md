@@ -25,9 +25,20 @@ net), or torn apart mid-eviction:
 
 **Unity is the main goal.** Fix the split and the follow-up list collapses.
 
-## Status (2026-09-14, 00:15 redeploy)
+## Status (2026-09-15, 00:20 redeploy)
 
-- **23:00–23:10 episode → 23:12 manual restart.** `materializing=1`
+- **00:10:52–00:10:55: `runtime Begin summary differs from committed
+  admission` — req 21 and 23 (the user's live session, erroring every
+  turn).** A source-based admission (shortlist HIT, reuse 107472/108487)
+  whose source's state image had been demoted to host while a sibling
+  request ran degraded to the documented Root + safety-net fallback at
+  materialization; the engine's Begin check only anticipated reuse
+  *growing* and threw on the *downgrade* — and the recovery failed every
+  other in-flight request too. Fixed `ce753306`: the documented downgrade
+  (committed non-Root → runtime Root, content-verified) is accepted with a
+  diagnostic; all other path/reuse changes stay fatal. Structural home:
+  P2.3 atomic admission.
+- **23:00–23:10 episode → 23:12:04 sentinel restart.** `materializing=1`
   sustained 22:59:45–23:03:35 (+23:08:25–23:09:30), engine ticker degraded
   to 25–30s cadence; req 21 then sat on `KV capacity defer: need 5548
   pages, free 2370→2462` until the 120s deadline abort (23:10:21, "cancelled
@@ -112,8 +123,19 @@ development. Each is verified with the P0 e2e gate + the live journal.
       `replacement effect changed` (`program_impl.h:9325`), `entitlement is
       inconsistent` (`program_impl.h:11647`), and (new, 22:10:58) `staged MTP
       bridge is outside the reusable suffix` (`program_impl.h:12544`). All are
-      the unit torn apart mid-eviction. *Exit:* 0 of each in a saturated e2e +
-      journal window.
+      the unit torn apart mid-eviction. **Fixed 00:20 (`ce753306`):
+      `runtime Begin summary differs from committed admission`** — the
+      00:10:52/00:10:55 episode (req 21/23, user's live session erroring
+      every turn): a source-based admission whose source's state image was
+      demoted to host while a sibling request ran degraded to the documented
+      Root + safety-net fallback at materialization; the engine's Begin check
+      only anticipated reuse *growing* and threw on the *downgrade*, and the
+      recovery also failed every other in-flight request. The runtime Begin
+      is content-verified, so the documented downgrade (committed non-Root →
+      runtime Root) is now accepted with a diagnostic; all other changes
+      stay fatal. Structural home: P2.3 atomic admission (commit only a path
+      whose unit is resident or atomically restorable). *Exit:* 0 of each in
+      a saturated e2e + journal window.
 - [x] **P1.3 — device KV: free pages from idle sessions.** `47406f79`. While a
       fit-gate defer is in flight and free pages have not grown for 15s, the
       gate demotes the largest idle continuation to the host safety net and
