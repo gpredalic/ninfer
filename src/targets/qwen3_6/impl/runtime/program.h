@@ -977,6 +977,20 @@ private:
         bool cancel_pending                 = false;
         bool prepared                       = false;
         bool terminal                       = false;
+        // Device-KV fit-gate defer bookkeeping (set by prepare_materialization's
+        // capacity gate, cleared when a prepare passes the gate). kv_defer_first
+        // bounds the defer: once it is older than kKVDeferDeadline the progress
+        // tick aborts the request instead of retrying forever — an unbounded
+        // defer livelocked the engine under sustained pool saturation (a
+        // single in-flight materialization cannot free pages itself, so a
+        // demand that never fits deferred on every ~1ms tick indefinitely).
+        // The last_logged fields rate-limit the defer log to free-page
+        // progress plus a 5-second heartbeat (a 1ms-tick engine otherwise
+        // turns one unfitted demand into ~1000 log lines/second).
+        std::optional<std::chrono::steady_clock::time_point> kv_defer_first;
+        std::uint32_t kv_defer_last_logged_pool = 0;
+        std::uint32_t kv_defer_last_logged_free = 0;
+        std::chrono::steady_clock::time_point kv_defer_last_logged{};
     };
 
     std::uint64_t next_materialization_id_ = 1;

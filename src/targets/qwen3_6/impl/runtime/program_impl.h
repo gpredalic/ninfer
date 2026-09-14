@@ -37,6 +37,17 @@ std::uint32_t normalized_private_capacity(const ContextCacheOptions& options) {
 
 using Clock = std::chrono::steady_clock;
 
+// How long a materialization may keep deferring on the device-KV fit gate
+// before the request is aborted (bounded defer; see the capacity gate in
+// prepare_materialization). Long enough to cover a legitimate relief wait
+// (draining the other in-flight requests that pin the pool), short enough
+// that a pool pinned at 100% by a wedged workload fails the request fast
+// instead of stalling the engine for minutes (the pre-fix behavior was an
+// immediate bad_alloc; the unbounded defer that replaced it livelocked the
+// engine — thousands of pure-defer ticks with no relief possible from
+// inside a single in-flight materialization).
+static constexpr std::chrono::seconds kKVDeferDeadline = std::chrono::seconds(120);
+
 // Host-side YaRN position scaling: positions <= original_context are unchanged;
 // positions beyond the threshold are compressed by factor. Matches the device kernel
 // scale_positions_yarn_kernel in ops/kernel/position.cuh.
@@ -4761,30 +4772,63 @@ bool ProgramImplCore::prepare_materialization(MaterializationTransaction& transa
     // pools' current physical occupancy is known, so a reservation that cannot fit now is
     // deferred to a later engine tick (the caller returns InProgress) instead of throwing
     // std::bad_alloc into the worker OOM handler. Pressure work (demotes/evictions) frees
-    // pages across ticks, so each retry re-runs this gate against lower occupancy. The check
-    // is pure: on a defer nothing is mutated, so the next tick re-prepares identically
-    // (pinned safety-net entry, plan, and pressure bookkeeping all stay intact).
+    // pages across ticks, so each retry re-runs this gate against lower occupancy. The
+    // defer is bounded: the first defer starts a kKVDeferDeadline clock (kv_defer_first),
+    // and the progress tick aborts the request once the deadline passes — a demand that
+    // never fits must fail the request, not stall the engine forever. On a defer the only
+    // mutation is that defer bookkeeping; the transaction's resources (pinned safety-net
+    // entry, plan, pressure bookkeeping) stay intact, so the next tick re-prepares
+    // identically.
     {
+        // Fit-gate defer bookkeeping: record the first defer (bounding it with
+        // kKVDeferDeadline — the progress tick aborts a demand that is still
+        // unfitted after the deadline) and rate-limit the defer log to
+        // free-page progress or a 5-second heartbeat.
+        const auto kv_defer_bookkeeping =
+            [&transaction, this](std::uint32_t pool, const char* name, std::uint32_t need,
+                                 std::uint32_t free) {
+                materialize_kv_defers_.fetch_add(1, std::memory_order_relaxed);
+                const auto now = Clock::now();
+                if (!transaction.kv_defer_first) { transaction.kv_defer_first = now; }
+                const bool progress =
+                    pool != transaction.kv_defer_last_logged_pool || free != transaction.kv_defer_last_logged_free;
+                const bool heartbeat =
+                    transaction.kv_defer_last_logged == std::chrono::steady_clock::time_point{} ||
+                    now - transaction.kv_defer_last_logged >= std::chrono::seconds(5);
+                if (progress || heartbeat) {
+                    const double seconds_deferred =
+                        std::chrono::duration<double>(now - *transaction.kv_defer_first).count();
+                    const auto remaining = std::chrono::duration_cast<std::chrono::seconds>(
+                        std::max<std::chrono::steady_clock::duration>(
+                            std::chrono::steady_clock::duration::zero(),
+                            *transaction.kv_defer_first + kKVDeferDeadline - now));
+                    std::fprintf(stderr,
+                                 "[materialize] %s capacity defer: need %u pages, free %u "
+                                 "(%.1fs deferring; abort if unfitted in %llds)\n",
+                                 name, need, free, seconds_deferred,
+                                 static_cast<long long>(remaining.count()));
+                    transaction.kv_defer_last_logged_pool = pool;
+                    transaction.kv_defer_last_logged_free = free;
+                    transaction.kv_defer_last_logged = now;
+                }
+            };
         const DeviceKVPagePool& text_pool = text_kv_pages->physical_pool();
         if (text_pool.available_pages() < demand.reservation_added.device.main_kv_pages) {
-            materialize_kv_defers_.fetch_add(1, std::memory_order_relaxed);
-            std::fprintf(stderr,
-                         "[materialize] KV capacity defer: need %u pages, free %u, deferring\n",
-                         demand.reservation_added.device.main_kv_pages,
-                         text_pool.available_pages());
+            kv_defer_bookkeeping(0, "KV", demand.reservation_added.device.main_kv_pages,
+                                 text_pool.available_pages());
             return false;
         }
         if (backend_kv_pages) {
             const DeviceKVPagePool& backend_pool = backend_kv_pages->physical_pool();
             if (backend_pool.available_pages() < demand.reservation_added.device.backend_kv_pages) {
-                materialize_kv_defers_.fetch_add(1, std::memory_order_relaxed);
-                std::fprintf(stderr,
-                             "[materialize] KV capacity defer (backend): need %u pages, free %u, deferring\n",
-                             demand.reservation_added.device.backend_kv_pages,
-                             backend_pool.available_pages());
+                kv_defer_bookkeeping(1, "KV (backend)", demand.reservation_added.device.backend_kv_pages,
+                                     backend_pool.available_pages());
                 return false;
             }
         }
+        // The gate passed: this request is no longer waiting on pool occupancy;
+        // restart the defer clock on any future defer.
+        transaction.kv_defer_first.reset();
     }
 
     std::uint32_t state_count = demand.reservation_added.device.state_slots;
@@ -6629,6 +6673,34 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
         complete_victim_acknowledgement();
         complete_shared_victim_acknowledgement();
     };
+    // Bounded defer: the fit gate set kv_defer_first on the first defer. A demand
+    // that still does not fit after kKVDeferDeadline of engine ticks has not been
+    // relieved by pressure work (the gate runs before relief, so a deferred tick
+    // frees nothing by itself — relief only comes from the other in-flight
+    // requests draining). Fail this one request the way the OOM-retry path does
+    // (Aborted → the engine completes it as cancelled), instead of deferring
+    // forever and stalling the engine.
+    const auto abort_if_kv_defer_expired = [&]() {
+        if (transaction.kv_defer_first &&
+            Clock::now() >= *transaction.kv_defer_first + kKVDeferDeadline) {
+            std::fprintf(stderr,
+                         "[materialize] KV defer deadline exceeded (%.0fs) — aborting request, "
+                         "other sessions preserved\n",
+                         std::chrono::duration<double>(Clock::now() - *transaction.kv_defer_first)
+                             .count());
+            try {
+                abort_transaction();
+            } catch (...) {
+                // If even cleanup fails, force-set the terminal state (same
+                // fallback as the OOM-retry path).
+                std::fprintf(stderr, "[materialize] KV defer abort + cleanup failed — forcing abort\n");
+                transaction.terminal = true;
+            }
+            out.status = runtime::ContextTransactionStatus::Aborted;
+            return true;
+        }
+        return false;
+    };
 
     if (cancellation.requested()) { transaction.cancel_pending = true; }
 
@@ -6973,6 +7045,7 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
         if (!prepare_materialization(transaction)) {
             // Device-KV demand cannot fit the current pool occupancy: retry on a later
             // engine tick. Transaction state is untouched, so the retry is identical.
+            if (abort_if_kv_defer_expired()) { return out; }
             out.status = runtime::ContextTransactionStatus::InProgress;
             return out;
         }
@@ -7041,6 +7114,7 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
                 if (!prepare_materialization(transaction)) {
                     // Still no room after the first OOM: defer to a later tick instead of
                     // failing the request (transaction state is untouched).
+                    if (abort_if_kv_defer_expired()) { return out; }
                     out.status = runtime::ContextTransactionStatus::InProgress;
                     return out;
                 }
@@ -7156,6 +7230,7 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
                 // Root (possibly safety-net restore) demand cannot fit the current pool
                 // occupancy: defer to a later tick. The pinned safety-net entry and the
                 // root plan are preserved, so the retry is identical.
+                if (abort_if_kv_defer_expired()) { return out; }
                 out.status = runtime::ContextTransactionStatus::InProgress;
                 return out;
             }
@@ -7903,8 +7978,10 @@ StartResult ProgramImplCore::start_request(MaterializationTransaction& transacti
             // clear_lane will try to spill the partially-modified state — which
             // may have invalid KV/identity and skip the spill silently. Spilling
             // here while the state is still intact ensures the safety net has a
-            // valid copy. If start_sequence succeeds, the extra entry ages out
-            // of the LRU harmlessly.
+            // valid copy. If start_sequence succeeds, the extra entry is
+            // harmless: a later spill of the same prefix supersedes it on add,
+            // and under host pressure the liveness-based eviction (dead-largest,
+            // then live-smallest) reclaims it like any stale entry.
             spill_victim_to_host_kv_safety_net(*continuation_index);
             continuation_slots[*continuation_index].role = ContinuationSlotRole::Active;
         } else {
