@@ -6518,10 +6518,37 @@ void ProgramImplCore::try_release_state_image(StateImageHandle handle, const cha
     if (!state_store || !state_store->valid(handle)) { return; }
     if (state_store->release(handle)) { return; }
     host_slot_release_failures_.fetch_add(1, std::memory_order_relaxed);
+    // Diagnostics. This function is noexcept: every accessor below must be
+    // valid-guarded and non-throwing. In particular physical_slot() must NOT
+    // be used here — it throws for a HostOnly image (no device replica), and
+    // a throw inside noexcept is std::terminate (that is exactly the 2026-09-14
+    // 14:13 SIGABRT crash loop).
+    //  ckpt_refs   — checkpoint references still held (blocker bit 0).
+    //  residency   — where the replicas live (None/DeviceOnly/HostOnly/Both).
+    //  shared_refs — shared-prefix entries referencing this same image. If
+    //                >= 1, the refusal may be LEGITIMATE: the image backs a
+    //                live shared prefix and is freed when that prefix is
+    //                evicted (release_shared_prefix_state), not at sequence
+    //                teardown. shared_refs == 0 with ckpt_refs > 0 is a true
+    //                orphan (a reference with no owner).
+    std::uint32_t ckpt_refs   = 0;
+    int           residency   = -1;
+    std::uint32_t shared_refs = 0;
+    if (state_store->valid(handle)) {
+        ckpt_refs = state_store->checkpoint_references(handle);
+        residency = static_cast<int>(state_store->residency(handle));
+        for (std::size_t i = 0; i < shared_prefix_states.size(); ++i) {
+            if (shared_prefix_slots[i].role == SharedPrefixSlotRole::Catalogued &&
+                shared_prefix_states[i].state == handle) {
+                ++shared_refs;
+            }
+        }
+    }
     std::fprintf(stderr,
-                 "[state-lease] LEAK: release refused (%s) blockers=%u "
-                 "(bit0=refs bit1=pins bit2=dest_pinned bit3=pending)\n",
-                 context, state_store->release_blockers(handle));
+                 "[state-lease] LEAK: release refused (%s) ckpt_refs=%u residency=%d shared_refs=%u "
+                 "blockers=%u (bit0=refs bit1=pins bit2=dest_pinned bit3=pending)\n",
+                 context, ckpt_refs, residency, shared_refs,
+                 state_store->release_blockers(handle));
 }
 
 ProgramImplCore::PhysicalReleaseResult

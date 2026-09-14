@@ -125,6 +125,46 @@ from. **This is the bug the user keeps hitting.** Investigate the admission path
 does a leaked state slot keep a lane logically occupied so `request_admission_check`
 never admits the waiting request? This supersedes the "lower priority" note above.
 
+**2026-09-14 14:29 update — first fix attempt REVERTED; new evidence changes the
+hypothesis.**
+
+- The 14:00 "recycle double-retain" root cause was **wrong** and its fix
+  (`1eb4c5d6`) is **reverted** (`2d7042f3`). Evidence against it: the leaked
+  image holds **exactly 1** checkpoint reference at clear time (not 2), and the
+  leak fires in **both** `rewrite` and `endpoint-write` contexts — a single
+  recycle-path double-retain cannot explain either.
+- The 14:00 fix also **introduced a crash loop**: its enriched LEAK log called
+  `state_store->physical_slot(handle)` inside the `noexcept`
+  `try_release_state_image`; `physical_slot()` throws for HostOnly images
+  ("StateImage has no published Device replica") → throw in noexcept →
+  `std::terminate` → SIGABRT. 2 crashes after deploy (14:13, 14:15), 0 before.
+  Lesson: in that function only valid-guarded, non-throwing accessors are
+  allowed (`release_blockers`, `checkpoint_references`, `residency` — all
+  guarded by a `valid()` check).
+- **New instrumentation (deployed with the revert):** the LEAK line now logs
+  `ckpt_refs=`, `residency=`, and `shared_refs=` (count of Catalogued
+  shared-prefix entries referencing the same image).
+- **Leading hypothesis (H1 — the "LEAK" is partly a false alarm + capacity
+  over-commit):** `publish_active_capture` retains a checkpoint reference on
+  the sequence's ACTIVE state when a shared prefix is published
+  (`program_impl.h:9165`); that reference is released only when the shared
+  prefix itself is evicted (`release_shared_prefix_state`, ~10256) — **not** at
+  sequence teardown. So a sequence whose active state backs a live shared
+  prefix gets its clear-time release refused (refs=1) and is logged as a LEAK,
+  but the image is legitimately retained and freed on shared-prefix eviction.
+  Compounding this: the device state pool is 8 slots total (3 cache + 5 active)
+  while up to **6 shared-prefix state images** can be live at once — shared
+  images + active sessions can structurally saturate the pool, producing the
+  "no resident state" → root-fallback → "private source result is missing"
+  cascade even with zero true orphans.
+- **H2 (true orphan):** a reference with `shared_refs=0` at clear time — a
+  genuinely unbalanced retain/release pair on some other path. The new
+  `shared_refs=` field distinguishes H1 from H2 on the next live LEAK event.
+- **Next:** watch the journal for the first LEAK line with the new fields.
+  `shared_refs>=1` → H1 (fix = release the shared reference on sequence
+  teardown, or stop retaining it on the active state, or right-size the pool);
+  `shared_refs=0` → H2 (trace the specific retain/release pair for that image).
+
 ## Standing plan — a cache unit is {KV + state}, atomically (invariant for every phase)
 
 A context-cache unit is **the attention KV and the GDN recurrent state together**.
