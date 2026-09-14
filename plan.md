@@ -75,31 +75,60 @@ net), or torn apart mid-eviction:
 Until these are done the server keeps forcing restarts, which is what blocks
 development. Each is verified with the P0 e2e gate + the live journal.
 
-- [ ] **P1.1 — complete the root-fallback path end-to-end.** The adopt fix
-      cleared the adopt stage; the fallback now throws at the publication stage
-      (`resource_manager.h:2617-2619`): the evicted source's state image is not
-      released from `record->publication_slot` before the fallback republishes
-      into it. Release the stale handle (or handle the fallback's slot
-      lifecycle) so a `no resident state` fallback **completes** instead of
-      erroring. *Exit:* 0 `inactive capability` errors; a forced-fallback e2e
-      case completes the request.
-- [ ] **P1.2 — triage + fix the other two sporadic error classes.**
-      `replacement effect changed` (`program_impl.h:9243`) and `entitlement is
-      inconsistent` (`program_impl.h:11565`). Both are the unit torn apart
-      mid-eviction. *Exit:* 0 of each in a saturated e2e + journal window.
-- [ ] **P1.3 — device KV: free pages from idle sessions.** The 20:45 deadline
-      hang: `need 3252 pages, free 1032`, frozen with `running=0` — idle
-      sessions' device KV is pinned and never demoted, so the fit gate defers
-      to the 120s abort. Scope + implement demoting idle (non-running)
-      sessions' device KV to the host pool as fit-gate relief (the device-side
-      twin of `fc5d0cf3`). *Exit:* a request that needs pages while other
-      sessions are idle fits (with a one-time H2D cost) instead of aborting at
-      120s.
+- [x] **P1.1 — complete the root-fallback path end-to-end.** `81933c0a`. The
+      evicted source's catalog entry is now retired (`clear_catalog_entry`) in
+      the summary-less Retained branch — the publication slot IS that slot, and
+      the stale handle was what threw `active publication cell retained an
+      inactive capability` (1:1 with every fallback).
+- [ ] **P1.2 — triage + fix the sporadic error classes.**
+      `replacement effect changed` (`program_impl.h:9325`), `entitlement is
+      inconsistent` (`program_impl.h:11647`), and (new, 22:10:58) `staged MTP
+      bridge is outside the reusable suffix` (`program_impl.h:12544`). All are
+      the unit torn apart mid-eviction. *Exit:* 0 of each in a saturated e2e +
+      journal window.
+- [x] **P1.3 — device KV: free pages from idle sessions.** `47406f79`. While a
+      fit-gate defer is in flight and free pages have not grown for 15s, the
+      gate demotes the largest idle continuation to the host safety net and
+      re-arms per relief. **Known limitation (22:26–22:28 episode):** 7
+      demotions of ~4200-page continuations freed only 77 free pages (535→612)
+      — the victims' pages are shared with the live shared prefix, so
+      per-victim relief is nearly inert against a shared-prefix-pinned pool,
+      and the request still hit the 120s deadline. See P1.5.
 - [ ] **P1.4 — true-orphan leak.** First `LEAK (orphan)` (`shared_refs=0`,
       `endpoint-write`, `ckpt_refs=1`) — recurring. Trace the unbalanced
       retain/release pair on the endpoint-write checkpoint-reference path.
-      *Exit:* 0 `LEAK (orphan)` lines; the endpoint-write checkpoint ref is
-      balanced.
+      *Exit:* 0 `LEAK (orphan)` lines.
+- [ ] **P1.5 — the device-KV pool is structurally over-committed; make relief
+      effective.** Quantified 22:28: a 267k-token request (req 25) needed
+      4684 pages; the pool had 535 free; 7 idle-continuation demotions
+      (29k mapped pages total) freed only **77** pages (535→612) — 99.7% of
+      the demoted pages were shared with the live shared prefix, so
+      per-conversation demotion frees only each conversation's unique tail.
+      The pool is pinned by the shared prefix + 4 live conversations; a 5th
+      cannot fit by construction. Fix direction: (a) rank relief victims by
+      *unique* (non-shared) resident pages, not mapped pages; (b) batch-demote
+      until the demand fits (bounded per tick), not one per 15s; (c) make the
+      **shared prefix itself a demotion unit** — demote it to host as one
+      {KV + state} unit (the standing-plan invariant applied to the shared
+      side); (d) admission should see the pool's shared-prefix occupancy and
+      queue the request (visible queue position) instead of a 120s silent
+      defer. *Exit:* a 5th-conversation e2e scenario completes (via
+      shared-prefix demotion or a fast visible queue) without a deadline abort.
+- [ ] **P1.6 — the admission wedge: a queued request must run or fail,
+      bounded.** The user's restart trigger is GPU 0% while the session is
+      active — journal signature `running=0 prefilling=0 decode_ready=0
+      materializing=0 waiting≥1` sustained (the 13:28:57 wedge: req 150 never
+      admitted for 4+ min; the 15:15–15:32 stall: `materializing=1` for ~15
+      min). Both pre-fix, both unverified-gone. The wedge sentinel
+      (`tools/monitor/wedge-sentinel.sh`, now the standalone
+      `ninfer-wedge-sentinel.service`) is the tripwire: it restarts after 90s
+      of that state (3-in-30-min cap) — **every firing is a timestamped data
+      point to investigate, and the goal is zero firings.** *Exit:* (a) the
+      15:15 stall class is diagnosed (what state holds `materializing`
+      without progress, and why admission stops promoting); (b) every stuck
+      state has a bounded progress guarantee — it progresses or the request
+      fails within a deadline (the 120s-defer pattern generalized); (c) 0
+      sentinel firings over a full day of live use.
 
 *P1 exit criteria:* a 1-hour saturated window (3 concurrent large
 conversations) with **0 request errors, 0 deadline aborts, no restart.**
