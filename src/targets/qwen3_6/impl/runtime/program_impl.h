@@ -6519,12 +6519,9 @@ void ProgramImplCore::try_release_state_image(StateImageHandle handle, const cha
     if (state_store->release(handle)) { return; }
     host_slot_release_failures_.fetch_add(1, std::memory_order_relaxed);
     std::fprintf(stderr,
-                 "[state-lease] LEAK: release refused (%s) slot=%d ckpt_refs=%u residency=%d "
-                 "blockers=%u (bit0=refs bit1=pins bit2=dest_pinned bit3=pending)\n",
-                 context, state_store->physical_slot(handle),
-                 state_store->checkpoint_references(handle),
-                 static_cast<int>(state_store->residency(handle)),
-                 state_store->release_blockers(handle));
+                 "[state-lease] LEAK: release refused (%s) blockers=%u "
+                 "(bit0=refs bit1=pins bit2=dest_pinned bit3=pending)\n",
+                 context, state_store->release_blockers(handle));
 }
 
 ProgramImplCore::PhysicalReleaseResult
@@ -8811,20 +8808,11 @@ ProgramImplCore::install_private_capture(SequenceState& sequence, const CaptureG
                                          std::optional<runtime::CheckpointRef> replacement) {
     detail::PhysicalResources removed;
     if (group.rewrite) {
-        if (sequence.rewrite_state) {
-            if (*sequence.rewrite_state != checkpoint) {
-                removed = checked_resource_sum(removed,
-                                               release_checkpoint_reference(*sequence.rewrite_state));
-                state_store->retain_checkpoint_reference(checkpoint);
-            }
-            // Same-image re-capture (the checkpoint IS the current rewrite binding, e.g.
-            // after a rewrite-restore where the checkpoint became the active state and no
-            // fork followed): the binding already exists — re-retaining would double-count
-            // it and the later single release at sequence-clear would leave one reference
-            // behind, refusing the release and orphaning the state slot (state-lease LEAK).
-        } else {
-            state_store->retain_checkpoint_reference(checkpoint);
+        if (sequence.rewrite_state && *sequence.rewrite_state != checkpoint) {
+            removed = checked_resource_sum(removed,
+                                           release_checkpoint_reference(*sequence.rewrite_state));
         }
+        state_store->retain_checkpoint_reference(checkpoint);
         sequence.rewrite_state      = checkpoint;
         sequence.rewrite_checkpoint = RewriteCheckpoint{
             .valid        = true,
@@ -9170,16 +9158,6 @@ ActiveCaptureResult ProgramImplCore::publish_active_capture(ActiveCaptureTransac
                 *sequence.rewrite_state != transaction.destination_state ||
                 !sequence.rewrite_checkpoint.valid) {
                 throw std::logic_error("recycled rewrite metadata changed before publication");
-            }
-            // The recycled slot becomes the new ACTIVE binding (see the ActiveStateBinding
-            // assignment below); its old checkpoint binding is superseded by this capture.
-            // Release the reference now — dropping the handle without it leaves the image
-            // holding a checkpoint reference forever: the next recycle re-targets the same
-            // image and install_private_capture re-retains it, so the clear-time release
-            // leaves one reference behind, the release is refused (state-lease LEAK), and
-            // the state slot is orphaned until restart.
-            if (state_store->checkpoint_references(*sequence.rewrite_state) != 0) {
-                state_store->release_checkpoint_reference(*sequence.rewrite_state);
             }
             sequence.rewrite_state.reset();
             sequence.rewrite_checkpoint        = {};
