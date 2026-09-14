@@ -4752,8 +4752,9 @@ ProgramImplCore::relieve_stalled_fit_gate(const MaterializationTransaction& tran
     // freed by a release — the 22:28 episode demoted 29k mapped pages and
     // freed 77. The {KV + state} unit is preserved in the host safety net, so
     // the session's next turn restores from host instead of re-prefilling.
-    std::uint32_t victim       = continuation_capacity;  // sentinel: none
-    std::uint32_t victim_pages = 0;
+    std::uint32_t victim              = continuation_capacity;  // sentinel: none
+    std::uint32_t victim_pages        = 0;
+    bool victim_is_shared_prefix      = false;
     for (std::uint32_t i = 0; i < continuation_capacity; ++i) {
         if (continuation_slots[i].role != ContinuationSlotRole::Catalogued) { continue; }
         if (transaction.has_source && transaction.source_index == i) { continue; }
@@ -4777,7 +4778,49 @@ ProgramImplCore::relieve_stalled_fit_gate(const MaterializationTransaction& tran
             victim       = i;
         }
     }
-    if (victim == continuation_capacity || victim_pages == 0) { return 0; }
+    if (victim == continuation_capacity) {
+        // Second stage (P1.5c): a shared prefix entry. The 00:32 episode
+        // quantified why this is needed: 13 idle-continuation demotions of one
+        // conversation's stale turn-continuations freed 156 of the ~3450 pages
+        // the demand was short — the continuations' pages stay resident under
+        // the shared prefix that pins the pool. Release the idle shared prefix
+        // (device KV + state) so the gate can fit. Its content survives in the
+        // host safety net through the spilled turn continuations (each compact
+        // prefix contains the shared prefix), so the conversation's next
+        // request restores via the normal safety-net fallback instead of
+        // re-prefilling. Bounded degradation: if no turn entry exists, the
+        // next request re-prefills from root — still cheaper than the 120s
+        // deadline abort + restart this stall would otherwise cause.
+        for (std::uint32_t i = 0; i < shared_prefix_capacity; ++i) {
+            if (shared_prefix_slots[i].role != SharedPrefixSlotRole::Catalogued) { continue; }
+            const SharedPrefixState& shared = shared_prefix_states[i];
+            if (!shared.kv || shared.active_references != 0) { continue; }
+            if (transaction.has_shared_source && transaction.shared_source_index == i) {
+                continue;
+            }
+            const SequenceKVBundle& kv = *shared.kv;
+            std::uint32_t unique = text_kv_addresses->resident_device_pages(kv.text);
+            if (kv.backend && backend_kv_addresses) {
+                unique += backend_kv_addresses->resident_device_pages(*kv.backend);
+            }
+            if (unique > victim_pages) {
+                victim_pages            = unique;
+                victim                  = i;
+                victim_is_shared_prefix = true;
+            }
+        }
+    }
+    if (victim_pages == 0) { return 0; }
+    if (victim_is_shared_prefix) {
+        try {
+            release_shared_prefix_state(victim, SharedPrefixSlotRole::Catalogued);
+        } catch (...) { return 0; }
+        std::fprintf(stderr,
+                     "[relief-kv] fit gate stalled — released idle shared prefix %u "
+                     "(%u resident pages); content preserved in safety-net turn entries\n",
+                     victim, victim_pages);
+        return victim_pages;
+    }
     // Same unit operation as the catalog-rotation and pressure-victim paths:
     // park the {KV + state} unit in the host safety net, then release the
     // device-side continuation (frees the device KV pages the gate is waiting
