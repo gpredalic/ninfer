@@ -55,21 +55,24 @@ net), or torn apart mid-eviction:
 
 ### P0 — quick wins + gate (hours each, do first)
 
-- [ ] **P0.1 — e2e deterministic checkpoints** (old #3). Force reasoning in
+- [x] **P0.1 — e2e deterministic checkpoints** (old #3). Force reasoning in
       phases 5/6 like phase 4 (`s.args.thinking_mode = True` +
       `reasoning: {effort: low}` in the payload) — ~5 lines in
-      `tools/e2e/ninfer-e2e.py`. *Exit:* two consecutive full e2e runs with 0
-      `rewrite_checkpoint_invalid` flaps. **This makes e2e a trustworthy gate
-      for the P1 fixes.**
+      `tools/e2e/ninfer-e2e.py`. `8530a45b`. *Exit:* two consecutive full e2e
+      runs with 0 `rewrite_checkpoint_invalid` flaps. **This makes e2e a
+      trustworthy gate for the P1 fixes.**
 - [ ] **P0.2 — retry detection** (old #4c). Identical prompt re-sent within ~60s
       re-prefills from scratch (~2.5M tokens of pure retry waste today). Detect
       the repeat, serve from the just-completed continuation.
       *Exit:* e2e retry scenario; 0 full re-prefills on repeated prompts.
-- [ ] **P0.3 — state-pool stopgap** (old #1b-lite). `--host-state-slots 24→48`
-      in `~/.config/ninfer.conf` (147 MiB/slot → ~7 GiB RAM). One-line ops
-      change that halves state-pool pressure until #7 lands.
-      *Exit:* fewer "no resident state" fallbacks; no host OOM. (Superseded by
-      #7 — do not build on it.)
+- [x] **P0.3 — state-pool stopgap** (old #1b-lite). `--host-state-slots 24→48`
+      in `~/.config/ninfer.conf` (147 MiB/slot → ~7 GiB RAM). Applied 23:55,
+      verified `host_state_capacity_slots: 48`. Justified by the 23:09
+      episode: the state pool was 24/24, the incoming 323k-token request's
+      checkpoint was evicted at admission, selection fell back to a full-root
+      5548-page demand (vs a ~24k-token delta once the frontier was back in
+      the shortlist at abort time), and the pool could not fit it → 120s
+      deadline abort. (Superseded by #7 — do not build on it.)
 
 ### P1 — stop the restarts (the user's actual pain; do before the big refactor)
 
