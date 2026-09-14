@@ -1,902 +1,147 @@
-# Host-KV context-cache — open optimization work
-
-This plan tracks the open host-KV / context-cache optimization work for the
-Qwen3.6/3.8 27B hybrid (SSM + attention) targets. Two earlier efforts that lived
-in this file are now merged and are no longer tracked here (see "Shipped" below);
-what remains is the atomic-unit invariant plus the still-open arena, topology and
-cache-shedding work.
-
-The governing invariant for all of it is the standing plan below.
-
-## Open tasks (2026-09-14)
-
-Prioritized. "Now" = the active thread; the rest are queued follow-ups.
-
-### 1. State-lease wedge — RESOLVED (2026-09-14, `fc5d0cf3`)
-The bug actively forcing user restarts. Root cause: the "state-lease LEAK" is a
-false alarm (every refused release has `shared_refs=1` — the image legitimately
-backs a live shared prefix). The real bug: the H2D state restore needs a NEW
-device slot but the pool is full, and the only relief is demand-driven (no-op
-when the stale planner model adds 0 state slots) → "no resident state" → root
-fallback → adopt contract error → retry loop. **Fix:** demote the coldest
-demotable checkpoint before each H2D restore attempt (both sites). Verified:
-prod 0 errors 14:50–15:03 (reqs 8–16 all healthy); e2e phase 12 (new regression
-phase) 5/5 PASS. **The engine no longer wedges.** One request error still
-surfaced at 15:05 (req 17): a legitimate source-eviction fallback whose abort
-terminal hit the adopt contract (task #6) — the request errored instead of
-cancelling cleanly, but the engine kept serving (reqs 18–21 healthy after).
-Follow-ups: task #6 (adopt contract); planner-side demand for the H2D slot when
-source is HostOnly; right-size the pool for thinking sessions + shared prefixes
-(6 + 2 > 8 is structurally over-committed); rename the misleading LEAK label.
-
-### 2. Strip-collapse fix — `--strip-thinking-cache`  (after #1)
-Re-prefill only the 7 RoPE-bound attention layers after a thinking-strip; restore
-the 21 GDN/SSM layers from the position-independent state image. Design is in the
-"Strip-Thinking-Cache" section below. 4× faster cancellation, ~80× less arena.
-- [ ] Scope the implementation (spill path, state-image restore, device-KV free,
-      new CLI flag, identity/entitlement interaction).
-- [ ] Implement + e2e-verify.
-
-### 3. Make e2e checkpoint assertions deterministic
-Phases 5/6 (checkpoint-advance, tool-calling) assert rewrite-checkpoint hits but the
-base `Session` doesn't force thinking — so they flap on model mood (the 2026-09-14
-run: 4 FAILs, all `rewrite_checkpoint_invalid`, while forced-thinking phase 4 was
-100%). Force reasoning in phases 5/6 like phase 4 does (`s.args.thinking_mode = True`
-+ `reasoning: {effort: low}` in the payload) — ~5 lines in `tools/e2e/ninfer-e2e.py`.
-
-### 4. Mid-conversation `reuse=root` re-prefills — INVESTIGATED (2026-09-14)
-Reconstructed from the request log (the 12:55 e2e run + today's prod traffic).
-The "93" was an undercount: e2e had **156** mid-conversation roots (2.78M tokens,
-all full roots, cache=0); prod had **119** (12.17M actual re-prefill tokens).
-
-**Prod split (the 75 true full roots, 11.88M tokens):**
-- 27 / 3.78M — restart-induced: the conversation's first turn in a fresh instance
-  (state wiped by the ~15 restarts of the error loop). **Gone with the adopt-fix
-  deploy** (0 errors since 20:04; no more restarts expected).
-- 48 / 8.10M — **mid-instance losses**: an earlier turn existed in the same
-  instance, yet the state was gone. Concentrated in the 6–8 largest conversations
-  (200k–400k-token long-running agent sessions), every turn, 1–4 min apart.
-- Plus 44 safety-net roots (cache>0): private continuation evicted, shared-prefix
-  safety net restored — cheap in tokens (0.29M) but 19s H2D ttft vs ~1.7s normal.
-
-**Mechanism (same in e2e and prod):** the host *state-slot* pool is the binding
-constraint, not host-KV bytes. Each state image is ~147 MiB; prod runs
-`--host-state-slots 24` (≈3.5 GiB of state). With 3+ concurrent large
-conversations (each holding turn-closure + checkpoint + anchor images) plus
-shared prefixes, the pool saturates (hs sawtooths 0→24→0 in the throughput log);
-LRU then evicts a live conversation's continuation before its next turn arrives
-(the user takes 1–4 min between turns). Next turn: no candidate → `no_pressure`,
-`targets_evaluated=1`, full root prefill. e2e (8 slots / 4 GiB) is the same
-mechanism at higher pressure, plus dead-phase catalog bloat that exhausts the
-planner's 4096-target budget (`budget_exhausted=True`, `stop_reason=
-expansion_capacity`) — a secondary symptom, not the cause.
-Journal confirms the safety-net path: `safety-net HIT after source eviction`
-(frontier restored, 19s ttft) and `ckpt-miss: reason=rewrite_checkpoint_invalid`
-(spills without a valid checkpoint can't back a fast private restore — the
-original hypothesis, confirmed; ties to task #3).
-
-**Follow-ups (new, from this investigation):**
-- [ ] #4a Right-size / protect the state pool: per-active-session minimum
-      guarantee (≥2 slots: turn-closure + checkpoint) so an interactive session's
-      continuation can't be LRU-evicted by another session's capture; or raise
-      `--host-state-slots` (147 MiB/slot — 48 slots ≈ 7 GiB RAM). Overlaps
-      follow-up #1b.
-- [ ] #4b Idle-aware retention: weight `RecentPrivate` by last-activity recency
-      (a session that responded <10 min ago is "interactive", not dead).
-- [ ] #4c Retry detection: identical prompt re-sent within ~60s (seen 3× at
-      16:36–16:46, 385k tokens each; 2× at 19:45–19:46, 400k each) re-prefills
-      from scratch — ~2.5M tokens of pure retry waste today.
-- [ ] #4d Planner: prune long-idle / dead owners from the search space so a
-      bloated catalog doesn't burn the full 4096-target budget (e2e symptom).
-
-### 5. 120s fit-gate deadline — live validation — DONE (2026-09-14)
-Verified by review + unit tests, and now **live**: the deadline fired 5× today
-(13:44:40, 14:18, 14:43, 14:48, 15:05) under real pool saturation — each time
-`[materialize] KV defer deadline exceeded (120s) — aborting request, other
-sessions preserved`, with the engine continuing to serve other requests and no
-crash. The bounded-defer fix (`cb0f245c`) is confirmed working in production.
-Note (15:05): when the deadline abort follows a root fallback (`has_source=false`),
-the Aborted terminal still goes through `adopt_materialization_progress` and
-throws "private source result is missing" → the request surfaces as an error
-instead of a clean cancel. That is the open adopt-contract task below.
-
-### 6. Adopt contract: no-source terminals must not error the request — DONE (2026-09-14, `f6a5bec3` + `b60c37eb`)
-The last piece of the 2026-09-14 chain. `adopt_materialization_progress`
-(`resource_manager.h:2505`) requires `result.source` whenever the claim record
-has a `source_slot` — but a legitimate root fallback (source evicted: "no
-resident state") sets `has_source=false`, so the terminal carries no source,
-and adopt throws. Observed 15:05:30: source evicted → root fallback → KV defer
-→ 120s deadline abort → adopt throws → `req 17 error` (instead of a clean
-cancel). The engine itself was fine (other sessions preserved). Fix: on a
-terminal with no source (Aborted, or Published-after-fallback), adopt should
-release the source claim gracefully (revert to Catalogued if the slot is still
-valid, else free it) instead of throwing. Requires care: the fallback recycles
-the source's physical continuation slot as the root destination, so the RM
-must not later release it twice.
-**Shipped:** `f6a5bec3` (reader side: RM adopt block + summary-less Retained
-acknowledgement) + `b60c37eb` (writer side: the fallback catch sets
-`source_fallback_retained` — without it the fix was inert). Built clean,
-deployed 20:04:47 (PID 155184). Post-deploy: 7 "no resident state" fallbacks,
-**0** "private source result is missing" (was 38 in the prior 6h). The fallback
-now completes the request on the slow path instead of erroring.
-
-## Known issues / follow-ups
-
-### State-lease leak on rewrite state → entitlement mismatch (filed 2026-09-14)
-
-**STATUS: RESOLVED 2026-09-14 (`fc5d0cf3`). The "leak" was a false alarm — see the
-14:45 update below for the confirmed root cause (shared-prefix retention + missing
-H2D relief) and the fix. The orphan-leak hypothesis in the body of this entry was
-DISPROVEN (every observed refusal has `shared_refs=1`, i.e. a legitimate live
-shared-prefix reference, not an orphan). The investigation history is kept below
-for reference.**
-
-**Symptom (from the 2026-09-13 attention-loss forensics, session f3f780aa):** on a
-subagent conversation (23k→217k tokens) under device-KV pressure, the journal
-showed, in the same window:
-
-- `[state-lease] LEAK: release refused (rewrite) blockers=1` (21:55:14)
-- `materialized sequence does not match its active entitlement` — **29×**, mostly
-  22:30–22:43, 12+ in a row on the subagent conversation
-- `retained materialization source is unavailable` — 5×
-
-Each entitlement failure aborts the materialization and forces a clean root
-re-prefill (slow, not wrong — no corrupted output was ever delivered).
-
-**Code locations:**
-- The leak: `ProgramImplCore::try_release_state_image` (`program_impl.h:6517`).
-  `release()` refuses when `release_blockers(handle) != 0`; `blockers=1` is
-  **bit 0 = `checkpoint_references != 0`** (`state_image_store.h:383`). So the
-  rewrite state image still holds checkpoint references when the sequence-clear
-  path releases it.
-- The release site: the sequence-clear block (`program_impl.h:11565–11574`)
-  releases `sequence.rewrite_state` via `try_release_state_image(handle, "rewrite")`
-  *after* dropping checkpoint references for `long_anchors` (11555–11562) — but it
-  does **not** drop `checkpoint_references` on the rewrite state itself before
-  releasing it. If the rewrite state was captured as a checkpoint whose reference
-  was never released, the release is refused and the state slot leaks.
-- The symptom: the entitlement check (`program_impl.h:8007`) compares
-  `resident_resources(sequence)` (actual) against `details.demand.active_entitlement`
-  (planned). A leaked, still-occupied state slot shifts actual occupancy away from
-  the plan → mismatch → abort → root re-prefill → repeat.
-
-**Hypothesis (to confirm):** the rewrite state image retains `checkpoint_references`
-that should have been dropped when the checkpoint was consumed/superseded, so the
-sequence-clear release is refused (leak), and the leaked slot is what breaks the
-entitlement match. The leak is the likely root; the entitlement mismatch is the
-symptom.
-
-**To investigate:**
-1. Trace where `checkpoint_references` on a rewrite state is incremented
-   (checkpoint capture) and where it should be decremented — find the path that
-   leaves it non-zero at sequence-clear time.
-2. Confirm the correlation: does the entitlement mismatch fire only when a
-   preceding `[state-lease] LEAK … (rewrite)` occurred on the same sequence?
-3. Decide the fix: drop the stale `checkpoint_references` before the rewrite
-   release, or make the entitlement check tolerate a known-leaked slot, or fix the
-   capture path so the reference is balanced.
-
-**Consequence (bounded):** slow re-prefills and reduced state-slot headroom, not
-silent corruption. ~~Lower priority than the strip-collapse fix~~ — see update below.
-
-**2026-09-14 13:30 update — this is the ACTIVE WEDGE CAUSE, top priority.** On the
-fixed binary (livelock gone: 0 defers / 0 OOM / 0 bad_alloc in the 13:05–13:33
-window), the server still wedged and forced a user restart. The journal shows the
-`[state-lease] LEAK: release refused (rewrite) blockers=1` firing on **nearly every
-turn** (12× in the window), and **3 of them fired immediately after req 149
-completed (13:28:53.146) — right before the engine wedged at 13:28:57** and sat at
-`waiting=1, running=0, materializing=0` for 4+ minutes, never admitting req 150.
-So the leak is not just "slower re-prefills": a refused rewrite-state release is
-leaving a lane/slot in a state the admission loop won't promote the next request
-from. **This is the bug the user keeps hitting.** Investigate the admission path:
-does a leaked state slot keep a lane logically occupied so `request_admission_check`
-never admits the waiting request? This supersedes the "lower priority" note above.
-
-**2026-09-14 14:29 update — first fix attempt REVERTED; new evidence changes the
-hypothesis.**
-
-- The 14:00 "recycle double-retain" root cause was **wrong** and its fix
-  (`1eb4c5d6`) is **reverted** (`2d7042f3`). Evidence against it: the leaked
-  image holds **exactly 1** checkpoint reference at clear time (not 2), and the
-  leak fires in **both** `rewrite` and `endpoint-write` contexts — a single
-  recycle-path double-retain cannot explain either.
-- The 14:00 fix also **introduced a crash loop**: its enriched LEAK log called
-  `state_store->physical_slot(handle)` inside the `noexcept`
-  `try_release_state_image`; `physical_slot()` throws for HostOnly images
-  ("StateImage has no published Device replica") → throw in noexcept →
-  `std::terminate` → SIGABRT. 2 crashes after deploy (14:13, 14:15), 0 before.
-  Lesson: in that function only valid-guarded, non-throwing accessors are
-  allowed (`release_blockers`, `checkpoint_references`, `residency` — all
-  guarded by a `valid()` check).
-- **New instrumentation (deployed with the revert):** the LEAK line now logs
-  `ckpt_refs=`, `residency=`, and `shared_refs=` (count of Catalogued
-  shared-prefix entries referencing the same image).
-- **Leading hypothesis (H1 — the "LEAK" is partly a false alarm + capacity
-  over-commit):** `publish_active_capture` retains a checkpoint reference on
-  the sequence's ACTIVE state when a shared prefix is published
-  (`program_impl.h:9165`); that reference is released only when the shared
-  prefix itself is evicted (`release_shared_prefix_state`, ~10256) — **not** at
-  sequence teardown. So a sequence whose active state backs a live shared
-  prefix gets its clear-time release refused (refs=1) and is logged as a LEAK,
-  but the image is legitimately retained and freed on shared-prefix eviction.
-  Compounding this: the device state pool is 8 slots total (3 cache + 5 active)
-  while up to **6 shared-prefix state images** can be live at once — shared
-  images + active sessions can structurally saturate the pool, producing the
-  "no resident state" → root-fallback → "private source result is missing"
-  cascade even with zero true orphans.
-- **H2 (true orphan):** a reference with `shared_refs=0` at clear time — a
-  genuinely unbalanced retain/release pair on some other path. The new
-  `shared_refs=` field distinguishes H1 from H2 on the next live LEAK event.
-- **Next:** watch the journal for the first LEAK line with the new fields.
-  `shared_refs>=1` → H1 (fix = release the shared reference on sequence
-  teardown, or stop retaining it on the active state, or right-size the pool);
-  `shared_refs=0` → H2 (trace the specific retain/release pair for that image).
-
-**2026-09-14 14:45 update — H1 CONFIRMED, root cause complete, relief fix in build.**
-
-Every observed LEAK event has `shared_refs=1` (both `residency=1` DeviceOnly and
-`residency=2` HostOnly variants) — **there is no true orphan**. The "LEAK" log is
-a false alarm: the image legitimately backs a live shared prefix
-(`publish_active_capture` retains a checkpoint reference on the sequence's state
-at `program_impl.h:9165`; released only when the shared prefix is evicted,
-`release_shared_prefix_state` ~10256 — not at sequence teardown).
-
-**The actual failure chain (all confirmed in journal):**
-1. The device state pool (8 slots: 3 cache + 5 active) fills with active session
-   states (ActiveMutable — not demotable) + rewrite checkpoints + shared-prefix
-   state images (CheckpointImmutable). 3 concurrent thinking sessions alone need
-   6 slots (active + rewrite each), leaving 2 for shared images.
-2. Under KV pressure the source's rewrite state is demoted to HostOnly
-   (safety-net spill / checkpoint demotion) — AFTER admission, so the planner's
-   state-residency model is stale (model/physical gap).
-3. Next turn: the H2D restore (`begin_host_to_device` at ~10830, or
-   `begin_host_to_device`/`begin_host_fork` at ~5054) needs a NEW device slot
-   (`take_device_slot()`), but the pool is full → nullopt → "no resident state"
-   → abort to root prefill.
-4. The only relief (`demote_checkpoints_to_make_room`) is demand-driven: it
-   demotes until `free_slots >= demand.state_slots`, and the stale model makes
-   that demand 0 → **zero `[relief]` lines in the journal** — no relief ever ran.
-5. Root fallback publishes no source → adopt contract throws "private source
-   result is missing" → request error → client retry → repeat.
-
-**The fix (in build):** call `demote_checkpoints_to_make_room(1)` before each
-H2D restore attempt (both sites) — demote the coldest demotable checkpoint until
-a slot is free. Demoting a shared-prefix-backed image is safe: it becomes
-HostOnly, and the shared-source restore path already handles HostOnly sources
-(H2D fork destination, `start_sequence` ~10495). This makes the system
-self-healing regardless of planner staleness.
-
-**Remaining (follow-ups):**
-- Planner-side: count the H2D restore's device slot in the demand when the
-  source is HostOnly (closes the model/physical gap at admission instead of
-  relying on runtime relief).
-- Structural: the pool is over-committed for 3 thinking sessions + shared
-  prefixes (6 + 2 > 8). Either right-size `--device-state-slots` or make the
-  planner account for shared-prefix state residency.
-- The "LEAK" log label is misleading for shared retention — consider renaming
-  to "retained (shared prefix)" when `shared_refs >= 1`.
-
-## Standing plan — a cache unit is {KV + state}, atomically (invariant for every phase)
-
-A context-cache unit is **the attention KV and the GDN recurrent state together**.
-It is captured, retained, evicted and restored as ONE indivisible unit. Never store,
-evict, retain, budget or restore either half on its own. This overrides any earlier
-text in this plan that describes them as separately storable items.
-
-Why (hybrid topology): the KV covers only the attention (softmax) layers — 7 of 28 in
-the Qwen3.6-27B configuration this plan targets, with the other 21 being GDN/SSM —
-while the ~150 MB state image carries the GDN recurrent state. The split is
-model-specific (the Qwen3.8-27B production configuration is 16 attention of 64); the
-invariant is not. Resuming at position N requires BOTH halves, and neither half is
-independently useful:
-
-- **KV without state cannot resume**, and is not "cheaper than losing both": the
-  attention K/V at position p depends on the GDN layers' output at p, so attention
-  KV is not independently recomputable. Any recompute is a full prefix pass, which
-  rebuilds the GDN state as a by-product and regenerates the KV being kept.
-- **State without KV can only resume while that KV is still device-resident**, so it
-  is not a durable unit and must not be a stored/retained form.
-
-Therefore:
-
-- a partially-retained unit is a **bug, not a degraded cache**: it wastes host memory
-  and it is a correctness hazard, because prefix matching can select it and then
-  restore with a missing half, silently producing a wrong continuation;
-- eviction removes a **whole unit** — there is no "state-only" or "KV-only" victim class;
-- the host budget accounts a unit's **full size** (KV pages + state image) as one number;
-- "which half is expensive" is never an eviction criterion, because the halves have no
-  independent value.
-
-- eviction is **cost-aware, not strict LRU**: re-prefill cost scales with the unit's
-  context length, so reclaim the SMALLEST complete units first and hold on to recent
-  large caches — re-prefilling a big context is far more expensive. Recency is only a
-  tie-breaker between units of comparable size.
-
-Consequences for the host-KV safety net: entries are atomic; never create a partial
-entry; reclaim any pre-existing partial entry first; then reclaim by re-prefill cost
-(smallest unit first, recent large units kept), with recency as the tie-breaker.
-
-## Shipped (merged — see git history and maintainer docs)
-
-The jinja and post-thinking efforts that previously occupied this file are done:
-
-- **Jinja chat-template engine + froggeric v22.5** (PR #4, `cb535944`): the
-  vendored `wangzhaode/jinja.cpp` engine now genuinely executes `--chat-template`;
-  the ~800-line hand-written renderer is gone; every parity gate is byte-exact
-  against the Python jinja2 oracle (engine + frontend suites, 16/16 froggeric
-  contract); deployed on strix with the A/B tool-leak battery green.
-- **Post-thinking sampler + atomic {KV + state} cache unit** (PR #6, `ae8eb23e`):
-  the `post_thinking` sampling phase (CLI + HTTP) and the atomic-unit invariant
-  below, enforced in `host_kv_safety_net.h` (half units refused, cost-aware
-  smallest-unit-first eviction, one shared host budget). Measured: quality-neutral
-  on BFCL v4 tool calling (1240 paired samples, p = 0.79) — a reproducibility /
-  reliability knob, not a quality one; full study in
-  `docs/maintainer/post-thinking-temperature.md`.
-
-Still open from the jinja line (carried, not on the serving path):
-- the qwen3.8 artifact still embeds the pre-v22.5 template; rebuilding it needs the
-  BF16 source checkpoint (not on the Mac). `kFroggericV22DeployedTemplateDigest`
-  keeps the currently deployed digest accepted until the rebuild; live serving
-  overrides the embedded template via `--chat-template`, so it is not on the path.
-- the frontend does not yet expose `tool_call_format`, `auto_disable_thinking_with_
-  tools`, `max_tool_arg_chars`, `max_tool_response_chars`; contexts using them are
-  covered by the raw engine suite only.
-
-## Post-Merge Findings — Arena Fragmentation & Eviction Strategy (2026-09-10)
-
-> **Status (2026-09-12):** the state-only FALLBACK failure mode is gone — PR #6 made
-> the cache unit atomic (no state-only entries), and eviction is now cost-aware,
-> smallest-unit-first, looping until the incoming unit fits the shared host budget
-> (`host_kv_safety_net.h::retain_state_capture`). That resolves Finding B and removes
-> the "state-only fallback loses KV" tail of the incident.
->
-> **Status (2026-09-13):** Finding A is fixed by **arena compaction**: the
-> scatter-gather path is removed, and a single-extent allocation that fails despite
-> sufficient total free now triggers `HostKVArena::compact()` (live extents relocate
-> to the front, free space becomes one contiguous extent) before the allocation
-> retries. The `/stats` fragmentation metrics below are implemented. **Still open:**
-> the real-scenario evaluation on the GPU box.
->
-> **Status (2026-09-13, evening):** the single-session arena-fill regression is
-> fixed on `docs/prune-plan` (commits `1fd9d08c`…`15d6361c`): safety-net
-> supersede-on-add + liveness-based eviction (dead-largest, then live-smallest),
-> host-state-pool saturation unblocked (`make_host_slot_available` drops the
-> coldest dual-resident replica; HostOnly never droppable), torn-HostSnapshot
-> orphan fix, the A* planner's 5 ms time budget removed (structural termination
-> only), the state-demotion model/physical gap closed (demotes modeled only when
-> the host pool can satisfy them), and pressure-relief failures converted from
-> uncaught `bad_alloc` to a controlled abort-to-root-prefill. Remaining: deploy
-> (one-command e2e swap) + `--device-state-slots 5` headroom in the serve config,
-> then the 4-session live-load acceptance run.
->
-> **Status (2026-09-14):** deployed and verified. The device-KV fit gate
-> (`cdaae981`) shipped, but its defer was unbounded: a demand that never fits
-> retried on every ~1ms engine tick with no timeout (materializing requests are
-> exempt from the pending timeout, and the gate runs before any relief work),
-> and it logged on every defer (~1000 lines/s). Under a saturated pool this
-> livelocked the engine (540k defer lines in 21 min, 3 SIGKILL-after-timeout
-> server deaths). Fixed in `cb0f245c`: first defer starts a 120 s deadline
-> (`MaterializationTransaction::kv_defer_first`); on expiry the progress tick
-> aborts the request (Aborted → engine completes it as cancelled, other
-> sessions preserved — same fail-one-request semantics as the OOM-retry path);
-> defer log rate-limited to free-page progress + 5 s heartbeat. Full 11-phase
-> e2e on the fixed binary: 43 PASS / 27 WARN / 4 FAIL, **zero bad_alloc, zero
-> defers, zero deadline aborts** (the gate never fired under e2e load — the
-> deadline is the safety net for the saturated case). The 4 FAILs are
-> checkpoint-capture assertions in phases 5/6 that depend on the model
-> spontaneously thinking (no rewrite checkpoint was generated on those turns —
-> forced-thinking phase 4 captured 100%); model non-determinism, not a server
-> regression. Monitor sidecar now reads the journal (cursor-based), journald
-> persists to /var/log/journal (2G cap).
-
-Production testing under extreme pressure (single 371k-token session, 1016
-messages, arena exhausted to 14MB free) revealed two issues in the host KV
-safety net arena that were not visible under moderate load.
-
-### Finding A — Arena fragmentation from scatter-gather allocations
-
-The scatter-gather multi-extent allocation (added to work around single-
-allocation failures) is **causing the fragmentation it was meant to solve**:
-
-1. Single contiguous allocation fails (free space split into small chunks)
-2. Scatter-gather splits into 2-3 smaller allocations
-3. These create separate used regions in the arena
-4. When freed, they leave separate small free holes
-5. Next allocation can't fit in any single hole → more scatter-gather
-6. Feedback loop: more fragmentation → more scatter-gather → more fragmentation
-
-**Evidence (from systemd journal, 16725 lines):**
-- 144 single-allocation failures with avg 7.90GB free (needing only 5.6GB)
-- Worst case: 14.22GB free, 6.72GB needed — couldn't allocate contiguously
-- 137 double-allocations, 6 triple-allocations (scatter-gather splitting)
-- Arena free hit 14MB despite 30GB capacity and only ~15GB used
-- 278 FALLBACK (state-only) events as a direct consequence
-- 1 bad_alloc (caught by WORKER OOM handler, server survived)
-
-**Root cause (corrected, verified against the deployed tree):** This is NOT a
-missing-coalescing bug. `HostKVArena::insert_free_extent` has coalesced
-adjacent free extents on every free since the safety net landed (2026-08-24),
-and the journal evidence above was collected from a build that includes it.
-The real mechanism is external fragmentation: large live spill entries
-(6-12.5GB each) interleaved with small live entries partition the free space
-into non-adjacent extents, and coalescing can only merge adjacent free
-regions — it cannot merge across a live block. When no single extent is large
-enough, the single-allocation path fails despite sufficient total free. The
-scatter-gather workaround then allocates across multiple extents; when those
-allocations are freed they add more live regions, so under churn the loop is
-self-reinforcing (Finding A's feedback chain holds, driven by live-entry
-interleaving rather than a missing coalesce).
-
-**Fix (implemented, 2026-09-13): compaction.** `HostKVArena::compact()`
-relocates every live allocation into a contiguous block at the front of the
-arena so all free space merges into one trailing extent. The spill path
-triggers it reactively: a single-extent allocation that fails despite
-sufficient total free syncs the transfer stream (no in-flight copies may
-reference arena memory), compacts, and retries — after which the retry
-always succeeds, because the free space is one extent of the total free.
-The scatter-gather path (`allocate_multi`) is removed: with compaction it is
-unreachable (total free < need is a capacity failure, not fragmentation).
-Options 2 (uniform entries via dropping backend KV) and 3 (buddy/slab) are
-not pursued: option 2's premise was wrong (see the corrected Architecture
-Optimization section — the "backend KV" is the MTP module's KV, not droppable
-replay records), and option 3 is a larger rewrite for a problem compaction
-already solves.
-
-### Finding B — evict-smallest evicts only ONE entry
-
-When the arena is full and a new spill needs space, `evict-smallest`
-evicts only ONE entry. If that entry is small (e.g., 2 pages = ~2MB),
-freeing it does not provide enough space for the new allocation (e.g.,
-5-7GB). The spill then falls through to scatter-gather (which may
-succeed by splitting) or to state-only FALLBACK (which loses KV).
-
-**Evidence:**
-- 276 evict-smallest operations
-- Evicted entry sizes range from 2 pages (~2MB) to 12106 pages (~12.8GB)
-- Most common `remaining` count after eviction: 3 (91 times)
-- With 3 entries of ~12.5GB each = 37.5GB > 30GB arena → still full
-- Min free after eviction: 14MB — evicting one small entry barely helped
-
-**Fix needed:** `evict-smallest` should loop: keep evicting entries
-(smallest first) until `free >= need`, not just evict one and stop.
-This is a simple loop change in the spill function. The current
-single-eviction design assumes entries are roughly uniform in size,
-which is false for mixed session sizes (a 371k session's checkpoint
-is 50x larger than a 5k session's checkpoint).
-
-### Impact
-
-Both issues compound: fragmentation prevents single allocations (Finding A),
-which triggers scatter-gather, which worsens fragmentation, which eventually
-makes even scatter-gather fail, which triggers state-only FALLBACK, which
-loses KV and causes re-prefills. The bad_alloc at the end of this chain
-was caught by the OOM handler (server survived), but the re-prefills
-(278 FALLBACK events) are the real cost.
-
-### Fragmentation measurement — extend the existing `/stats` endpoint
-
-No new endpoint: `/stats` (`src/serve/stats_json.cpp`) already exposes
-`host_kv_capacity_bytes` / `host_kv_occupied_bytes`. Add fragmentation
-fields so the fix is measured instead of log-grepped.
-
-Instantaneous (into `MemorySummary`):
-- `host_kv_free_bytes`
-- `host_kv_largest_free_extent_bytes`
-- `host_kv_free_extent_count`
-- `host_kv_fragmentation_ratio` = largest extent / total free (1.0 = one
-  contiguous extent; lower = more shredded). The arena already tracks
-  `free_extents_`; this is a small read-only accessor.
-
-Cumulative counters (plumbed into `RuntimeStats`, exposed under the
-`host_kv` group of `/stats`):
-- `host_kv_single_alloc_failures` — single-extent allocations that failed
-  despite sufficient total free (the fragmentation signature; in the spill
-  path each is immediately repaired by a compaction)
-- `host_kv_compactions` — arena compactions that merged the free space
-- `host_kv_evictions` — whole units evicted from the safety net
-
-(The section's original `host_kv_state_only_fallbacks` counter is obsolete:
-PR #6 removed the state-only fallback path. The original
-`host_kv_scatter_gather_*` counters are obsolete too: the scatter-gather
-path was removed when compaction landed.)
-
-Land the metrics first, before the allocator fix: they are additive and
-give us the "before" baseline immediately.
-
-### Verification after fix (quantified against the metrics above)
-
-- every `host_kv_single_alloc_failures` increment in the spill path is
-  immediately followed by a compaction and a successful allocation — no
-  fragmentation-caused spill failures (incident baseline: 144 failures,
-  278 fallbacks)
-- no multi-extent allocations at all — the scatter-gather path is removed
-- evict-smallest frees enough space for the new allocation in one pass
-  (`host_kv_evictions` does not climb to drain the safety net)
-- `host_kv_fragmentation_ratio` stays at or above 0.9 during the evaluation
-  run (it is 1.0 right after a compaction; it only drops when interleaved
-  frees split the free space again)
-
-### Evaluation — demonstrate the defrag fix in a real scenario
-
-Run the same pressure workload against pre-fix and post-fix builds and
-compare the counters above.
-
-Workload (reproduces the production shape that triggered the incident):
-- one long multi-turn thinking session, 371k tokens / ~1000 messages
-  (drives repeated 6-12.5GB checkpoint spills), plus several small
-  interleaved sessions (~5k tokens each) so the arena holds mixed-size
-  live entries — the exact allocation pattern that produced the 144
-  single-alloc failures and 278 FALLBACKs.
-- 30GB arena, same seed, thinking with `--preserve-reasoning` on.
-
-Method:
-1. Pre-fix build (metrics only): run the workload, poll `/stats` through
-   the run; record worst-case `host_kv_fragmentation_ratio` and the four
-   cumulative counters.
-2. Post-fix build: identical run.
-3. Compare. Pass = all four verification criteria hold in the post-fix run
-   and fail (as in the incident) in the pre-fix run.
-
-Configurations: pre-fix (incident build) vs post-fix. The pre-fix baseline
-is the incident journal data (144 single-alloc failures, 278 fallbacks); a
-fresh pre-fix run is optional.
-
-Fast regression (implemented): `tests/test_kv_cache.cpp::exercise_compaction`
-replays the interleaved allocate/free pattern (eight 8-page blocks, two
-interleaved frees), asserts the 12-page allocation fails despite sufficient
-total free, compacts, asserts the free space is one extent with the data
-intact, and asserts the allocation then succeeds. Runs with the other
-`ninfer_kv_cache_test` checks (needs the CUDA driver for the pinned buffer,
-like the rest of that target).
-
-## Architecture Optimization — Exploit Hybrid SSM+Attention Topology (2026-09-10)
-
-### Discovery
-
-Qwen3-27B QUASAR uses a **hybrid architecture** (`hybrid_topology.h`):
-every 4th layer is full attention, the other 3 are GDN/SSM layers.
-
-```
-Layer:     0  1  2  3  4  5  6  7  8  ... 24 25 26 27
-Type:      G  G  G  A  G  G  G  A  G  ...  G  G  G  A
-```
-
-For 28 total layers:
-- **7 full-attention layers** (25%): need growing K/V cache (text KV)
-- **21 GDN/SSM layers** (75%): need only fixed-size recurrent state (state image)
-
-The GDN layers use a State Space Model (Mamba-style) architecture.
-Each token's GDN state depends only on the previous token's state
-(recurrent, O(1) per token). The state image (`StateImageHostLayout`)
-captures this recurrent state as a **fixed-size** tensor (~150MB) that
-does NOT scale with context length.
-
-### What we currently store vs what we actually need
-
-**Current spill (per checkpoint):**
-- `text_kv` — attention K/V for the attention layers, scales with context
-- `backend_kv` — speculative-backend KV (the MTP module's causal-attention KV when
-  `--spec mtp`, or the DFlash context KV), scales with context
-- State image — GDN recurrent state, fixed ~150MB
-
-> **Correction (2026-09-13, verified in code):** the original text of this section
-> described `backend_kv` as "GDN replay records" that are "only for mid-sequence
-> branching" and therefore droppable. That premise is **wrong**. In this codebase the
-> "backend KV" is the speculative backend's KV: `backend_kv_cache()` returns
-> `decoder->mtp_cache()` for `--spec mtp` (the production configuration), and the MTP
-> ops run **causal attention over the entire MTP KV prefix**
-> (`mtp_forward_batch` / `mtp_forward_ar_step`, `CausalAttentionExecutionEnvelope{visible,
-> visible}`). The GDN replay records the original text meant to drop are not in the
-> host spill at all — they live in the fixed `replay_records` arena plus the state
-> image, and are only consumed by the Fold of the current speculative round's candidate
-> window. Dropping the MTP KV from the host spill would therefore permanently degrade
-> MTP drafting after any safety-net restore (the restored prefix's MTP KV would be zero
-> and never recovered short of a full re-prefill). Level 1 below is rejected on this
-> basis. The size estimates in this section (backend_kv ≈ text_kv ≈ 6GB) are also
-> suspect: the MTP module is a small extra layer, so its KV is much smaller than the
-> main attention KV.
-
-### Three optimization levels
-
-**Level 1 — Drop backend_kv from host spill (keep text_kv + state image): REJECTED (2026-09-13).**
-
-> **Rejected — wrong premise.** This level assumed `backend_kv` holds droppable GDN
-> replay records. It does not: it is the MTP module's causal-attention KV (see the
-> correction above). Dropping it from the host spill permanently degrades MTP drafting
-> after any safety-net restore — the restored prefix's MTP KV would be zero and never
-> recovered short of a full re-prefill, which is exactly what the safety net exists to
-> avoid. Production runs `--spec mtp --draft-tokens 5`, so the cost is real. The
-> "2x more checkpoints" goal is also not achieved: the MTP KV is a small extra layer,
-> far smaller than the main attention KV that dominates the unit's size. The
-> fragmentation goal this level was meant to serve is instead met by arena compaction
-> (Post-Merge Findings, Finding A).
-
-- (Original proposal, retained for the record:) spill function skips backend_kv for
-  entries beyond a threshold; add `text_only` flag to `HostKVSafetyNetEntry`.
-
-**Level 2 — Drop both text_kv and backend_kv (state image only):**
-
-> **SUPERSEDED by the standing plan (atomic {KV + state} unit).** This level proposes
-> storing the state image WITHOUT its attention KV. Per the invariant that is not a
-> valid cache unit: the attention K/V for a position depends on the hidden state produced
-> by the preceding GDN layers, so it is not recomputable in isolation — the premise here
-> that only the attention layers need re-prefilling must be re-derived before this level
-> can be considered. Do not implement this level as written.
-
-- This is what state-only fallback already does!
-- ~150MB per checkpoint → effectively unlimited checkpoints in arena
-- Turn_closure: restore state image + re-prefill 7 attention layers only
-- Re-prefill cost: 25% of full model (7/28 layers) = ~4x faster than full re-prefill
-- For 370k tokens: ~25s instead of ~100s (estimated, 7 attention layers only)
-- Already partially implemented (state-only fallback), but currently treated as
-  a failure mode rather than a deliberate storage strategy
-
-**Level 3 — Don't store text_kv on device either (radical):**
-
-> **SUPERSEDED by the standing plan (atomic {KV + state} unit).** This level proposes
-> storing the state image WITHOUT its attention KV. Per the invariant that is not a
-> valid cache unit: the attention K/V for a position depends on the hidden state produced
-> by the preceding GDN layers, so it is not recomputable in isolation — the premise here
-> that only the attention layers need re-prefilling must be re-derived before this level
-> can be considered. Do not implement this level as written.
-
-- Device KV only holds 7 attention layers' worth of K/V (not 28 layers' text+backend)
-- Same 12.8GB device KV budget → **4x larger context** (555k → ~2.2M tokens)
-- Every turn_closure: restore GDN state (instant) + re-prefill 7 attention layers (25% compute)
-- Re-prefill of 7 layers for 555k tokens: ~25s (vs 0.3s with full KV cache)
-- Trade-off: 4x context capacity at the cost of ~25s per turn_closure
-- This is the fundamental advantage of hybrid SSM+attention: the SSM layers
-  have O(1) state, so only the attention layers' KV cache limits context length
-
-### Impact on arena fragmentation (Finding A)
-
-Level 1 directly addresses the fragmentation problem:
-- Entries are ~6GB instead of ~12.5GB (half the size)
-- Smaller, more uniform allocations reduce fragmentation
-- 2x more entries fit in the same 30GB arena
-- Fewer evictions needed → less churn → less fragmentation
-
-### Correctness
-
-GDN recurrent state (in the state image) is sufficient for correct forward
-generation. The model produces identical outputs whether using:
-- Full backend_kv (replay records) + text_kv, or
-- State image (recurrent state) + text_kv
-
-The replay records are a performance optimization for mid-sequence restore,
-not a correctness requirement. The recurrent state is the authoritative
-summary of all prior token processing.
-
-### Implementation sketch
-
-```
-// New flag on HostKVSafetyNetEntry
-bool text_only = false;  // true = no backend_kv stored, only text_kv + state
-
-// In spill function: for entries beyond tier-1 threshold
-if (entry_age > tier1_threshold) {
-    // Skip backend_kv copy, only spill text_kv + state image
-    entry.text_only = true;
-    // No backend_allocations, no backend_page_count
-}
-
-// In restore function: check entry.text_only
-if (entry.text_only) {
-    // Restore text_kv from host (H2D)
-    // Restore state image (already in state-only entry)
-    // No backend_kv to restore — GDN uses recurrent state from state image
-    // Schedule attention-layer-only prefill for the delta tokens
-}
-```
-
-### Verification
-
-- Correctness: outputs must be byte-identical between full-KV and text-only-KV
-  paths (GDN recurrent state produces same results as replay records for forward gen)
-- Performance: text-only turn_closure should be same speed as full-KV turn_closure
-  (same H2D for text_kv, same state image restore)
-- Arena: 2x more entries fit, fragmentation reduced
-- Mid-sequence branching: document as unsupported from text-only entries
-  (would need full re-prefill of GDN layers, which is correct but slow)
-
-### Refined Analysis — Reasoning Block Shedding (from user feedback)
-
-> **Attribution:** The reasoning-block shedding concept was proposed by
-> Mark (tokenring.ai), who identified that `--preserve-reasoning` causes
-> reasoning blocks to accumulate and consume the entire context budget,
-> and suggested tagging KV entries by semantic chunk to selectively shed
-> old reasoning while keeping responses.
-
-The real use case is not just "drop backend_kv" but **semantic KV cache
-shedding**: selectively discarding KV for old reasoning blocks that
-accumulate with `--preserve-reasoning` (thinking=on).
-
-#### The Problem
-
-With thinking enabled, each turn generates 10k-50k tokens of reasoning
-that is preserved in the conversation. After 10 turns, the context is
-~350k tokens — **mostly old reasoning that the model already used** to
-produce its response. The reasoning from turn 3 is irrelevant to turn 10,
-but its KV cache sits there consuming device and host space.
-
-#### The Insight
-
-The hybrid SSM+attention topology makes shedding **almost free**:
-
-- **GDN/SSM layers (75%):** The recurrent state (state image) already
-  "digested" the reasoning tokens. Shedding them from the KV cache has
-  **zero effect** on GDN forward generation. The state image captures
-  the recurrent state *after* processing the reasoning, so the
-  "memory" of that reasoning is baked into the fixed-size state.
-
-- **Attention layers (25%):** Shed reasoning tokens are masked in
-  attention (treated as padding). The model loses the ability to attend
-  to old reasoning details but retains all responses, tool calls, and
-  tool results. This is semantically meaningful: "forget the work,
-  remember the conclusion."
-
-#### Combined Impact
-
-| Strategy | Tokens spilled | Arena per checkpoint | Reduction |
-|---|---|---|---|
-| Current (text+backend) | 370k | ~12.5GB | 1x |
-| Shed old reasoning | ~50k (responses only) | ~1.7GB | 7x |
-
-(The original table's "Drop backend_kv (Level 1)" and "Both combined / 14x"
-rows depended on the rejected Level 1 — see the correction above — and are
-removed. Shedding alone is the remaining lever.)
-
-With 7x reduction, the 30GB arena could hold ~18 checkpoints instead of
-~2.5. Arena exhaustion and bad_alloc would disappear for typical workloads;
-fragmentation is handled separately by arena compaction.
-
-#### Implementation
-
-1. **Tagging:** The chat template already emits `  2. **KV metadata:** Tag page ranges with (turn_index, is_reasoning) metadata.
-   Pages are grouped by logical chunk, not individually.
-
-3. **Shed operation:** When context exceeds threshold (e.g., 80% of
-   max_context), find old reasoning blocks (turn_index < current - N)
-   and mark their KV pages as shed:
-   - Device: free pages for reuse (targeted eviction of reasoning only)
-   - Host: don't spill shed pages (smaller spill = less arena pressure)
-   - GDN: no change (recurrent state unaffected)
-
-4. **Attention masking:** Shed pages are skipped in attention computation
-   (same as padding tokens). No architectural change needed — the model
-   already handles masked positions.
-
-5. **Shed threshold:** Configurable via CLI (e.g.,
-   `--shed-reasoning-after N` — shed reasoning blocks older than N turns).
-   Default: shed when context exceeds 80% of max_context.
-
-#### Correctness
-
-- GDN layers: **perfect** — recurrent state is identical
-- Attention layers: **approximate** — same quality degradation as context
-  window truncation (the model is trained to handle missing context)
-- The response text (kept) captures the outcome of the reasoning, so
-  the model can still reference conclusions from old turns
-- This is strictly better than the current behavior (full eviction of
-  entire continuations, which loses EVERYTHING including responses)
-
-> **Reconciled with the standing plan:** the strip-invariance result below concerns the
-> GDN recurrent state, which is position-independent — that part stands. It does NOT
-> license storing the state WITHOUT its attention KV: "arena stores state image only" is
-> not a valid cache unit. A strip-thinking design must retain the attention KV and the
-> GDN state together; what may legitimately change is which *positions* the retained KV
-> covers, not whether the KV is kept.
-
-## Strip-Thinking-Cache — Don't Cache Reasoning KV (from vLLM/SGLang)
-
-> **Attribution:** Based on [vLLM PR #39806](https://github.com/vllm-project/vllm/pull/39806)
-> and [SGLang PR #23315](https://github.com/sgl-project/sglang/pull/23315).
-> Both identified the same problem and implemented the same solution independently.
-
-### The RoPE Position Problem
-
-When a client strips reasoning blocks from subsequent turns (the standard
-convention per DeepSeek/OpenAI API docs), the prefix cache breaks for a
-fundamental reason: **RoPE position shift**.
-
-Answer tokens after thinking have RoPE positional encodings computed at:
-```
-positions [input_len + thinking_len, input_len + thinking_len + answer_len]
-```
-
-In the next turn (without thinking), those same answer tokens appear at:
-```
-positions [input_len, input_len + answer_len]
-```
-
-The positions don't match. RoPE encodings are baked into the attention KV
-cache. The answer KV is **permanently invalid** after stripping thinking —
-not just a prefix-match failure, but a numerical correctness issue.
-
-This applies to YaRN-scaled positions too: YaRN is a scaling factor on
-RoPE positions. The shift is proportional. The problem exists with or
-without YaRN; YaRN doesn't make it better or worse.
-
-### What vLLM and SGLang Do
-
-Both engines added an opt-in flag (vLLM: `cache_reasoning_tokens=False`,
-SGLang: `--strip-thinking-cache`). On request completion with reasoning
-tokens detected:
-
-1. **Prompt prefix blocks** → normal cache path (retain hash for prefix matching)
-2. **Thinking + answer blocks** → immediately evicted (hash removed, blocks freed)
-
-Answer tokens are also stripped because their RoPE positions are mismatched.
-Both engines measured significant improvements:
-- SGLang: +6% cache hit rate, -1s TTFT (QwQ-32B, 2×B300)
-- vLLM: eliminates 1.3–1.6 GB dead branches per turn
-
-### ninfer's Advantage: Hybrid Architecture
-
-The RoPE position problem only affects the **7 attention layers** (25% of
-the model). The **21 GDN/SSM layers** (75%) don't use RoPE at all —
-confirmed in `gdn_mix()` which has no position/RoPE parameters. GDN uses
-`conv1d` + `gated_delta_net` (SSM recurrence), both position-independent.
-
-This means:
-- **Attention KV (text_kv, 7 layers):** NOT reusable after stripping thinking
-  (RoPE position shift). Must re-prefill.
-- **GDN recurrent state (state image, 21 layers):** Fully reusable regardless
-  of thinking token stripping or YaRN. The recurrent state captures all
-  history in a fixed-size tensor.
-
-### Proposed Implementation
-
-Add `--strip-thinking-cache` CLI flag (opt-in, default off).
-
-When enabled, on request completion with reasoning tokens detected:
-
-1. **Spill to host KV:** Only spill text_kv for the prompt prefix (before any
-   thinking block). Don't spill thinking + answer text_kv (RoPE-invalid).
-   Don't spill the thinking + answer range of backend_kv either — it is the
-   MTP module's KV (see the correction in the Architecture Optimization
-   section), and MTP causally attends over that range, so it has the same
-   position-binding problem; the cost is degraded MTP drafting until the
-   range is re-prefilled, which is acceptable for stripped/cancelled turns.
-
-2. **State image:** Always preserve (GDN recurrent state is position-independent
-   and fully reusable).
-
-3. **Device KV:** Free thinking + answer KV pages immediately for reuse
-   (same as vLLM/SGLang immediate eviction).
-
-4. **Next turn restore:** Restore GDN state from state image (instant) +
-   re-prefill 7 attention layers for the prompt prefix + answer + new message.
-   Re-prefill cost: 25% of full model (7/28 layers).
-
-### Impact
-
-| Scenario | Without strip | With strip |
-|---|---|---|
-| Normal turn (no cancellation) | turn_closure (0.3s) | Re-prefill 7 layers (~25% compute) |
-| Cancellation turn (reasoning stripped) | Root prefill ALL 28 layers (124s) | Re-prefill 7 layers only (~31s) |
-| Arena storage per checkpoint | ~12.5GB (text+backend) | ~0.15GB (state image only) |
-| Arena capacity (30GB) | ~2.4 entries | ~200 entries |
-
-The trade-off: normal turns become slightly slower (re-prefill 7 layers
-instead of instant turn_closure), but cancellation turns become 4x faster
-(31s instead of 124s), and arena pressure drops by 80x.
-
-For interactive coding sessions where cancellation is common, this is a
-net win. For batch/streaming sessions without cancellation, the default
-(off) preserves the current fast turn_closure behavior.
-
-### Combined with Reasoning Block Shedding
-
-The `--strip-thinking-cache` flag and the reasoning block shedding plan
-are complementary:
-
-- **strip-thinking-cache:** Don't cache thinking+answer KV at all. Handle
-  the client-stripping case (cancellation). Arena stores state image only.
-- **Reasoning block shedding:** Keep thinking in the prompt (preserve_thinking=on),
-  tag and shed old reasoning KV in the engine. Handle the accumulation case.
-  Arena stores text_kv for responses only.
-
-Both reduce arena pressure. Both exploit the GDN/SSM advantage (75% of
-layers unaffected by RoPE position shift). They can be used together or
-independently depending on the workload.
+# Host-KV plan — concise (2026-09-14)
+
+Step-for-step working plan. Shipped work: `implemented.md`. Design context,
+full invariant text, and investigation history: `plan-reference.md`.
+
+## Goal — unity
+
+**A cache unit is {KV + state}, atomically.** Captured, retained, budgeted,
+evicted, and restored as ONE indivisible unit — never store, budget, or evict
+either half on its own (full invariant: `plan-reference.md`, "Standing plan").
+
+Every failure class we chased this week is an instance of the unit being split
+across three stores with separate capacities, separate LRU, and separate
+lifecycles (host-KV pool 30 GiB / host state pool 24 × ~147 MiB / compact-prefix
+safety net):
+
+| Symptom | Split that caused it |
+|---|---|
+| Restart/wedge loop (09-14) | state slot evicted, KV kept → "no resident state" → error loop |
+| Mid-conversation re-prefills (12.17M tokens today) | state-slot LRU evicts a live continuation; KV pool 25% full |
+| 19s safety-net ttft | continuation gone, only the shared-prefix half survives |
+| `rewrite_checkpoint_invalid` ckpt-miss | half-unit stored (KV + prefix without a valid checkpoint) |
+| Fit-gate deadline aborts | state pool saturated while KV pool has room |
+
+**Unity is the main goal.** Fix the split and the follow-up list collapses.
+
+## Status (2026-09-14, post-deploy 20:04)
+
+- Server stable: 0 adopt errors, 0 orphans at deploy; bounded deadline aborts
+  work; slow-path fallbacks complete. Restart causes eliminated (see
+  `implemented.md`).
+- Residual: the state-slot pool is the binding constraint (24 × 147 MiB);
+  ~11 slow fallbacks/day; **1 true orphan observed post-deploy**
+  (`LEAK (orphan)`, `shared_refs=0`, `endpoint-write`, `ckpt_refs=1` — recurring,
+  stable signature).
+
+## Tasks, in execution order
+
+### P0 — quick wins (hours each, do before starting #7)
+
+- [ ] **P0.1 — e2e deterministic checkpoints** (old #3). Force reasoning in
+      phases 5/6 like phase 4 (`s.args.thinking_mode = True` +
+      `reasoning: {effort: low}` in the payload) — ~5 lines in
+      `tools/e2e/ninfer-e2e.py`.
+      *Exit:* two consecutive full e2e runs with 0 `rewrite_checkpoint_invalid`
+      flaps.
+- [ ] **P0.2 — retry detection** (old #4c). Identical prompt re-sent within ~60s
+      re-prefills from scratch (seen 3× at 16:36–16:46, 385k tokens each; 2× at
+      19:45–19:46, 400k each — ~2.5M tokens of pure retry waste today). Detect
+      the repeat and serve from the just-completed continuation.
+      *Exit:* e2e retry scenario; 0 full re-prefills on repeated prompts.
+- [ ] **P0.3 — state-pool stopgap** (old #1b-lite). `--host-state-slots 24→48`
+      in `~/.config/ninfer.conf` (147 MiB/slot → ~7 GiB RAM). One-line ops
+      change that halves state-pool pressure until #7 lands.
+      *Exit:* fewer "no resident state" fallbacks in the journal; no host OOM.
+      (Superseded by #7 — do not build on it.)
+
+### P1 — #7: the unit (checkpoint + KV as one unit) — the main development effort
+
+The standing plan already declares the invariant; the code violates it in four
+ways: (1) two independent host budgets (KV pool vs state-slot pool); (2)
+independent LRU — the state pool evicts a live continuation while the KV pool
+sits 25% full; (3) half-units get stored (`ckpt-miss:
+rewrite_checkpoint_invalid`, `ckpt_frontier=0`); (4) "state without KV" is a
+retained form (the 19s safety-net class). #7 implements the invariant.
+**Subsumes:** #1a (planner-side H2D demand), #1b (pool right-sizing), #4a
+(per-session slot guarantee), #4b (idle-aware retention), the 19s safety-net
+class, the ckpt-miss class.
+
+- [ ] **P1.1 — scope in plan mode.** Refactor spans `StateImageStore`/
+      `HostStatePool`, the host-KV pool, spill/safety-net paths, RM accounting,
+      and the planner cost model. *Exit:* approved plan with slice boundaries.
+- [ ] **P1.2 — Slice 1: unit identity + cost model.** A continuation owns one
+      unit {KV replica, frontier checkpoint, compact prefix}; one cost =
+      `kv_bytes + state_image_bytes`; RM accounts one number.
+      *Exit:* unit-identity unit tests; accounting matches the sum of parts.
+- [ ] **P1.3 — Slice 2: atomic admission.** Admit only when the whole unit fits
+      the shared host budget; `rewrite_checkpoint_invalid` becomes an admission
+      *failure*, not a degraded half-spill.
+      *Exit:* 0 `ckpt_frontier=0` units in e2e + journal.
+- [ ] **P1.4 — Slice 3: atomic spill/restore.** The unit moves to host / back as
+      one; "KV on host + no resident state" becomes impossible.
+      *Exit:* 0 "no resident state" lines under pool pressure (e2e phase 12).
+- [ ] **P1.5 — Slice 4: unit LRU/retention + per-session guarantee.** Evict
+      whole units, cost-aware smallest-first; protect an interactive session's
+      unit (≥2 slots: turn-closure + checkpoint); idle-aware recency weight.
+      *Exit:* 0 mid-instance full-root re-prefills in a long-session e2e; the
+      19s safety-net class is gone.
+- [ ] **P1.6 — config.** `--host-state-slots` derived from (or replaced by) the
+      shared budget; document the single `--host-cache-mib`.
+
+*#7 exit criteria:* e2e full suite + 3-session long conversation: 0 full-root
+mid-conversation re-prefills, 0 ckpt-miss half-units, 0 "no resident state",
+no restarts during a 1-hour saturated run.
+
+### P2 — #2: strip-collapse (`--strip-thinking-cache`)
+
+Re-prefill only the 7 RoPE-bound attention layers after a thinking-strip;
+restore the 21 GDN/SSM layers from the position-independent state image.
+4× faster cancellation, ~80× less arena. Design: `plan-reference.md`,
+"Strip-Thinking-Cache". **After #7** — its state-image-restore path sits on the
+unit model; building the unit first makes this cheaper.
+
+- [ ] Scope (spill path, state-image restore, device-KV free, new CLI flag,
+      identity/entitlement interaction).
+- [ ] Implement + e2e-verify (cancellation turn ~4× faster; arena ~80× less).
+
+### P3 — long tail
+
+- [ ] **True-orphan investigation (live, post-deploy).** First
+      `LEAK (orphan)` (`shared_refs=0`, `endpoint-write`, `ckpt_refs=1`)
+      observed after the 20:04 deploy — recurring with a stable signature.
+      Trace the unbalanced retain/release pair on the endpoint-write
+      checkpoint-reference path. Every orphan leaks a state slot forever →
+      feeds the pool saturation that drives #4-class losses.
+- [ ] **#4d — planner pruning.** Prune long-idle/dead owners from the 4096-target
+      search space (e2e symptom: `budget_exhausted=True`,
+      `stop_reason=expansion_capacity`). Shrinks further after #7's unit
+      lifecycle.
+- [ ] **15:15–15:32 stall (pre-deploy, uninvestigated).** ~15 min at
+      `waiting=1, materializing=1`. May be error-loop fallout — recheck the
+      post-deploy journal before chasing.
+- [ ] **jinja carries** (not on the serving path): qwen3.8 artifact embedded
+      template rebuild (needs BF16 source); frontend flag exposure
+      (`tool_call_format`, `auto_disable_thinking_with_tools`,
+      `max_tool_arg_chars`, `max_tool_response_chars`).
+
+## Why this order
+
+1. **P0 first:** hours of work, removes daily waste (retry re-prefills, pool
+   pressure), and makes e2e a trustworthy gate before the big refactor.
+2. **#7 is the unifying work:** every other cache pain is an instance of the
+   unit being split; fix the split and the follow-up list collapses.
+3. **#2 after #7:** strip-collapse's restore path must sit on the unit model
+   anyway.
+4. **Long tail last:** each item is either subsumed by #7 or shrunk by it.
+
+## Evidence base (for #7 sizing)
+
+From the 09-14 request-log reconstruction (commit `2e83ec50`): e2e 156
+mid-conversation roots / 2.78M tokens (all full roots); prod 119 / 12.17M
+tokens — 75 true full roots (27 restart-induced, gone with the adopt-fix
+deploy; 48 mid-instance losses concentrated in 200k–400k-token conversations,
+every turn) + 44 safety-net roots (0.29M tokens but 19s ttft). Mechanism:
+state-slot pool saturation (hs sawtooths 0→24→0 with no requests in flight) →
+LRU evicts a live continuation before its next turn (1–4 min human gaps) →
+no candidate → full root prefill.
