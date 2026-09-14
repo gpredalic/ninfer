@@ -1038,6 +1038,11 @@ private:
         bool publish_private = false;
         bool publish_shared  = false;
         bool replaces_shared = false;
+        // Set once publish_active_capture has retained the shared source's
+        // checkpoint reference (for the new shared entry). If the publish is
+        // aborted after that point, abort_active_capture must release the
+        // reference — the shared slot is rolled back, so nothing else would.
+        bool shared_reference_retained = false;
         std::optional<runtime::CheckpointRef> private_replacement;
         std::optional<std::uint32_t> shared_index;
         std::uint64_t replacement_generation = 0;

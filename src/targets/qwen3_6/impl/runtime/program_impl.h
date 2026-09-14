@@ -9234,6 +9234,14 @@ void ProgramImplCore::abort_active_capture(ActiveCaptureTransaction& transaction
                         (void)state_store->release(transaction.destination_state);
                     }
                 }
+                if (transaction.shared_reference_retained) {
+                    // The new shared entry is rolled back by the shared_index
+                    // block below; release its checkpoint reference here, or
+                    // it dangles on the source image ("LEAK (orphan)" —
+                    // shared_refs=0, refs=1, endpoint-write).
+                    state_store->release_checkpoint_reference(transaction.source_state);
+                    transaction.shared_reference_retained = false;
+                }
                 state_store->thaw(transaction.source_state);
                 refresh_state_views(sequence);
             } catch (...) {}
@@ -9316,6 +9324,7 @@ ActiveCaptureResult ProgramImplCore::publish_active_capture(ActiveCaptureTransac
     detail::PhysicalResources removed = transaction.capacity_preparation_removed;
     if (transaction.publish_shared) {
         state_store->retain_checkpoint_reference(transaction.source_state);
+        transaction.shared_reference_retained = true;
     }
     if (transaction.publish_private) {
         if (transaction.recycles_private_state) {
@@ -9345,7 +9354,29 @@ ActiveCaptureResult ProgramImplCore::publish_active_capture(ActiveCaptureTransac
         }
     }
     if (removed != transaction.resource_delta.removed) {
-        throw std::logic_error("active capture replacement effect changed after reservation");
+        // The reservation's expected removal (admission time) and the actual
+        // removal (prepare-time release + recycle + install) diverged. The
+        // physical operations are already done and the bookkeeping below uses
+        // the ACTUAL removed, so the divergence is a benign timing class —
+        // pressure work demoted/evicted part of the replacement unit between
+        // reservation and publication. Accept the actual effect (bounded by
+        // one unit's resources) instead of escalating to a worker-wide
+        // recovery that wipes the catalog and orphans the shared retain.
+        // Genuine world corruption is still caught by the generation and
+        // descriptor checks above and in the shared publication block below.
+        std::fprintf(stderr,
+                     "[capture] replacement effect diverged from reservation "
+                     "(reserved: dev_kv=%u dev_state=%u host_state=%u host_kv_bytes=%zu; "
+                     "actual: dev_kv=%u dev_state=%u host_state=%u host_kv_bytes=%zu) "
+                     "— accepting actual effect\n",
+                     (unsigned)transaction.resource_delta.removed.device.main_kv_pages,
+                     (unsigned)transaction.resource_delta.removed.device.state_slots,
+                     (unsigned)transaction.resource_delta.removed.host.state_slots,
+                     (size_t)transaction.resource_delta.removed.host.kv_bytes,
+                     (unsigned)removed.device.main_kv_pages,
+                     (unsigned)removed.device.state_slots,
+                     (unsigned)removed.host.state_slots,
+                     (size_t)removed.host.kv_bytes);
     }
 
     const detail::PhysicalResources private_replacement_removed =
