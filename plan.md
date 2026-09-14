@@ -171,6 +171,17 @@ development. Each is verified with the P0 e2e gate + the live journal.
       (29k mapped pages total) freed only **77** pages (535→612) — 99.7% of
       the demoted pages were shared with the live shared prefix, so
       per-conversation demotion frees only each conversation's unique tail.
+      Quantified 00:32–00:34 (decisive): req 23 (227k-token conversation)
+      needed 4070 pages, free 621; **13 idle-continuation demotions** (each
+      reporting 6.6k–7.1k *unique resident* pages — the `a53db4b4` ranking
+      works) freed **156 pages total** (621→777). The victims are stale
+      turn-continuations of the SAME conversation; their pages stay
+      device-resident because the **shared prefix entry** and the active
+      continuation still reference them — the metric measures residency,
+      not exclusivity. The single conversation's working set (prefix ~224k +
+      active ~227k + incoming ~227k ≈ 675k tokens) exceeds the device pool
+      (~520k tokens): no per-continuation demotion combination can fit the
+      next turn.
       Quantified 23:09 (worse): req 21 needed **5548** pages, free sat at
       2370→2462 through 120s of defers — no combination of idle-continuation
       demotions could close a ~3000-page gap. The "idle continuations" are
