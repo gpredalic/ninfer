@@ -191,9 +191,7 @@ development. Each is verified with the P0 e2e gate + the live journal.
       construction. Fix direction: (a) rank relief victims by *unique*
       (non-shared) resident pages, not mapped pages — **done `a53db4b4`**;
       (b) batch-demote until the demand fits (bounded per tick), not one per
-      15s — **done `a53db4b4`**; (c) make the **shared prefix itself a
-      demotion unit** — demote it to host as one {KV + state} unit (the
-      standing-plan invariant applied to the shared side); (d) admission
+      15s — **done `a53db4b4`**; (c) make the **shared prefix itself a demotion unit** — **stage 2 shipped `f02bc048`**: when no private victim exists, relief releases the idle shared prefix entry (Catalogued, active_references==0, not the transaction's shared source) with the most resident pages; content survives in the safety net via spilled turn continuations. Full unit-grade version (D2H spill of the shared prefix as one {KV + state} unit) is P2.4; also noted: the incoming restore allocates NEW device pages for a prefix that is already device-resident (identity-based restore is the deeper fix); (d) admission
       should see the pool's shared-prefix occupancy and queue the request
       (visible queue position) instead of a 120s silent defer. *Exit:* a
       5th-conversation e2e scenario completes (via shared-prefix demotion or
