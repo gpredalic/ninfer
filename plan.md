@@ -125,6 +125,45 @@ from. **This is the bug the user keeps hitting.** Investigate the admission path
 does a leaked state slot keep a lane logically occupied so `request_admission_check`
 never admits the waiting request? This supersedes the "lower priority" note above.
 
+**2026-09-14 14:00 update — ROOT CAUSE FOUND, fix in build.** The full death spiral,
+confirmed by journal + code:
+
+1. **The imbalance:** the recycle-capture publish path (`program_impl.h` ~9156)
+   reset `sequence.rewrite_state` **without releasing its checkpoint reference**.
+   The recycled slot becomes the new ACTIVE binding (the `ActiveStateBinding`
+   assignment at ~9118), so the image keeps ref=1 while it is active. The NEXT
+   recycle re-targets the same image as the new checkpoint destination, and
+   `install_private_capture` re-retains it (its `!= checkpoint` guard skips the
+   release when the image is the same) → **ref=2**.
+2. **The leak:** at sequence-clear, one reference is released (2→1), then the
+   handle release is refused (`checkpoint_references != 0`) → `state-lease LEAK`
+   → the state slot is **orphaned forever** (the store still holds it; the
+   sequence no longer references it).
+3. **The spiral:** device state pool = 8 slots (3 cache + 5 active). Each leak
+   consumes one. At 8/8 (`device_state_occupied_slots=8`, live /stats), sources
+   can no longer keep/restore state → `resident_resources` (which only counts
+   valid, sequence-exclusive images) reads 0 → **"materialization source has no
+   resident state"** → root-prefill fallback.
+4. **The error loop:** the root fallback sets `has_source=false`, so the terminal
+   result carries no source — but the admission claim record still expects one →
+   `adopt_materialization_progress` (resource_manager.h:2505) throws
+   **"materialization private source result is missing"** → request errors →
+   client retries → repeat. (44× in 15 min; 109k KV defers; 1 deadline abort.)
+
+**The fix (3 edits, `program_impl.h`):**
+- Recycle reset: release the checkpoint reference before dropping the handle
+  (the primary fix — breaks the double-retain).
+- `install_private_capture`: idempotent same-image re-capture (retain only when
+  the binding is new or replaced; a same-image re-capture no-ops instead of
+  double-retaining).
+- LEAK log enriched with `image=`, `ckpt_refs=`, `residency=` for future diagnosis.
+
+**Remaining (follow-up, not in this fix):** the adopt path still hard-errors on
+any legitimate "no resident state" fallback (the claim record expects a source the
+root result doesn't carry). With the leak gone this is rare, but it should become
+graceful degradation (consume the claim, complete as root) rather than a request
+error. Filed as a separate task.
+
 ## Standing plan — a cache unit is {KV + state}, atomically (invariant for every phase)
 
 A context-cache unit is **the attention KV and the GDN recurrent state together**.
