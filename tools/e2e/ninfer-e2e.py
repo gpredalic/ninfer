@@ -74,6 +74,8 @@ class Session:
             "store": True,
             "stream": False,
         }
+        if getattr(self.args, "thinking_mode", False):
+            payload["reasoning"] = {"effort": "low"}
         if self.response_id:
             payload["previous_response_id"] = self.response_id
         t0 = time.monotonic()
@@ -134,6 +136,8 @@ class ChatSession:
             "tool_choice": "auto",
             "stream": False,
         }
+        if getattr(self.args, "thinking_mode", False):
+            payload["enable_thinking"] = True
         t0 = time.monotonic()
         out = json.load(urllib.request.urlopen(urllib.request.Request(
             f"http://{self.args.host}:{self.args.port}/v1/chat/completions",
@@ -1069,6 +1073,11 @@ def phase_5(args):
     log_off = count_log_lines(args.serve_log)
     stats0 = get_stats(args)
     s5 = [Session("CKPT", 12000, 2000, args)]
+    # Force reasoning (rewrite checkpoints) like phase 4 so the
+    # checkpoint-advance assertions don't flap on model mood.
+    s5[0].args = type(args)(**vars(args))
+    s5[0].args.thinking_mode = True
+    s5[0].args.max_output_tokens = 128
     for r in range(1, 9):
         print(f"Round {r}:")
         errors = run_round(s5, r, args.timeout)
@@ -1127,6 +1136,9 @@ def phase_6(args):
     # Override max_output_tokens so the model has room to generate tool calls
     s6[0].args = type(args)(**vars(args))
     s6[0].args.max_output_tokens = 256
+    # Force reasoning (rewrite checkpoints) like phase 4 so the
+    # checkpoint assertions don't flap on model mood.
+    s6[0].args.thinking_mode = True
     for r in range(1, 7):
         print(f"Round {r}:")
         errors = run_round(s6, r, args.timeout)
