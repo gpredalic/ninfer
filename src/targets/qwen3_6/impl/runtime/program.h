@@ -977,6 +977,13 @@ private:
         bool cancel_pending                 = false;
         bool prepared                       = false;
         bool terminal                       = false;
+        // Set by the root-prefill fallback (source evicted before restore): the
+        // source's physical state is gone and its continuation slot was recycled
+        // as the root destination, so no source summary can be populated. The
+        // terminal (publish or abort) then reports the source as Retained
+        // WITHOUT a final summary — the adopt side keeps the logical entry
+        // (restorable from the safety net) without adding an active reference.
+        bool source_fallback_retained       = false;
         // Device-KV fit-gate defer bookkeeping (set by prepare_materialization's
         // capacity gate, cleared when a prepare passes the gate). kv_defer_first
         // bounds the defer: once it is older than kKVDeferDeadline the progress

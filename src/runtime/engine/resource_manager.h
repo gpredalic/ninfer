@@ -2500,39 +2500,58 @@ private:
         bool retained_private_source = false;
         if (record->source_slot != kInvalidCatalogSlot) {
             CatalogEntry& source = catalog_[record->source_slot];
-            if (!result.source || source.state != CatalogState::Claimed ||
+            if (source.state != CatalogState::Claimed ||
                 source.id != record->source_id || source.revision != record->source_revision) {
                 throw std::logic_error("materialization private source result is missing");
             }
-            if (result.status == ContextTransactionStatus::Published &&
-                result.source->disposition != record->source_disposition) {
-                throw std::logic_error("private source outcome differs from the selected target");
-            }
-            if (result.source->disposition == ClaimDisposition::Retained) {
-                if (result.source->final_summary) {
-                    if (!valid_continuation_summary(*result.source->final_summary)) {
-                        throw std::logic_error("materialization source summary is invalid");
-                    }
-                    assign_continuation_summary(source.summary, *result.source->final_summary);
-                    migrate_observations(source, *result.source->final_summary, source.retention);
-                    advance_revision(source.revision);
-                    refresh_session_owner_revision(record->source_id, record->source_slot,
-                                                   source.revision);
-                }
-                source.state            = CatalogState::Catalogued;
-                retained_private_source = result.status == ContextTransactionStatus::Published;
-                if (retained_private_source) { ++source.active_references; }
-            } else if (result.source->disposition == ClaimDisposition::ConsumedToActive) {
-                erase_session_if_owner(source.id);
-                source.handle.reset();
-                source.summary.endpoint.reset();
-                source.summary.rewrite.reset();
-                source.summary.long_anchors.clear();
-                source.observations.clear();
-                source.session.reset();
-                source.active_references = 0;
+            if (!result.source) {
+                // Root-fallback acknowledgement: the source's physical state was
+                // evicted before restore, so the program fell back to root prefill
+                // (or was aborted after a deferred one) and reports no source.
+                // The logical continuation survives (restorable from the safety
+                // net) — release the claim back to Catalogued without a summary
+                // update and without an active reference.
+                source.state = CatalogState::Catalogued;
             } else {
-                throw std::logic_error("materialization source returned an invalid disposition");
+                // A root-fallback acknowledgement carries no final summary (the
+                // program could not populate one — the source state is gone), so
+                // the planned disposition was not honored and must not be checked.
+                if (result.status == ContextTransactionStatus::Published &&
+                    result.source->final_summary &&
+                    result.source->disposition != record->source_disposition) {
+                    throw std::logic_error("private source outcome differs from the selected target");
+                }
+                if (result.source->disposition == ClaimDisposition::Retained) {
+                    if (result.source->final_summary) {
+                        if (!valid_continuation_summary(*result.source->final_summary)) {
+                            throw std::logic_error("materialization source summary is invalid");
+                        }
+                        assign_continuation_summary(source.summary, *result.source->final_summary);
+                        migrate_observations(source, *result.source->final_summary, source.retention);
+                        advance_revision(source.revision);
+                        refresh_session_owner_revision(record->source_id, record->source_slot,
+                                               source.revision);
+                        source.state            = CatalogState::Catalogued;
+                        retained_private_source = result.status == ContextTransactionStatus::Published;
+                        if (retained_private_source) { ++source.active_references; }
+                    } else {
+                        // Root-fallback acknowledgement (summary-less Retained):
+                        // the logical entry survives restorable — keep it
+                        // Catalogued with its prior summary, no reference bump.
+                        source.state = CatalogState::Catalogued;
+                    }
+                } else if (result.source->disposition == ClaimDisposition::ConsumedToActive) {
+                    erase_session_if_owner(source.id);
+                    source.handle.reset();
+                    source.summary.endpoint.reset();
+                    source.summary.rewrite.reset();
+                    source.summary.long_anchors.clear();
+                    source.observations.clear();
+                    source.session.reset();
+                    source.active_references = 0;
+                } else {
+                    throw std::logic_error("materialization source returned an invalid disposition");
+                }
             }
         } else if (result.source) {
             throw std::logic_error("root materialization returned a private source result");

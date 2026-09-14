@@ -6557,8 +6557,10 @@ void ProgramImplCore::try_release_state_image(StateImageHandle handle, const cha
         }
     }
     std::fprintf(stderr,
-                 "[state-lease] LEAK: release refused (%s) ckpt_refs=%u residency=%d shared_refs=%u "
+                 "%s release refused (%s) ckpt_refs=%u residency=%d shared_refs=%u "
                  "blockers=%u (bit0=refs bit1=pins bit2=dest_pinned bit3=pending)\n",
+                 shared_refs > 0 ? "[state-lease] retained (shared prefix)"
+                                 : "[state-lease] LEAK (orphan)",
                  context, ckpt_refs, residency, shared_refs,
                  state_store->release_blockers(handle));
 }
@@ -6642,6 +6644,19 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
         out.victims = std::move(transaction.pressure_results);
     };
     const auto complete_source_acknowledgement = [&](bool published) {
+        if (transaction.source_fallback_retained) {
+            // Root fallback: the source's physical state was evicted before
+            // restore and its slot was recycled as the root destination, so no
+            // summary can be populated. The logical entry survives (restorable
+            // from the safety net): report it as Retained WITHOUT a summary —
+            // the adopt side keeps it Catalogued without adding an active
+            // reference. (A normal Retained always carries a summary, so a
+            // summary-less Retained unambiguously marks a fallback.)
+            out.source.emplace(MaterializationSourceResult{
+                .disposition = runtime::ClaimDisposition::Retained,
+            });
+            return;
+        }
         if (!transaction.has_source) { return; }
         if (published &&
             transaction.source_disposition == runtime::ClaimDisposition::ConsumedToActive) {
