@@ -2027,6 +2027,12 @@ private:
                 recover_from_oom_locked(oom_error);
                 finish_engine_phase(cleanup, EngineHostPhase::Maintenance);
                 oom_backoff_ = kOomBackoffIterations;
+                // Recovery changed admission-visible program/resource state
+                // (fail_all_cleanup + catalog clear) and the admission check
+                // signal was already consumed by the failing attempt — re-arm
+                // it, or a still-pending request would never be re-admitted
+                // (the 23:10:21 wedge: waiting=1, GPU 0%, until restart).
+                request_admission_check();
                 // Scheduler state was cleared by recover_from_oom_locked; treat the next
                 // iteration as a fresh scheduling boundary (no decode continuity).
                 previous_unit_was_decode = false;
@@ -2045,6 +2051,13 @@ private:
                 recover_from_oom_locked(std::current_exception());
                 finish_engine_phase(cleanup, EngineHostPhase::Maintenance);
                 oom_backoff_ = kOomBackoffIterations;
+                // Same re-arm as the OOM path: the failing admission attempt
+                // consumed the one-shot admission check, and recovery left
+                // pending requests behind. Without this, a logic_error during
+                // admission wedges the worker at waiting>=1 / GPU 0% forever
+                // (bounded only by the sentinel); with it, the request is
+                // re-admitted or fails via the kOomMaxRecoveries fail-all.
+                request_admission_check();
                 previous_unit_was_decode = false;
                 continue;
             } catch (...) {

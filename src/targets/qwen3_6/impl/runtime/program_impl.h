@@ -1248,16 +1248,19 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_admission(
     }
     const SequenceState* source_state = nullptr;
     if (source != nullptr) {
-        if (!valid_continuation(*source)) {
-            throw std::logic_error("admission source continuation is stale");
-        }
+        // A stale source is a candidate whose slot was recycled between the
+        // prefix-index rebuild and this inspect (release bumps the slot
+        // generation). That is a normal lifecycle event, not an Engine fault:
+        // skip the candidate (the caller logs an inspect MISS) instead of
+        // throwing — a throw here escalated to a full worker recovery that
+        // left the requesting request unadmitted (the 23:10:21 wedge). Same
+        // idiom as the owner-validity skips in the claim paths.
+        if (!valid_continuation(*source)) { return std::nullopt; }
         source_state = &continuation_states[ContractAccess::index(*source)];
     }
     const SharedPrefixState* shared_state = nullptr;
     if (shared_source != nullptr) {
-        if (!valid_shared_prefix(*shared_source)) {
-            throw std::logic_error("admission shared-prefix source is stale");
-        }
+        if (!valid_shared_prefix(*shared_source)) { return std::nullopt; }
         shared_state = &shared_prefix_states[ContractAccess::index(*shared_source)];
     }
 
