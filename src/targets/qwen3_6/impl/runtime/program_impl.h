@@ -4744,10 +4744,11 @@ ProgramImplCore::relieve_stalled_fit_gate(const MaterializationTransaction& tran
     // continuations that are neither in use nor about to be used are the
     // Catalogued ones that are not this transaction's source or destination
     // and are not bound to a decode lane. Demote the one pinning the most
-    // text KV pages: it frees the most, and the giant idle sessions are
-    // exactly what pins the pool. The {KV + state} unit is preserved in the
-    // host safety net, so the session's next turn restores from host instead
-    // of re-prefilling.
+    // UNIQUE device-resident pages: mapped pages overcount, because pages
+    // shared with the live shared prefix (or already host-resident) are not
+    // freed by a release — the 22:28 episode demoted 29k mapped pages and
+    // freed 77. The {KV + state} unit is preserved in the host safety net, so
+    // the session's next turn restores from host instead of re-prefilling.
     std::uint32_t victim       = continuation_capacity;  // sentinel: none
     std::uint32_t victim_pages = 0;
     for (std::uint32_t i = 0; i < continuation_capacity; ++i) {
@@ -4763,10 +4764,13 @@ ProgramImplCore::relieve_stalled_fit_gate(const MaterializationTransaction& tran
             if (active_continuations[lane] == i) { lane_bound = true; break; }
         }
         if (lane_bound || !continuation_states[i].kv) { continue; }
-        const std::uint32_t pages =
-            text_kv_addresses->mapped_pages(continuation_states[i].kv->text);
-        if (pages > victim_pages) {
-            victim_pages = pages;
+        const SequenceKVBundle& kv = *continuation_states[i].kv;
+        std::uint32_t unique = text_kv_addresses->resident_device_pages(kv.text);
+        if (kv.backend && backend_kv_addresses) {
+            unique += backend_kv_addresses->resident_device_pages(*kv.backend);
+        }
+        if (unique > victim_pages) {
+            victim_pages = unique;
             victim       = i;
         }
     }
@@ -4780,7 +4784,7 @@ ProgramImplCore::relieve_stalled_fit_gate(const MaterializationTransaction& tran
     release_continuation_slot(victim);
     std::fprintf(stderr,
                  "[relief-kv] fit gate stalled — demoted idle continuation %u "
-                 "(%u text pages) to the host safety net\n",
+                 "(%u unique resident pages) to the host safety net\n",
                  victim, victim_pages);
     return victim_pages;
 }
@@ -4876,12 +4880,14 @@ bool ProgramImplCore::prepare_materialization(MaterializationTransaction& transa
         // other in-flight work drains. If they have not grown for
         // kKVReliefDelay, nothing is draining (no running requests, and the
         // context transaction is single — no other materialization can free
-        // pages), so demote the largest idle continuation to the host safety
-        // net instead of deferring to the 120s deadline. Re-armed after each
-        // relief so a demand larger than one victim gets repeated relief; a
-        // drain in progress (free grew) always wins by resetting the clock.
+        // pages), so demote idle continuations to the host safety net instead
+        // of deferring to the 120s deadline. A single victim rarely covers a
+        // big demand (conversations share a prefix, so each frees only its
+        // unique tail), so batch up to 3 demotions per tick until the pool
+        // covers the demand; a drain in progress (free grew) always wins by
+        // resetting the clock.
         const auto maybe_relief =
-            [&transaction, this](std::uint32_t free_pages) {
+            [&transaction, this](std::uint32_t need, std::uint32_t free_pages) {
                 const auto now = Clock::now();
                 if (transaction.kv_defer_flat_since == std::chrono::steady_clock::time_point{} ||
                     free_pages > transaction.kv_defer_last_free) {
@@ -4890,12 +4896,15 @@ bool ProgramImplCore::prepare_materialization(MaterializationTransaction& transa
                 transaction.kv_defer_last_free = free_pages;
                 if (now - transaction.kv_defer_flat_since < kKVReliefDelay) { return; }
                 transaction.kv_defer_flat_since = now;
-                (void)relieve_stalled_fit_gate(transaction);
+                for (int i = 0; i < 3; ++i) {
+                    if (relieve_stalled_fit_gate(transaction) == 0) { break; }
+                }
             };
         if (text_pool.available_pages() < demand.reservation_added.device.main_kv_pages) {
             kv_defer_bookkeeping(0, "KV", demand.reservation_added.device.main_kv_pages,
                                  text_pool.available_pages());
-            maybe_relief(text_pool.available_pages());
+            maybe_relief(demand.reservation_added.device.main_kv_pages,
+                         text_pool.available_pages());
             return false;
         }
         if (backend_kv_pages) {
@@ -4903,7 +4912,8 @@ bool ProgramImplCore::prepare_materialization(MaterializationTransaction& transa
             if (backend_pool.available_pages() < demand.reservation_added.device.backend_kv_pages) {
                 kv_defer_bookkeeping(1, "KV (backend)", demand.reservation_added.device.backend_kv_pages,
                                      backend_pool.available_pages());
-                maybe_relief(backend_pool.available_pages());
+                maybe_relief(demand.reservation_added.device.backend_kv_pages,
+                             backend_pool.available_pages());
                 return false;
             }
         }

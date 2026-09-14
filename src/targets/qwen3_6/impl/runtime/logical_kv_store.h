@@ -1614,6 +1614,23 @@ public:
         return require(handle).page_count;
     }
 
+    // Quiet probe: how many of the space's logical pages currently hold a
+    // device replica. Unlike physical_page_if_resident() this logs nothing,
+    // so it can be used to rank fit-gate relief victims by the pages a
+    // release would actually free (a space whose pages are already
+    // host-resident, or shared with a space that stays resident, frees
+    // almost nothing despite a large mapped count).
+    [[nodiscard]] std::uint32_t resident_device_pages(KVAddressSpaceHandle handle) const noexcept {
+        if (!valid(handle)) { return 0; }
+        const Address& address = addresses_[handle.index_];
+        std::uint32_t count = 0;
+        for (std::uint32_t p = 0; p < address.page_count; ++p) {
+            const LogicalKVPageHandle logical = membership(address, p);
+            if (pages_->valid(logical) && pages_->device_resident(logical)) { ++count; }
+        }
+        return count;
+    }
+
     [[nodiscard]] std::uint32_t entitlement(KVAddressSpaceHandle handle) const {
         return entitlement(require(handle));
     }
