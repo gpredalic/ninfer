@@ -7225,6 +7225,12 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
         }
         transaction.has_source = false;
         transaction.source_index = 0;
+        // The source's physical state is gone, but its logical catalog entry
+        // (and any safety-net restore data) survives. Mark the transaction so
+        // the terminal (publish or abort) acknowledges the source as Retained
+        // without a summary — the adopt side keeps the entry Catalogued
+        // instead of throwing "private source result is missing".
+        transaction.source_fallback_retained = true;
         if (transaction.plan && transaction.plan->impl_) {
             transaction.plan->impl_->reuse = ReusePath::Root;
             transaction.plan->impl_->has_source = false;

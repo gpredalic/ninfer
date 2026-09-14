@@ -525,11 +525,13 @@ def parse_serve_log(path, skip_lines=0):
                 #     eviction). The "LEAK" log is a false alarm here.
                 #   shared_refs == 0  -> TRUE orphan: a reference with no
                 #     owner — an unbalanced retain/release pair.
-                if "[state-lease] LEAK" in line:
+                # Two labels: 'LEAK (orphan)' = shared_refs=0 (a real bug);
+                # 'retained (shared prefix)' = shared_refs>=1 (legitimate).
+                if "[state-lease] LEAK (orphan)" in line:
                     d["state_lease_leak"] += 1
-                    m = re.search(r"shared_refs=(\d+)", line)
-                    if m and int(m.group(1)) == 0:
-                        d["state_lease_orphan"] += 1
+                    d["state_lease_orphan"] += 1
+                elif "[state-lease] retained (shared prefix)" in line:
+                    d["state_lease_leak"] += 1
                 # State relief: a checkpoint demoted to host to free a device
                 # slot for an H2D restore. Its presence proves the
                 # pool-saturation + restore path was exercised.

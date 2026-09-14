@@ -2553,6 +2553,7 @@ private:
                     throw std::logic_error("materialization source returned an invalid disposition");
                 }
             }
+
         } else if (result.source) {
             throw std::logic_error("root materialization returned a private source result");
         }
