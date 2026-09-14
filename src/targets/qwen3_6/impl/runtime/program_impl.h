@@ -48,6 +48,17 @@ using Clock = std::chrono::steady_clock;
 // inside a single in-flight materialization).
 static constexpr std::chrono::seconds kKVDeferDeadline = std::chrono::seconds(120);
 
+// How long a stalled fit gate (free device-KV pages not growing) waits before
+// demoting an idle continuation to the host safety net as relief. The defer
+// normally resolves when the other in-flight requests drain; when nothing is
+// draining (no running requests, and the context transaction is single so no
+// other materialization can be in flight) the pool stays flat and the request
+// would otherwise defer to the 120s deadline. 15s is long enough that a
+// request about to complete gets its drain first, short enough that a truly
+// stalled gate gets relief (and, if the demand is larger than one victim,
+// repeated relief) well before the deadline.
+static constexpr std::chrono::seconds kKVReliefDelay = std::chrono::seconds(15);
+
 // Host-side YaRN position scaling: positions <= original_context are unchanged;
 // positions beyond the threshold are compressed by factor. Matches the device kernel
 // scale_positions_yarn_kernel in ops/kernel/position.cuh.
@@ -4726,6 +4737,54 @@ std::uint32_t ProgramImplCore::demote_checkpoints_to_make_room(std::uint32_t nee
     return demoted;
 }
 
+std::uint32_t
+ProgramImplCore::relieve_stalled_fit_gate(const MaterializationTransaction& transaction) noexcept {
+    // Safety: the context transaction is single — no other materialization can
+    // be in flight — and decode does not release KV pages, so the only
+    // continuations that are neither in use nor about to be used are the
+    // Catalogued ones that are not this transaction's source or destination
+    // and are not bound to a decode lane. Demote the one pinning the most
+    // text KV pages: it frees the most, and the giant idle sessions are
+    // exactly what pins the pool. The {KV + state} unit is preserved in the
+    // host safety net, so the session's next turn restores from host instead
+    // of re-prefilling.
+    std::uint32_t victim       = continuation_capacity;  // sentinel: none
+    std::uint32_t victim_pages = 0;
+    for (std::uint32_t i = 0; i < continuation_capacity; ++i) {
+        if (continuation_slots[i].role != ContinuationSlotRole::Catalogued) { continue; }
+        if (transaction.has_source && transaction.source_index == i) { continue; }
+        if (transaction.root_continuation_index &&
+            *transaction.root_continuation_index == i) {
+            continue;
+        }
+        if (materialization_pins(i, continuation_slots[i].generation)) { continue; }
+        bool lane_bound = false;
+        for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+            if (active_continuations[lane] == i) { lane_bound = true; break; }
+        }
+        if (lane_bound || !continuation_states[i].kv) { continue; }
+        const std::uint32_t pages =
+            text_kv_addresses->mapped_pages(continuation_states[i].kv->text);
+        if (pages > victim_pages) {
+            victim_pages = pages;
+            victim       = i;
+        }
+    }
+    if (victim == continuation_capacity || victim_pages == 0) { return 0; }
+    // Same unit operation as the catalog-rotation and pressure-victim paths:
+    // park the {KV + state} unit in the host safety net, then release the
+    // device-side continuation (frees the device KV pages the gate is waiting
+    // on). A refused state release (shared-prefix retention) still leaves the
+    // KV freed — the state slot is a separate pool, not gated here.
+    spill_victim_to_host_kv_safety_net(victim);
+    release_continuation_slot(victim);
+    std::fprintf(stderr,
+                 "[relief-kv] fit gate stalled — demoted idle continuation %u "
+                 "(%u text pages) to the host safety net\n",
+                 victim, victim_pages);
+    return victim_pages;
+}
+
 bool ProgramImplCore::prepare_materialization(MaterializationTransaction& transaction) {
     if (transaction.prepared || !transaction.plan ||
         transaction.destination.value >= max_concurrency ||
@@ -4813,9 +4872,30 @@ bool ProgramImplCore::prepare_materialization(MaterializationTransaction& transa
                 }
             };
         const DeviceKVPagePool& text_pool = text_kv_pages->physical_pool();
+        // Stall relief: while a defer is in flight, free pages only grow when
+        // other in-flight work drains. If they have not grown for
+        // kKVReliefDelay, nothing is draining (no running requests, and the
+        // context transaction is single — no other materialization can free
+        // pages), so demote the largest idle continuation to the host safety
+        // net instead of deferring to the 120s deadline. Re-armed after each
+        // relief so a demand larger than one victim gets repeated relief; a
+        // drain in progress (free grew) always wins by resetting the clock.
+        const auto maybe_relief =
+            [&transaction, this](std::uint32_t free_pages) {
+                const auto now = Clock::now();
+                if (transaction.kv_defer_flat_since == std::chrono::steady_clock::time_point{} ||
+                    free_pages > transaction.kv_defer_last_free) {
+                    transaction.kv_defer_flat_since = now;
+                }
+                transaction.kv_defer_last_free = free_pages;
+                if (now - transaction.kv_defer_flat_since < kKVReliefDelay) { return; }
+                transaction.kv_defer_flat_since = now;
+                (void)relieve_stalled_fit_gate(transaction);
+            };
         if (text_pool.available_pages() < demand.reservation_added.device.main_kv_pages) {
             kv_defer_bookkeeping(0, "KV", demand.reservation_added.device.main_kv_pages,
                                  text_pool.available_pages());
+            maybe_relief(text_pool.available_pages());
             return false;
         }
         if (backend_kv_pages) {
@@ -4823,12 +4903,14 @@ bool ProgramImplCore::prepare_materialization(MaterializationTransaction& transa
             if (backend_pool.available_pages() < demand.reservation_added.device.backend_kv_pages) {
                 kv_defer_bookkeeping(1, "KV (backend)", demand.reservation_added.device.backend_kv_pages,
                                      backend_pool.available_pages());
+                maybe_relief(backend_pool.available_pages());
                 return false;
             }
         }
         // The gate passed: this request is no longer waiting on pool occupancy;
         // restart the defer clock on any future defer.
         transaction.kv_defer_first.reset();
+        transaction.kv_defer_flat_since = {};
     }
 
     std::uint32_t state_count = demand.reservation_added.device.state_slots;

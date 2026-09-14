@@ -998,7 +998,23 @@ private:
         std::uint32_t kv_defer_last_logged_pool = 0;
         std::uint32_t kv_defer_last_logged_free = 0;
         std::chrono::steady_clock::time_point kv_defer_last_logged{};
+        // Fit-gate stall relief: while a defer is in flight, free pages only
+        // grow when other in-flight work drains. If they have not grown for
+        // kKVReliefDelay, nothing is draining (no running requests, and the
+        // context transaction is single — no other materialization can be in
+        // flight), so the gate demotes the largest idle continuation to the
+        // host safety net instead of deferring to the 120s deadline.
+        std::chrono::steady_clock::time_point kv_defer_flat_since{};
+        std::uint32_t kv_defer_last_free      = 0;
     };
+
+    // Fit-gate stall relief: demote the largest idle (Catalogued, not bound to a
+    // decode lane, not this transaction's source/destination) continuation to
+    // the host safety net — the same {KV + state} unit operation as the
+    // catalog-rotation and pressure-victim paths — freeing device KV pages for
+    // a stalled fit gate. Returns the text pages freed (0 if no idle victim).
+    [[nodiscard]] std::uint32_t relieve_stalled_fit_gate(
+        const MaterializationTransaction& transaction) noexcept;
 
     std::uint64_t next_materialization_id_ = 1;
     CudaCompletionEvent context_source_ready_;
