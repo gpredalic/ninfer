@@ -1294,16 +1294,40 @@ private:
         if (!request->lane || !progress.pending) {
             throw std::logic_error("completed prefill has no lane or pending token");
         }
-        // The prompt and reuse path must match the committed admission exactly.
-        // reused_prompt_tokens may only grow: the transparent host-KV safety-net
-        // restore (a Root admission whose prefix is restored from host RAM)
-        // advances the staged prefill base after the admission was sealed, so
-        // the runtime legitimately reports more reuse than the plan committed.
+        // The prompt must match the committed admission exactly. Reuse may
+        // only grow: the transparent host-KV safety-net restore (a Root
+        // admission whose prefix is restored from host RAM) advances the
+        // staged prefill base after the admission was sealed, so the runtime
+        // legitimately reports more reuse than the plan committed.
+        //
+        // One documented downgrade is legal: a source-based admission whose
+        // source's state image is no longer resident degrades to a Root
+        // admission at materialization ("materialization source has no
+        // resident state — falling back to root prefill"), optionally fronted
+        // by a safety-net restore. The runtime Begin is still content-verified
+        // (prompt_tokens equal; the reported reuse is a prefix boundary the
+        // runtime matched), so accept it — the only loss is the smaller reuse
+        // (a few hundred extra prefill tokens). Any other path/reuse change
+        // remains fatal.
         if (!request->admitted_begin ||
-            progress.summary.prompt_tokens != request->admitted_begin->prompt_tokens ||
-            progress.summary.prefix_reuse_path != request->admitted_begin->prefix_reuse_path ||
-            progress.summary.reused_prompt_tokens < request->admitted_begin->reused_prompt_tokens) {
+            progress.summary.prompt_tokens != request->admitted_begin->prompt_tokens) {
             throw std::logic_error("runtime Begin summary differs from committed admission");
+        }
+        if (progress.summary.prefix_reuse_path != request->admitted_begin->prefix_reuse_path ||
+            progress.summary.reused_prompt_tokens < request->admitted_begin->reused_prompt_tokens) {
+            const bool documented_fallback =
+                request->admitted_begin->prefix_reuse_path != PrefixReusePath::Root &&
+                progress.summary.prefix_reuse_path == PrefixReusePath::Root;
+            if (!documented_fallback) {
+                throw std::logic_error("runtime Begin summary differs from committed admission");
+            }
+            std::fprintf(stderr,
+                         "[admission] Begin degraded from committed path=%d (reuse %u) to root "
+                         "(reuse %u) — source state not resident at materialization; "
+                         "safety-net/root fallback\n",
+                         static_cast<int>(request->admitted_begin->prefix_reuse_path),
+                         request->admitted_begin->reused_prompt_tokens,
+                         progress.summary.reused_prompt_tokens);
         }
         const std::uint32_t lane = request->lane->value;
         if (scheduler_.prefill_lane() == lane) {
