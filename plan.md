@@ -9,10 +9,10 @@ full invariant text, and investigation history: `plan-reference.md`.
 evicted, and restored as ONE indivisible unit — never store, budget, or evict
 either half on its own (full invariant: `plan-reference.md`, "Standing plan").
 
-Every failure class we chased this week is an instance of the unit being split
-across three stores with separate capacities, separate LRU, and separate
-lifecycles (host-KV pool 30 GiB / host state pool 24 × ~147 MiB / compact-prefix
-safety net):
+Every failure class we've chased is an instance of the unit being split across
+three stores with separate capacities, separate LRU, and separate lifecycles
+(host-KV pool 30 GiB / host state pool 24 × ~147 MiB / compact-prefix safety
+net), or torn apart mid-eviction:
 
 | Symptom | Split that caused it |
 |---|---|
@@ -21,41 +21,90 @@ safety net):
 | 19s safety-net ttft | continuation gone, only the shared-prefix half survives |
 | `rewrite_checkpoint_invalid` ckpt-miss | half-unit stored (KV + prefix without a valid checkpoint) |
 | Fit-gate deadline aborts | state pool saturated while KV pool has room |
+| **`inactive capability` request errors** | **evicted source's state image not released from its publication slot before the fallback republishes** |
 
 **Unity is the main goal.** Fix the split and the follow-up list collapses.
 
-## Status (2026-09-14, post-deploy 20:04)
+## Status (2026-09-14, post-deploy 20:04, restarted 20:46)
 
-- Server stable: 0 adopt errors, 0 orphans at deploy; bounded deadline aborts
-  work; slow-path fallbacks complete. Restart causes eliminated (see
-  `implemented.md`).
-- Residual: the state-slot pool is the binding constraint (24 × 147 MiB);
-  ~11 slow fallbacks/day; **1 true orphan observed post-deploy**
-  (`LEAK (orphan)`, `shared_refs=0`, `endpoint-write`, `ckpt_refs=1` — recurring,
-  stable signature).
+- The dominant loop is fixed: `private source result is missing` 44 → **0**
+  (adopt fix, `f6a5bec3`+`b60c37eb`).
+- **But the server was restarted again at 20:46** (manual SIGKILL, not a
+  crash). Two causes, both still open:
+  1. **120s deadline hang** — req 134 (a 176k-token conversation) queued 120s
+     then aborted: `KV capacity defer: need 3252 pages, free 1032`, frozen the
+     whole time with `running=0`. Idle sessions' **device KV was pinned** and
+     never freed, so the fit gate could never fit. The user's own request
+     hanging 2 min then erroring is what triggered the restart.
+  2. **The root-fallback path still fails downstream.** The adopt fix cleared
+     the adopt stage, but every `no resident state` fallback now hits
+     `active publication cell retained an inactive capability`
+     (`resource_manager.h:2617-2619`) — the evicted source's state image is not
+     released from its publication slot before the fallback republishes. 1:1
+     with fallbacks (11× post-deploy).
+- **Three sporadic request-error classes** remain (pre-existing, all in the
+  eviction/fallback territory): `inactive capability` (RM publication slot),
+  `replacement effect changed` (`program_impl.h:9243`), `entitlement is
+  inconsistent` (`program_impl.h:11565`).
+- **1 true orphan** observed post-deploy: `LEAK (orphan)`, `shared_refs=0`,
+  `endpoint-write`, `ckpt_refs=1` — recurring, stable signature. Leaks a state
+  slot forever → feeds pool saturation.
 
 ## Tasks, in execution order
 
-### P0 — quick wins (hours each, do before starting #7)
+### P0 — quick wins + gate (hours each, do first)
 
 - [ ] **P0.1 — e2e deterministic checkpoints** (old #3). Force reasoning in
       phases 5/6 like phase 4 (`s.args.thinking_mode = True` +
       `reasoning: {effort: low}` in the payload) — ~5 lines in
-      `tools/e2e/ninfer-e2e.py`.
-      *Exit:* two consecutive full e2e runs with 0 `rewrite_checkpoint_invalid`
-      flaps.
+      `tools/e2e/ninfer-e2e.py`. *Exit:* two consecutive full e2e runs with 0
+      `rewrite_checkpoint_invalid` flaps. **This makes e2e a trustworthy gate
+      for the P1 fixes.**
 - [ ] **P0.2 — retry detection** (old #4c). Identical prompt re-sent within ~60s
-      re-prefills from scratch (seen 3× at 16:36–16:46, 385k tokens each; 2× at
-      19:45–19:46, 400k each — ~2.5M tokens of pure retry waste today). Detect
-      the repeat and serve from the just-completed continuation.
+      re-prefills from scratch (~2.5M tokens of pure retry waste today). Detect
+      the repeat, serve from the just-completed continuation.
       *Exit:* e2e retry scenario; 0 full re-prefills on repeated prompts.
 - [ ] **P0.3 — state-pool stopgap** (old #1b-lite). `--host-state-slots 24→48`
       in `~/.config/ninfer.conf` (147 MiB/slot → ~7 GiB RAM). One-line ops
       change that halves state-pool pressure until #7 lands.
-      *Exit:* fewer "no resident state" fallbacks in the journal; no host OOM.
-      (Superseded by #7 — do not build on it.)
+      *Exit:* fewer "no resident state" fallbacks; no host OOM. (Superseded by
+      #7 — do not build on it.)
 
-### P1 — #7: the unit (checkpoint + KV as one unit) — the main development effort
+### P1 — stop the restarts (the user's actual pain; do before the big refactor)
+
+Until these are done the server keeps forcing restarts, which is what blocks
+development. Each is verified with the P0 e2e gate + the live journal.
+
+- [ ] **P1.1 — complete the root-fallback path end-to-end.** The adopt fix
+      cleared the adopt stage; the fallback now throws at the publication stage
+      (`resource_manager.h:2617-2619`): the evicted source's state image is not
+      released from `record->publication_slot` before the fallback republishes
+      into it. Release the stale handle (or handle the fallback's slot
+      lifecycle) so a `no resident state` fallback **completes** instead of
+      erroring. *Exit:* 0 `inactive capability` errors; a forced-fallback e2e
+      case completes the request.
+- [ ] **P1.2 — triage + fix the other two sporadic error classes.**
+      `replacement effect changed` (`program_impl.h:9243`) and `entitlement is
+      inconsistent` (`program_impl.h:11565`). Both are the unit torn apart
+      mid-eviction. *Exit:* 0 of each in a saturated e2e + journal window.
+- [ ] **P1.3 — device KV: free pages from idle sessions.** The 20:45 deadline
+      hang: `need 3252 pages, free 1032`, frozen with `running=0` — idle
+      sessions' device KV is pinned and never demoted, so the fit gate defers
+      to the 120s abort. Scope + implement demoting idle (non-running)
+      sessions' device KV to the host pool as fit-gate relief (the device-side
+      twin of `fc5d0cf3`). *Exit:* a request that needs pages while other
+      sessions are idle fits (with a one-time H2D cost) instead of aborting at
+      120s.
+- [ ] **P1.4 — true-orphan leak.** First `LEAK (orphan)` (`shared_refs=0`,
+      `endpoint-write`, `ckpt_refs=1`) — recurring. Trace the unbalanced
+      retain/release pair on the endpoint-write checkpoint-reference path.
+      *Exit:* 0 `LEAK (orphan)` lines; the endpoint-write checkpoint ref is
+      balanced.
+
+*P1 exit criteria:* a 1-hour saturated window (3 concurrent large
+conversations) with **0 request errors, 0 deadline aborts, no restart.**
+
+### P2 — #7: the unit (checkpoint + KV as one unit) — the main development effort
 
 The standing plan already declares the invariant; the code violates it in four
 ways: (1) two independent host budgets (KV pool vs state-slot pool); (2)
@@ -65,35 +114,36 @@ rewrite_checkpoint_invalid`, `ckpt_frontier=0`); (4) "state without KV" is a
 retained form (the 19s safety-net class). #7 implements the invariant.
 **Subsumes:** #1a (planner-side H2D demand), #1b (pool right-sizing), #4a
 (per-session slot guarantee), #4b (idle-aware retention), the 19s safety-net
-class, the ckpt-miss class.
+class, the ckpt-miss class — and structurally dissolves the P1 error classes
+(the unit is no longer torn apart mid-eviction).
 
-- [ ] **P1.1 — scope in plan mode.** Refactor spans `StateImageStore`/
+- [ ] **P2.1 — scope in plan mode.** Refactor spans `StateImageStore`/
       `HostStatePool`, the host-KV pool, spill/safety-net paths, RM accounting,
       and the planner cost model. *Exit:* approved plan with slice boundaries.
-- [ ] **P1.2 — Slice 1: unit identity + cost model.** A continuation owns one
+- [ ] **P2.2 — Slice 1: unit identity + cost model.** A continuation owns one
       unit {KV replica, frontier checkpoint, compact prefix}; one cost =
       `kv_bytes + state_image_bytes`; RM accounts one number.
       *Exit:* unit-identity unit tests; accounting matches the sum of parts.
-- [ ] **P1.3 — Slice 2: atomic admission.** Admit only when the whole unit fits
+- [ ] **P2.3 — Slice 2: atomic admission.** Admit only when the whole unit fits
       the shared host budget; `rewrite_checkpoint_invalid` becomes an admission
       *failure*, not a degraded half-spill.
       *Exit:* 0 `ckpt_frontier=0` units in e2e + journal.
-- [ ] **P1.4 — Slice 3: atomic spill/restore.** The unit moves to host / back as
+- [ ] **P2.4 — Slice 3: atomic spill/restore.** The unit moves to host / back as
       one; "KV on host + no resident state" becomes impossible.
       *Exit:* 0 "no resident state" lines under pool pressure (e2e phase 12).
-- [ ] **P1.5 — Slice 4: unit LRU/retention + per-session guarantee.** Evict
+- [ ] **P2.5 — Slice 4: unit LRU/retention + per-session guarantee.** Evict
       whole units, cost-aware smallest-first; protect an interactive session's
       unit (≥2 slots: turn-closure + checkpoint); idle-aware recency weight.
       *Exit:* 0 mid-instance full-root re-prefills in a long-session e2e; the
       19s safety-net class is gone.
-- [ ] **P1.6 — config.** `--host-state-slots` derived from (or replaced by) the
+- [ ] **P2.6 — config.** `--host-state-slots` derived from (or replaced by) the
       shared budget; document the single `--host-cache-mib`.
 
 *#7 exit criteria:* e2e full suite + 3-session long conversation: 0 full-root
 mid-conversation re-prefills, 0 ckpt-miss half-units, 0 "no resident state",
 no restarts during a 1-hour saturated run.
 
-### P2 — #2: strip-collapse (`--strip-thinking-cache`)
+### P3 — #2: strip-collapse (`--strip-thinking-cache`)
 
 Re-prefill only the 7 RoPE-bound attention layers after a thinking-strip;
 restore the 21 GDN/SSM layers from the position-independent state image.
@@ -105,14 +155,8 @@ unit model; building the unit first makes this cheaper.
       identity/entitlement interaction).
 - [ ] Implement + e2e-verify (cancellation turn ~4× faster; arena ~80× less).
 
-### P3 — long tail
+### P4 — long tail
 
-- [ ] **True-orphan investigation (live, post-deploy).** First
-      `LEAK (orphan)` (`shared_refs=0`, `endpoint-write`, `ckpt_refs=1`)
-      observed after the 20:04 deploy — recurring with a stable signature.
-      Trace the unbalanced retain/release pair on the endpoint-write
-      checkpoint-reference path. Every orphan leaks a state slot forever →
-      feeds the pool saturation that drives #4-class losses.
 - [ ] **#4d — planner pruning.** Prune long-idle/dead owners from the 4096-target
       search space (e2e symptom: `budget_exhausted=True`,
       `stop_reason=expansion_capacity`). Shrinks further after #7's unit
@@ -128,14 +172,19 @@ unit model; building the unit first makes this cheaper.
 ## Why this order
 
 1. **P0 first:** hours of work, removes daily waste (retry re-prefills, pool
-   pressure), and makes e2e a trustworthy gate before the big refactor.
-2. **#7 is the unifying work:** every other cache pain is an instance of the
-   unit being split; fix the split and the follow-up list collapses.
-3. **#2 after #7:** strip-collapse's restore path must sit on the unit model
+   pressure), and makes e2e a trustworthy gate so the P1 fixes are verifiable.
+2. **P1 stops the restarts** — the thing that actually blocks development. P1.1
+   is the direct continuation of the adopt fix (the fallback's next stage);
+   P1.3 is what triggered today's restart. Until P1 is done the server keeps
+   forcing restarts.
+3. **#7 is the unifying work:** every P1 error class and every re-prefill is an
+   instance of the unit being split or torn apart; fix the split and the list
+   collapses.
+4. **#2 after #7:** strip-collapse's restore path must sit on the unit model
    anyway.
-4. **Long tail last:** each item is either subsumed by #7 or shrunk by it.
+5. **Long tail last:** each item is either subsumed by #7 or shrunk by it.
 
-## Evidence base (for #7 sizing)
+## Evidence base (for sizing)
 
 From the 09-14 request-log reconstruction (commit `2e83ec50`): e2e 156
 mid-conversation roots / 2.78M tokens (all full roots); prod 119 / 12.17M
