@@ -69,6 +69,11 @@ class Config:
         # rotated server-side; this only bounds the launcher-redirected stderr.
         self.serve_log_max_bytes = args.serve_log_max_mb * 1024 * 1024
         self.serve_log_keep = args.serve_log_keep
+        # Serve-log source: "file" (launcher-redirected stderr, the default) or
+        # "journal" (systemd journal of --journal-unit; the systemd unit does not
+        # redirect the server's stdout to a file, so the journal is the live log).
+        self.log_source = args.log_source
+        self.journal_unit = args.journal_unit
         self.pidfile = args.pidfile
 
 
@@ -135,6 +140,57 @@ class Tail:
         return lines
 
 
+class JournalTail:
+    """Incrementally tail a systemd unit's journal (cursor-based).
+
+    Same interface as Tail: read_lines() returns the complete lines appended
+    since the last call. Starts at the current tail (no backfill). Uses
+    journalctl's export cursors, so journal rotation/vacuum is transparent
+    and no line is seen twice.
+    """
+
+    def __init__(self, unit: str) -> None:
+        self.unit = unit
+        self.cursor = None
+        self._seed()
+
+    def _seed(self) -> None:
+        # Take the cursor of the newest existing entry (no backfill).
+        try:
+            out = subprocess.run(
+                ["journalctl", "-u", self.unit, "--no-pager", "-o", "export", "-n", "1"],
+                capture_output=True, text=True, timeout=10,
+            )
+            for ln in out.stdout.splitlines():
+                if ln.startswith("__CURSOR="):
+                    self.cursor = ln[len("__CURSOR="):]
+                    return
+        except (OSError, subprocess.SubprocessError):
+            pass
+        self.cursor = None
+
+    def read_lines(self) -> list[str]:
+        if self.cursor is None:
+            self._seed()
+            if self.cursor is None:
+                return []
+        cmd = ["journalctl", "-u", self.unit, "--no-pager", "-o", "export",
+               "--cursor", self.cursor]
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        except (OSError, subprocess.SubprocessError):
+            return []
+        lines: list[str] = []
+        for ln in out.stdout.splitlines():
+            if ln.startswith("__CURSOR="):
+                self.cursor = ln[len("__CURSOR="):]
+            elif ln.startswith("MESSAGE=") or ln.startswith("SYSLOG_MSG="):
+                msg = ln.split("=", 1)[1]
+                if msg.strip():
+                    lines.append(msg)
+        return lines
+
+
 # ---------------------------------------------------------------------------
 # Monitor: state + sampler
 # ---------------------------------------------------------------------------
@@ -158,7 +214,10 @@ class Monitor:
         self.last_cpu_idle = None
         self.last_cpu_total = None
         self.jsonl_tail = Tail(cfg.jsonl)
-        self.serve_tail = Tail(cfg.serve_log)
+        if cfg.log_source == "journal":
+            self.serve_tail = JournalTail(cfg.journal_unit)
+        else:
+            self.serve_tail = Tail(cfg.serve_log)
         # Per-tick host-KV event counts (park/evict/restore/miss), parsed from
         # the serve log; captured into each sample and charted.
         self._kv_totals = {"d2h_pages": 0, "h2d_pages": 0, "spill_pages": 0,
@@ -348,15 +407,26 @@ class Monitor:
         # back to the serve-log heartbeat: fresh "throughput interval=" lines
         # prove the engine loop is alive even when /stats is starved.
         log_alive = False
-        try:
-            with open(self.cfg.serve_log, "rb") as f:
-                f.seek(0, os.SEEK_END)
-                size = f.tell()
-                f.seek(max(0, size - 4096))
-                tail = f.read(4096)
-            log_alive = b"throughput interval=" in tail
-        except OSError:
-            pass
+        if self.cfg.log_source == "journal":
+            try:
+                out = subprocess.run(
+                    ["journalctl", "-u", self.cfg.journal_unit, "--no-pager",
+                     "-o", "cat", "-n", "50"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                log_alive = "throughput interval=" in out.stdout
+            except (OSError, subprocess.SubprocessError):
+                pass
+        else:
+            try:
+                with open(self.cfg.serve_log, "rb") as f:
+                    f.seek(0, os.SEEK_END)
+                    size = f.tell()
+                    f.seek(max(0, size - 4096))
+                    tail = f.read(4096)
+                log_alive = b"throughput interval=" in tail
+            except OSError:
+                pass
         self.server_info["up"] = (
             (last is not None and now_ms - last <= STALE_AFTER_MS) or log_alive
         )
@@ -456,6 +526,8 @@ class Monitor:
     # -- serve-log rotation (copytruncate) ----------------------------------
 
     def maybe_rotate_serve_log(self) -> None:
+        if self.cfg.log_source == "journal":
+            return  # journald owns rotation/vacuum; nothing to do
         path = self.cfg.serve_log
         try:
             size = os.path.getsize(path)
@@ -474,7 +546,8 @@ class Monitor:
             with open(path, "rb") as src, open(path + ".1", "wb") as dst:
                 dst.write(src.read())
             open(path, "w").close()  # truncate in place (server holds the fd)
-            self.serve_tail._open()
+            if isinstance(self.serve_tail, Tail):
+                self.serve_tail._open()
         except OSError:
             pass
 
@@ -1233,6 +1306,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--server-url", default="http://127.0.0.1:8080")
     p.add_argument("--jsonl", default=os.path.expanduser("~/ninfer-requests.jsonl"))
     p.add_argument("--serve-log", default=os.path.expanduser("~/ninfer-serve.log"))
+    p.add_argument("--log-source", choices=("file", "journal"), default="file",
+                   help="serve-log source: launcher-redirected file (default) or "
+                        "the systemd journal of --journal-unit")
+    p.add_argument("--journal-unit", default="ninfer.service",
+                   help="systemd unit to read from when --log-source journal")
     p.add_argument("--interval", type=float, default=5.0)
     p.add_argument("--samples", type=int, default=4320,
                    help="ring-buffer length (6h at 5s)")
