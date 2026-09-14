@@ -165,6 +165,50 @@ hypothesis.**
   teardown, or stop retaining it on the active state, or right-size the pool);
   `shared_refs=0` → H2 (trace the specific retain/release pair for that image).
 
+**2026-09-14 14:45 update — H1 CONFIRMED, root cause complete, relief fix in build.**
+
+Every observed LEAK event has `shared_refs=1` (both `residency=1` DeviceOnly and
+`residency=2` HostOnly variants) — **there is no true orphan**. The "LEAK" log is
+a false alarm: the image legitimately backs a live shared prefix
+(`publish_active_capture` retains a checkpoint reference on the sequence's state
+at `program_impl.h:9165`; released only when the shared prefix is evicted,
+`release_shared_prefix_state` ~10256 — not at sequence teardown).
+
+**The actual failure chain (all confirmed in journal):**
+1. The device state pool (8 slots: 3 cache + 5 active) fills with active session
+   states (ActiveMutable — not demotable) + rewrite checkpoints + shared-prefix
+   state images (CheckpointImmutable). 3 concurrent thinking sessions alone need
+   6 slots (active + rewrite each), leaving 2 for shared images.
+2. Under KV pressure the source's rewrite state is demoted to HostOnly
+   (safety-net spill / checkpoint demotion) — AFTER admission, so the planner's
+   state-residency model is stale (model/physical gap).
+3. Next turn: the H2D restore (`begin_host_to_device` at ~10830, or
+   `begin_host_to_device`/`begin_host_fork` at ~5054) needs a NEW device slot
+   (`take_device_slot()`), but the pool is full → nullopt → "no resident state"
+   → abort to root prefill.
+4. The only relief (`demote_checkpoints_to_make_room`) is demand-driven: it
+   demotes until `free_slots >= demand.state_slots`, and the stale model makes
+   that demand 0 → **zero `[relief]` lines in the journal** — no relief ever ran.
+5. Root fallback publishes no source → adopt contract throws "private source
+   result is missing" → request error → client retry → repeat.
+
+**The fix (in build):** call `demote_checkpoints_to_make_room(1)` before each
+H2D restore attempt (both sites) — demote the coldest demotable checkpoint until
+a slot is free. Demoting a shared-prefix-backed image is safe: it becomes
+HostOnly, and the shared-source restore path already handles HostOnly sources
+(H2D fork destination, `start_sequence` ~10495). This makes the system
+self-healing regardless of planner staleness.
+
+**Remaining (follow-ups):**
+- Planner-side: count the H2D restore's device slot in the demand when the
+  source is HostOnly (closes the model/physical gap at admission instead of
+  relying on runtime relief).
+- Structural: the pool is over-committed for 3 thinking sessions + shared
+  prefixes (6 + 2 > 8). Either right-size `--device-state-slots` or make the
+  planner account for shared-prefix state residency.
+- The "LEAK" log label is misleading for shared retention — consider renaming
+  to "retained (shared prefix)" when `shared_refs >= 1`.
+
 ## Standing plan — a cache unit is {KV + state}, atomically (invariant for every phase)
 
 A context-cache unit is **the attention KV and the GDN recurrent state together**.

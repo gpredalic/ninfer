@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """E2E test suite for ninfer safety-net eviction system.
 
-Runs eleven phases by default against a single test server (no flags needed):
+Runs twelve phases by default against a single test server (no flags needed):
   Phase 1 "pressure":           4 sessions — basic safety net (spills, restores, no re-prefills)
   Phase 2 "mixed":              1 big + 3 small — eviction order (smallest-first, big preserved)
   Phase 3 "trash":              10 sessions — graceful degradation under trashing (no crash)
@@ -12,8 +12,12 @@ Runs eleven phases by default against a single test server (no flags needed):
   Phase 8 "reasoning-effort":   5 requests — reasoning effort tier mapping (high, minimal, max, medium, low)
   Phase 9 "concurrent":         2 sessions + title-gen — source eviction fallback, no cross-session state destruction
   Phase 10 "thinking-sig":      4 requests — thinking signature skip when preserve_thinking=false
+  Phase 11 "demotion":          3 sessions, large prompts — host demotion + checkpoint restore
+  Phase 12 "state-lease":       4 thinking sessions — rewrite-recycle pressure; zero state-lease
+                                leaks / orphaned state slots (regression: 2026-09-14 prod wedge)
 
-Server config: 32k max-context, 64k kv-capacity, 4GB host-kv, 3 continuations.
+Server config: 32k max-context, 64k kv-capacity, 4GB host-kv, 3 continuations,
+5 device state slots (production parity — required by phase 12).
 All phases use the same server — no restarts.
 
 Usage: python3 ninfer-e2e.py [--host 127.0.0.1] [--port 8080] [--serve-log /home/zenz/ninfer-serve.log]
@@ -430,6 +434,10 @@ def parse_serve_log(path, skip_lines=0):
         "mixed_copy_ok",
         "kv_not_resident_stale",
         "kv_not_resident_no_device",
+        "state_lease_leak",
+        "state_lease_orphan",
+        "missing_source_result",
+        "relief_demote",
     ]}
     d["evict_pages"] = []
     d["checkpoint_frontiers"] = []
@@ -509,6 +517,29 @@ def parse_serve_log(path, skip_lines=0):
                     d["kv_copy_skip"] += 1
                 if "[materialize] HostOnly restore failed" in line:
                     d["hostonly_restore_fail"] += 1
+                # State-lease leak: a state image whose release was refused
+                # (checkpoint_references != 0 at clear time). Two sub-cases:
+                #   shared_refs >= 1 -> LEGITIMATE retention: the image backs
+                #     a live shared prefix (publish_active_capture retains a
+                #     ref on the active state; released only on shared-prefix
+                #     eviction). The "LEAK" log is a false alarm here.
+                #   shared_refs == 0  -> TRUE orphan: a reference with no
+                #     owner — an unbalanced retain/release pair.
+                if "[state-lease] LEAK" in line:
+                    d["state_lease_leak"] += 1
+                    m = re.search(r"shared_refs=(\d+)", line)
+                    if m and int(m.group(1)) == 0:
+                        d["state_lease_orphan"] += 1
+                # State relief: a checkpoint demoted to host to free a device
+                # slot for an H2D restore. Its presence proves the
+                # pool-saturation + restore path was exercised.
+                if "[relief] demoted" in line:
+                    d["relief_demote"] += 1
+                # The adopt-path error that followed the leak in prod: the
+                # root-prefill fallback publishes no source, but the admission
+                # claim still expects one.
+                if "] error materialization private source result is missing" in line:
+                    d["missing_source_result"] += 1
     except OSError:
         pass
     return d
@@ -826,7 +857,7 @@ def main():
     p.add_argument("--serve-log", default="/home/zenz/ninfer-serve.log")
     p.add_argument("--timeout", type=int, default=120)
     p.add_argument("--start-phase", type=int, default=1,
-                   help="run phases N..11 (for split runs across separate e2e server windows)")
+                   help="run phases N..12 (for split runs across separate e2e server windows)")
     args = p.parse_args()
 
     # Verify we're running against the test server, not production.
@@ -861,7 +892,7 @@ def main():
 
     all_verdicts = []
     phases = (phase_1, phase_2, phase_3, phase_4, phase_5, phase_6, phase_7,
-              phase_8, phase_9, phase_10, phase_11)
+              phase_8, phase_9, phase_10, phase_11, phase_12)
     for i, phase_fn in enumerate(phases, start=1):
         if i < args.start_phase:
             print(f"=== Phase {i}: skipped (--start-phase {args.start_phase}) ===")
@@ -1249,6 +1280,112 @@ def phase_11(args):
         all_verdicts.append(("demotion", f"PASS: 0 cold-starts across {sum(len(s.turns) for s in s11)} turns"))
     elif cold > 0:
         all_verdicts.append(("demotion", f"WARN: {cold} cold-starts — demotion may not have prevented all re-prefills"))
+    return all_verdicts
+
+
+def phase_12(args):
+    all_verdicts = []
+    # Phase 12: state-lease — rewrite-checkpoint recycle pressure.
+    # Reproduces the 2026-09-14 production wedge: forced-thinking sessions fill
+    # the device state pool, so captures fork + recycle checkpoint slots. The
+    # buggy recycle-capture publish path dropped the rewrite handle without
+    # releasing its checkpoint reference, so every fork+recycle cycle leaked a
+    # state slot (release refused -> orphaned slot -> pool exhaustion ->
+    # "no resident state" -> "private source result is missing" request errors
+    # -> client retry loop).
+    # Requires the test server with --device-state-slots 5 (8 total: 3 cache +
+    # 5 active): with the old 6-slot total the pool was exactly full under 4
+    # thinking sessions, forks failed, and the recycle-with-fork path was never
+    # exercised — which is how the bug shipped.
+    print("\n=== Phase 12: state-lease (4 thinking sessions, 5 rounds, rewrite-recycle pressure) ===")
+    log_off = count_log_lines(args.serve_log)
+    stats0 = get_stats(args)
+    s12 = [Session(f"SL{i}", 10000, 1500, args) for i in range(4)]
+    for s in s12:
+        s.args = type(args)(**vars(args))
+        s.args.max_output_tokens = 128
+    # Force reasoning (rewrite checkpoints) like phase 4.
+    original_turn = Session.turn
+    def thinking_turn(self, index):
+        question = f"Question {index}: Consider the paragraph about '{self.rng.choice(WORDS)}'. Answer briefly."
+        new_text = filler(self.rng, self.turn_tokens) + "\n\n" + question
+        if index == 1:
+            new_text = self.doc + "\n\n---\n\n" + new_text
+        payload = {
+            "model": self.args.model,
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": new_text}]}],
+            "instructions": "You are a concise assistant.",
+            "max_output_tokens": self.args.max_output_tokens,
+            "store": True,
+            "stream": False,
+            "reasoning": {"effort": "low"},
+        }
+        if self.response_id:
+            payload["previous_response_id"] = self.response_id
+        t0 = time.monotonic()
+        out = json.load(urllib.request.urlopen(urllib.request.Request(
+            f"http://{self.args.host}:{self.args.port}/v1/responses",
+            data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"},
+            method="POST"), timeout=self.args.timeout))
+        wall = time.monotonic() - t0
+        usage = out.get("usage", {}) or {}
+        self.response_id = out.get("id", self.response_id)
+        record = {"session": self.name, "turn": index, "wall_s": round(wall, 2),
+                  "input_tokens": usage.get("input_tokens"), "output_tokens": usage.get("output_tokens")}
+        self.turns.append(record)
+        print(f"  {self.name} t{index}: wall={record['wall_s']:.1f}s prompt={record['input_tokens']} out={record['output_tokens']}")
+        return record
+    Session.turn = thinking_turn
+    for r in range(1, 6):
+        print(f"Round {r}:")
+        errors = run_round(s12, r, args.timeout)
+        if errors:
+            for n, e in errors: print(f"  ERROR {n}: {e}")
+            print("  Retrying failed sessions...")
+            time.sleep(3)
+            failed = [s for s in s12 if s.name in [n for n, _ in errors]]
+            errors2 = run_round(failed, r, args.timeout)
+            if errors2:
+                for n, e in errors2: print(f"  ERROR {n}: {e}")
+            continue
+    Session.turn = original_turn
+    stats1 = get_stats(args)
+    log12 = parse_serve_log(args.serve_log, log_off)
+
+    # The leak signatures. A refused release is only a TRUE bug when the
+    # image has no owner (shared_refs == 0). shared_refs >= 1 is legitimate
+    # retention (the image backs a live shared prefix) and is expected.
+    if log12["state_lease_orphan"] > 0:
+        all_verdicts.append(("state-lease", f"FAIL: {log12['state_lease_orphan']} orphaned state image(s) (shared_refs=0) — unbalanced checkpoint ref"))
+    else:
+        all_verdicts.append(("state-lease", "PASS: zero orphaned state images (no shared_refs=0 refusals)"))
+    if log12["missing_source_result"] > 0:
+        all_verdicts.append(("state-lease", f"FAIL: {log12['missing_source_result']} 'private source result is missing' request error(s)"))
+    else:
+        all_verdicts.append(("state-lease", "PASS: zero 'private source result is missing' errors"))
+    # Refused releases that are LEGITIMATE (shared-prefix retention) are
+    # expected under pressure; report them as info, not failure.
+    if log12["state_lease_leak"] > 0:
+        all_verdicts.append(("state-lease", f"INFO: {log12['state_lease_leak']} refused release(s), {log12['state_lease_leak'] - log12['state_lease_orphan']} legitimate (shared-prefix retention)"))
+    # Orphaned state slots surface in /stats as refused releases.
+    h0 = (stats0.get("pressure", {}) or {}).get("host_slot_release_failures", 0)
+    h1 = (stats1.get("pressure", {}) or {}).get("host_slot_release_failures", 0)
+    if h1 > h0:
+        all_verdicts.append(("state-lease", f"WARN: host_slot_release_failures grew by {h1 - h0} (includes legitimate shared-prefix retention)"))
+    else:
+        all_verdicts.append(("state-lease", "PASS: host_slot_release_failures unchanged"))
+    # Vacuity guards: the pressure path must have actually been exercised.
+    captured = log12["spill_ckpt_ok"]
+    restored = log12["checkpoint_restored"] + log12["rewrite_prefix_hit"]
+    demoted = log12["checkpoint_demoted"]
+    if captured < 4:
+        all_verdicts.append(("state-lease", f"WARN: only {captured} checkpoint captures (expected >= 4) — state pressure may not have been reached"))
+    else:
+        all_verdicts.append(("state-lease", f"PASS: {captured} checkpoint captures (rewrite-recycle precondition)"))
+    if restored == 0 and demoted == 0 and log12["relief_demote"] == 0:
+        all_verdicts.append(("state-lease", "WARN: no checkpoint demote/restore/relief observed — state pool never pressurized (H2D-restore path may be unexercised)"))
+    else:
+        all_verdicts.append(("state-lease", f"PASS: state pool pressurized (demoted={demoted}, restored={restored}, relief={log12['relief_demote']})"))
     return all_verdicts
 
 

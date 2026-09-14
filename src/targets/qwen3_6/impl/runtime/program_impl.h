@@ -5046,6 +5046,18 @@ bool ProgramImplCore::prepare_materialization(MaterializationTransaction& transa
                             transaction.backend_restore_destinations);
     }
     if (host_state_restore) {
+        // The H2D restore (both variants) takes a NEW device slot. The
+        // planner's state-residency model can be stale — the source was
+        // device-resident at admission and the demand added no state slots,
+        // so the overcommit guard scheduled no relief — while the checkpoint
+        // was demoted to host in the meantime (model/physical gap). Demote
+        // the coldest demotable checkpoint(s) until a slot is free; without
+        // this a saturated pool makes the restore fail (bad_alloc here,
+        // "no resident state" on the rewrite path) and the request falls
+        // back to root prefill. Demoting a shared-prefix-backed image is
+        // safe: its state becomes HostOnly and the shared-source restore
+        // path handles HostOnly sources (H2D fork destination).
+        (void)demote_checkpoints_to_make_room(1);
         start_context_transfer_timer(runtime::ContextResourceClass::State);
         std::optional<StateImageTransfer> restore =
             host_state_fork_destination
@@ -10827,6 +10839,14 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                 std::fprintf(stderr,
                     "[rewrite-restore] restoring HostOnly checkpoint to device (frontier=%u)\n",
                     sequence.rewrite_checkpoint.frontier);
+                // begin_host_to_device takes a NEW device slot. The planner
+                // modeled this state as device-resident (stale after a
+                // post-admission demotion), so no relief was scheduled.
+                // Demote the coldest demotable checkpoint until a slot is
+                // free — otherwise a saturated pool fails the restore and
+                // the request errors out ("no resident state" -> root
+                // fallback -> adopt contract error).
+                (void)demote_checkpoints_to_make_room(1);
                 auto restore = state_store->begin_host_to_device(checkpoint, device.transfer_stream);
                 if (!restore) {
                     throw std::logic_error("materialization source has no resident state");
