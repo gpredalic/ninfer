@@ -25,30 +25,31 @@ net), or torn apart mid-eviction:
 
 **Unity is the main goal.** Fix the split and the follow-up list collapses.
 
-## Status (2026-09-14, post-deploy 20:04, restarted 20:46)
+## Status (2026-09-14, 23:34 redeploy)
 
-- The dominant loop is fixed: `private source result is missing` 44 → **0**
-  (adopt fix, `f6a5bec3`+`b60c37eb`).
-- **But the server was restarted again at 20:46** (manual SIGKILL, not a
-  crash). Two causes, both still open:
-  1. **120s deadline hang** — req 134 (a 176k-token conversation) queued 120s
-     then aborted: `KV capacity defer: need 3252 pages, free 1032`, frozen the
-     whole time with `running=0`. Idle sessions' **device KV was pinned** and
-     never freed, so the fit gate could never fit. The user's own request
-     hanging 2 min then erroring is what triggered the restart.
-  2. **The root-fallback path still fails downstream.** The adopt fix cleared
-     the adopt stage, but every `no resident state` fallback now hits
-     `active publication cell retained an inactive capability`
-     (`resource_manager.h:2617-2619`) — the evicted source's state image is not
-     released from its publication slot before the fallback republishes. 1:1
-     with fallbacks (11× post-deploy).
-- **Three sporadic request-error classes** remain (pre-existing, all in the
-  eviction/fallback territory): `inactive capability` (RM publication slot),
-  `replacement effect changed` (`program_impl.h:9243`), `entitlement is
-  inconsistent` (`program_impl.h:11565`).
-- **1 true orphan** observed post-deploy: `LEAK (orphan)`, `shared_refs=0`,
-  `endpoint-write`, `ckpt_refs=1` — recurring, stable signature. Leaks a state
-  slot forever → feeds pool saturation.
+- **23:00–23:10 episode → 23:12 manual restart.** `materializing=1`
+  sustained 22:59:45–23:03:35 (+23:08:25–23:09:30), engine ticker degraded
+  to 25–30s cadence; req 21 then sat on `KV capacity defer: need 5548
+  pages, free 2370→2462` until the 120s deadline abort (23:10:21, "cancelled
+  generation cannot be serialized"). The 5548-page demand exceeded free
+  pages even if every idle-continuation demotion succeeded — the pool is
+  structurally over-committed for this working set (P1.5).
+- **The wedge sentinel never fired** (three compounding defects; v2 fixes
+  all, `478054b9`). The running process had the pre-fix detection (bash does
+  not reload on-disk edits — the service was restarted to load v2); the old
+  detection required `materializing=0`; and a poll with no journal line
+  reset the timer while a wedged engine goes silent or degrades. v2 polls
+  HTTP /stats first, journal as fallback, and HOLDs an armed timer through
+  silence.
+- **Relief ranking fix deployed** (`a53db4b4`): victims ranked by *unique*
+  resident pages (text + backend), batched 3/tick — the 22:28 class
+  (demote 29k mapped pages, free 77) now targets what a release actually
+  frees. Helps marginal fits; cannot by itself fix the 23:09 episode
+  (needs the prefix-scale lever — P1.5c/d).
+- Earlier (post-deploy 20:04 / restart 20:46): `private source result is
+  missing` 44 → 0 (adopt fix); P1.1 `inactive capability` cleared
+  (`81933c0a`); P1.3 stall relief in place (`47406f79`); 3 sporadic error
+  classes + 1 true orphan remain open (P1.2/P1.4).
 
 ## Tasks, in execution order
 
@@ -89,11 +90,12 @@ development. Each is verified with the P0 e2e gate + the live journal.
 - [x] **P1.3 — device KV: free pages from idle sessions.** `47406f79`. While a
       fit-gate defer is in flight and free pages have not grown for 15s, the
       gate demotes the largest idle continuation to the host safety net and
-      re-arms per relief. **Known limitation (22:26–22:28 episode):** 7
-      demotions of ~4200-page continuations freed only 77 free pages (535→612)
-      — the victims' pages are shared with the live shared prefix, so
-      per-victim relief is nearly inert against a shared-prefix-pinned pool,
-      and the request still hit the 120s deadline. See P1.5.
+      re-arms per relief. **23:34 (`a53db4b4`):** victims ranked by *unique*
+      resident pages (text + backend, quiet `resident_device_pages` probe)
+      and batched 3/tick — the 22:28 episode demoted 29k *mapped* pages and
+      freed only 77 (535→612) because victims' pages are shared with the
+      live shared prefix; per-victim relief is nearly inert against a
+      shared-prefix-pinned pool. See P1.5.
 - [ ] **P1.4 — true-orphan leak.** First `LEAK (orphan)` (`shared_refs=0`,
       `endpoint-write`, `ckpt_refs=1`) — recurring. Trace the unbalanced
       retain/release pair on the endpoint-write checkpoint-reference path.
@@ -104,26 +106,36 @@ development. Each is verified with the P0 e2e gate + the live journal.
       (29k mapped pages total) freed only **77** pages (535→612) — 99.7% of
       the demoted pages were shared with the live shared prefix, so
       per-conversation demotion frees only each conversation's unique tail.
-      The pool is pinned by the shared prefix + 4 live conversations; a 5th
-      cannot fit by construction. Fix direction: (a) rank relief victims by
-      *unique* (non-shared) resident pages, not mapped pages; (b) batch-demote
-      until the demand fits (bounded per tick), not one per 15s; (c) make the
-      **shared prefix itself a demotion unit** — demote it to host as one
-      {KV + state} unit (the standing-plan invariant applied to the shared
-      side); (d) admission should see the pool's shared-prefix occupancy and
-      queue the request (visible queue position) instead of a 120s silent
-      defer. *Exit:* a 5th-conversation e2e scenario completes (via
-      shared-prefix demotion or a fast visible queue) without a deadline abort.
+      Quantified 23:09 (worse): req 21 needed **5548** pages, free sat at
+      2370→2462 through 120s of defers — no combination of idle-continuation
+      demotions could close a ~3000-page gap. The "idle continuations" are
+      branches of ONE large conversation (user-confirmed), so their unique
+      tails are small; the pool is pinned by the shared prefix + the live
+      conversation's own working set, and the incoming turn cannot fit by
+      construction. Fix direction: (a) rank relief victims by *unique*
+      (non-shared) resident pages, not mapped pages — **done `a53db4b4`**;
+      (b) batch-demote until the demand fits (bounded per tick), not one per
+      15s — **done `a53db4b4`**; (c) make the **shared prefix itself a
+      demotion unit** — demote it to host as one {KV + state} unit (the
+      standing-plan invariant applied to the shared side); (d) admission
+      should see the pool's shared-prefix occupancy and queue the request
+      (visible queue position) instead of a 120s silent defer. *Exit:* a
+      5th-conversation e2e scenario completes (via shared-prefix demotion or
+      a fast visible queue) without a deadline abort.
 - [ ] **P1.6 — the admission wedge: a queued request must run or fail,
       bounded.** The user's restart trigger is GPU 0% while the session is
-      active — journal signature `running=0 prefilling=0 decode_ready=0
-      materializing=0 waiting≥1` sustained (the 13:28:57 wedge: req 150 never
+      active — signature `running=0 prefilling=0 decode_ready=0` sustained
+      with `waiting≥1` or `materializing≥1` (the 13:28:57 wedge: req 150 never
       admitted for 4+ min; the 15:15–15:32 stall: `materializing=1` for ~15
-      min). Both pre-fix, both unverified-gone. The wedge sentinel
+      min; the 22:59–23:10 stall: `materializing=1` 3.5+ min, ticker degraded
+      to 25–30s). Both pre-fix, both unverified-gone. The wedge sentinel
       (`tools/monitor/wedge-sentinel.sh`, now the standalone
       `ninfer-wedge-sentinel.service`) is the tripwire: it restarts after 90s
       of that state (3-in-30-min cap) — **every firing is a timestamped data
-      point to investigate, and the goal is zero firings.** *Exit:* (a) the
+      point to investigate, and the goal is zero firings.** v2 (`478054b9`)
+      after the 23:12 episode: /stats primary, journal fallback, armed timer
+      held through engine silence (v1 reset on a missing line and ran stale
+      code — bash does not reload on-disk edits). *Exit:* (a) the
       15:15 stall class is diagnosed (what state holds `materializing`
       without progress, and why admission stops promoting); (b) every stuck
       state has a bounded progress guarantee — it progresses or the request
