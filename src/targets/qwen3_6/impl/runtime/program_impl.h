@@ -9220,6 +9220,16 @@ void ProgramImplCore::abort_active_capture(ActiveCaptureTransaction& transaction
                     if (transaction.recycles_private_state) {
                         state_store->restore_recycled_checkpoint(transaction.destination_state,
                                                                  transaction.recycled_state_epoch);
+                        // The restored image carries refs=1. If the sequence's
+                        // write state still points at it (the fork_pending reset
+                        // above only fires for in-place writers, read==write),
+                        // that reference is owned by this sequence — record it
+                        // so release_sequence_state releases it exactly once.
+                        // Without this the teardown orphans it ("LEAK (orphan)",
+                        // endpoint-write, ckpt_refs=1, shared_refs=0).
+                        if (sequence.state.write == transaction.destination_state) {
+                            sequence.recycled_write_state = transaction.destination_state;
+                        }
                     } else {
                         (void)state_store->release(transaction.destination_state);
                     }
@@ -11720,6 +11730,20 @@ void ProgramImplCore::release_sequence_state(SequenceState& sequence) noexcept {
                 state_store->checkpoint_references(anchor.state) != 0) {
                 state_store->release_checkpoint_reference(anchor.state);
             }
+        }
+        // Restored-recycled write state (publish-abort path): its reference was
+        // set by restore_recycled_checkpoint, not by a retain call, so no other
+        // path releases it. Runs after the rewrite/anchor releases above, so a
+        // write image that is also the rewrite state is released once per
+        // reference; the refs!=0 guard makes a double release impossible.
+        if (sequence.recycled_write_state &&
+            sequence.state.write == *sequence.recycled_write_state) {
+            const StateImageHandle recycled = *sequence.recycled_write_state;
+            if (state_store->valid(recycled) &&
+                state_store->checkpoint_references(recycled) != 0) {
+                state_store->release_checkpoint_reference(recycled);
+            }
+            sequence.recycled_write_state.reset();
         }
     } catch (...) {}
 

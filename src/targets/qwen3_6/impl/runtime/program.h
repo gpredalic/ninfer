@@ -467,6 +467,13 @@ struct SequenceState {
     bool tail_hidden_valid        = false;
     bool state_source_retained    = false;
     bool endpoint_valid           = false;
+    // Restored-recycled write state: the handle of a state image restored via
+    // restore_recycled_checkpoint() (the publish-abort path) whose refs=1 was
+    // set directly, not by a retain_checkpoint_reference() call — so no other
+    // path releases it. release_sequence_state releases it exactly once, and
+    // only while state.write still matches (a replaced write hands the image
+    // to the checkpoint/claim lifecycle, like state.read).
+    std::optional<StateImageHandle> recycled_write_state;
     RewriteCheckpoint rewrite_checkpoint;
     std::vector<LongAnchorCheckpoint> long_anchors;
     std::vector<std::uint32_t> shared_prefix_references;
