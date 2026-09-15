@@ -4927,13 +4927,57 @@ bool ProgramImplCore::prepare_materialization(MaterializationTransaction& transa
     SharedPrefixState* shared_state = transaction.has_shared_source
                                           ? &shared_prefix_states[transaction.shared_source_index]
                                           : nullptr;
-    if (source_state != nullptr && resident_resources(*source_state).device.state_slots == 0 &&
-        resident_resources(*source_state).host.state_slots == 0) {
+    // P2.4: gate on the SELECTED state image's residency, not the sequence's
+    // exclusive footprint. Restore reads the selected image's replica, so a
+    // shared image (checkpoint_refs > owned) is fully restorable. The old
+    // exclusive-ownership test (resident_resources) threw a false "no resident
+    // state" on every shared rewrite checkpoint — 18-81% of prod requests —
+    // forcing a full root re-prefill.
+    const StateReplicaResidency selected_residency = [&]() -> StateReplicaResidency {
+        if (source_state == nullptr || state_store == nullptr) {
+            return StateReplicaResidency::None;
+        }
+        const SequenceState& sel = *source_state;
+        const ReusePath sel_reuse = details.reuse;
+        if (sel_reuse == ReusePath::PrivateEndpoint) {
+            return sel.endpoint_valid && state_store->valid(sel.state.read)
+                       ? state_store->residency(sel.state.read)
+                       : StateReplicaResidency::None;
+        }
+        if (is_rewrite_checkpoint_restore(sel_reuse) && sel.rewrite_state &&
+            state_store->valid(*sel.rewrite_state)) {
+            return state_store->residency(*sel.rewrite_state);
+        }
+        if (sel_reuse == ReusePath::PrivateLongAnchor && details.selected_checkpoint &&
+            details.selected_checkpoint->kind == runtime::CheckpointKind::LongAnchor) {
+            for (const LongAnchorCheckpoint& anchor : sel.long_anchors) {
+                if (anchor.frontier == details.selected_checkpoint->frontier &&
+                    anchor.ordinal == details.selected_checkpoint->ordinal &&
+                    state_store->valid(anchor.state)) {
+                    return state_store->residency(anchor.state);
+                }
+            }
+        }
+        return StateReplicaResidency::None;
+    }();
+
+    if (source_state != nullptr && selected_residency == StateReplicaResidency::None) {
         // P2.4 step 0: trace the loss path — the zero-residency source's
         // identity plus the store census at the moment materialization fails.
         const SequenceState& src = *source_state;
         const auto hist = state_store ? state_store->residency_histogram()
                                       : StateImageStore::ResidencyHistogram{};
+        const auto handle_diag = [this, &src](const char* name, StateImageHandle h) {
+            if (!state_store || !state_store->valid(h)) {
+                std::fprintf(stderr, "[materialize] DIAG   %s: invalid\n", name);
+                return;
+            }
+            std::fprintf(stderr,
+                         "[materialize] DIAG   %s: residency=%d ckpt_refs=%u owned=%u\n",
+                         name, (int)state_store->residency(h),
+                         state_store->checkpoint_references(h),
+                         owned_checkpoint_references(src, h));
+        };
         std::fprintf(stderr,
                      "[materialize] DIAG no-resident-state: source=%u gen=%llu frontier=%u "
                      "read_valid=%d write_valid=%d rewrite_valid=%d "
@@ -4947,6 +4991,13 @@ bool ProgramImplCore::prepare_materialization(MaterializationTransaction& transa
                            state_store->valid(*src.rewrite_state)),
                      hist.device_slots, hist.host_slots, hist.pending_device_slots,
                      hist.pending_host_slots, hist.dual_resident, hist.host_only);
+        handle_diag("endpoint-read", src.state.read);
+        handle_diag("endpoint-write", src.state.write);
+        if (src.rewrite_state) { handle_diag("rewrite", *src.rewrite_state); }
+        if (src.reserved_state) { handle_diag("reserved", *src.reserved_state); }
+        for (std::size_t a = 0; a < src.long_anchors.size(); ++a) {
+            handle_diag("anchor", src.long_anchors[a].state);
+        }
         throw std::logic_error("materialization source has no resident state");
     }
 

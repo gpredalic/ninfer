@@ -578,7 +578,22 @@ shared meter.
       restore path (find/take_pinned, state H2D 11555–11590) is correct and
       already runs at fallback time — the episode's safety-find missed only
       because the unit was NOT in the net (its state was lost before any
-      spill happened). Increments:
+      spill happened).
+      **Step 0 finding (2026-09-16, DIAG at the throw site): the dominant
+      class is a GATE FALSE POSITIVE, not a state loss.** The gate
+      (`program_impl.h:4930`) tested `resident_resources(source)` — the
+      sequence's EXCLUSIVE state footprint — but restore only READS the
+      selected image's replica, so a SHARED image (checkpoint_refs > owned)
+      is fully restorable. DIAG confirmed on every episode: the endpoint
+      handles are released (expected — a thinking follow-up rewinds to the
+      rewrite checkpoint) while `rewrite: residency={DeviceOnly,HostOnly}
+      ckpt_refs=2 owned=1` — resident and restorable, yet the exclusive test
+      counted 0 → throw → 4× root re-prefill. Fix: gate on the SELECTED
+      image's residency (mirrors `selected_state`), not the exclusive
+      footprint. This also converts a would-be unclean "no selected
+      StateImage" throw (selected image gone, another image resident) into
+      the clean root fallback. The "KV without state" pressure loss remains
+      as the secondary class for the increments below. Increments:
       - **Increment 1 — spill-before-loss (kill the unit split).** At the
         point a unit's state is about to lose its LAST replica (device-slot
         release under pressure; host-replica drop/eviction), if the unit's KV
