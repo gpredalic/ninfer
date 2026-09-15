@@ -278,7 +278,24 @@ development. Each is verified with the P0 e2e gate + the live journal.
       (b) batch-demote until the demand fits (bounded per tick), not one per
       15s — **done `a53db4b4`**; (c) make the **shared prefix itself a demotion unit** — **stage 2 shipped `f02bc048`**: when no private victim exists, relief releases the idle shared prefix entry (Catalogued, active_references==0, not the transaction's shared source) with the most resident pages; content survives in the safety net via spilled turn continuations. **Regression:** its admission→reserve race with pending captures (victim chosen at admission, pinned only at reserve) threw `capture replacement capability is stale` 38× — fixed by the `622c841d` degrade-to-no-replacement (runtime-reserve side) and `4e712ab3` RM catalog probe (RM-planning side; see P1.2). Full unit-grade version (D2H spill of the shared prefix as one {KV + state} unit) is P2.4; also noted: the incoming restore allocates NEW device pages for a prefix that is already device-resident (identity-based restore is the deeper fix — shipped `33c53fb9`/`a1cd9dda`, see P1.7); (d) admission
       should see the pool's shared-prefix occupancy and queue the request
-      (visible queue position) instead of a 120s silent defer. *Exit:* a
+      (visible queue position) instead of a 120s silent defer.
+      **State-pool sizing fix deployed 2026-09-16 01:04 (config-only, no code):**
+      the 500s from the (reverted) P2.4 gate fix were device-state-pool
+      exhaustion — total slots = `max_concurrency + device_state_slots` = 3+5 =
+      8, but the working set needs 9 (3 concurrent rewrite-restores × 3 slots:
+      active + fork-write + replacement checkpoint), and the host pool (24)
+      was 24/24 full so `demote_checkpoints_to_make_room` had no demotion
+      target (relief dead). Live /stats confirmed both pools saturated in
+      steady state (8/8 device, 20–24/24 host). Fix: `--device-state-slots
+      5→6` (total 9 = exact working-set fit; the pool self-adapts — active
+      lanes take what they need, surplus holds hot checkpoints) +
+      `--host-state-slots 24→48` (7 GiB RAM, 14 GiB available; gives relief
+      room to demote into). Verified: 9/9 device + 3/48 host post-deploy,
+      0 alloc failures. KV cost: ~1 slot (146 MiB ≈ 6.5k tokens) — the
+      device-KV pool (the binding constraint) loses ~1%. The KV-side of P1.5
+      (shared-page relief: 99.7% of demoted pages shared with the live
+      prefix) remains open — that is the structural part.
+      *Exit:* a
       5th-conversation e2e scenario completes (via shared-prefix demotion or
       a fast visible queue) without a deadline abort.
 - [ ] **P1.6 — the admission wedge: a queued request must run or fail,
