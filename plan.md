@@ -601,7 +601,19 @@ shared meter.
       completions with `cache=143110`/`157548` (~143k–157k tokens from cache,
       tail-only prefill) instead of a full root re-prefill. The per-handle
       DIAG stays as a canary for the secondary class (it now fires only on a
-      genuine `None` residency — the selected image actually gone). Increments:
+      genuine `None` residency — the selected image actually gone).
+      **Regression the gate fix unmasked, fixed `fb9b6318`:** unblocking the
+      rewrite-restore path exposed a latent planner under-count — a
+      ConsumedToActive restore whose selected state is SHARED (more checkpoint
+      refs than the sequence consumes) must FORK it (read + write both
+      device-resident), one more slot than the base active entitlement (1)
+      covers. The planner reserved base(1) + new-checkpoint(1) = 2 but the
+      sequence holds 3 (read + write + rewrite), so `reserve_state_entitlement`
+      threw `entitlement is inconsistent` (footprint=3 slots=2 fork_pending=1)
+      and the request 500ed (9× in 20 min) instead of restoring. Fix: count
+      the fork's write slot in `active_optional_resources.device.state_slots`
+      when `state_fork_required`. Live-verified: 0 mismatches on the new
+      binary. Increments:
       - **Increment 1 — spill-before-loss (kill the unit split).** At the
         point a unit's state is about to lose its LAST replica (device-slot
         release under pressure; host-replica drop/eviction), if the unit's KV
