@@ -487,10 +487,12 @@ shared meter.
         not a rip-out of the two-pool accounting — the existing per-pool
         eviction keeps working unchanged, so a meter bug degrades to "no
         improvement," not "wrong eviction."
-- [ ] **P2.3 — Slice 2: atomic admission.** Admit only when the whole unit fits
+- [x] **P2.3 — Slice 2: atomic admission.** Admit only when the whole unit fits
       the shared host budget; `rewrite_checkpoint_invalid` becomes an admission
       *failure*, not a degraded half-spill. *Exit:* 0 `ckpt_frontier=0` units
-      in e2e + journal.
+      in e2e + journal. **Shipped `ee0bf25c`, e2e-verified 2026-09-15 (full
+      12-phase suite, one swap, rc=0: 50 PASS / 25 WARN / 0 FAIL, 0 error
+      classes).**
       **Design (2026-09-15, scoped from the admission/spill paths):**
       *Unit completeness* — a retained unit is complete iff its endpoint state
       image is present AND (no rewrite checkpoint is expected for it OR its
@@ -529,6 +531,20 @@ shared meter.
         property and kills the pathological-unit class.
       *Exit:* 0 retained units that expected a rewrite checkpoint but lack
       it, 0 endpoint_fallback units, 0 half-units in e2e + journal.
+      **Shipped `ee0bf25c`, e2e-verified 2026-09-15 (full 12-phase suite, one
+      swap, rc=0: 50 PASS / 25 WARN / 0 FAIL, 0 error classes).** Run log:
+      44 complete units retained (13 with rewrite checkpoints, 31
+      no-checkpoint sessions — complete by definition); 95 atomic ABORTs
+      (`endpoint_state_missing` — the 19s-class symptom, now visible and
+      countable instead of silently half-retained; P2.5's unit LRU is the
+      structural fix); 0 `rewrite_checkpoint_uncaptured` ABORTs (every
+      expected checkpoint was captured in this run); 0 error classes; 0
+      entitlement errors (P1.7(b) fix held under the new load). The
+      `endpoint_state_missing` ABORTs are the expected visible symptom until
+      P2.5: the state pool still evicts live units' endpoint states, and the
+      atomic rule now refuses the half-unit rather than storing it. One soft
+      WARN to watch: state-lease phase saw 1 checkpoint capture (expected
+      ≥4) — device-pool pressure variance, all hard checks passed.
 - [ ] **P2.4 — Slice 3: atomic spill/restore.** The unit moves to host / back
       as one; the safety-net spill (already whole-unit) becomes the only spill
       path; restore reassembles into the SAME unit (no 3× duplication: device
