@@ -676,6 +676,16 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
         plan->state_fork_required =
             selected_state_requires_fork(*source, plan->reuse, plan->rewrite_disposition,
                                          plan->selected_checkpoint, plan->reuse_base);
+        if (plan->state_fork_required) {
+            // The selected state is shared (more checkpoint refs than this
+            // sequence consumes), so it cannot be moved into the active slot —
+            // it is FORKED: read (source) + write (copy) are both device
+            // resident, one more than the base active entitlement (1) covers.
+            // Count the fork's write slot or reserve_state_entitlement throws
+            // "entitlement is inconsistent" (footprint 3 > slots 2) and the
+            // request 500s instead of restoring.
+            ++plan->active_optional_resources.device.state_slots;
+        }
     }
     if (source != nullptr && is_rewrite_checkpoint_restore(plan->reuse) &&
         plan->source_disposition == runtime::ClaimDisposition::ConsumedToActive) {
