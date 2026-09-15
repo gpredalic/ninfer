@@ -200,7 +200,15 @@ development. Each is verified with the P0 e2e gate + the live journal.
       so the plan undercounts by 1 device slot. **Fix direction (not yet
       applied — plan-side admission change, needs a careful pass + test):**
       in the rewrite-restore path, a retained `HostOnly` checkpoint that will
-      be H2D-restored must also count a device state slot. Self-recovering
+      be H2D-restored must also count a device state slot. **Plan-side
+      diagnostic deployed** (`[plan-state] rewrite-restore slots=… opt_dev=…
+      opt_host=… needs_transfer=… fork=… disp=… sel_res=… rw_res=…`,
+      `request_plan_impl.h` before `return AdmissionCandidate`): the next
+      firing correlates the plan's exact accounting with the runtime
+      `[state-entitlement] MISMATCH` line to pin whether the undercount is the
+      selected state (`needs_transfer`, the +1 at `request_plan_impl.h:1208–1215`
+      skips `HostOnly`) or the retained rewrite checkpoint (the optional-states
+      loop `:680–711` counts `HostOnly` as host-only). Self-recovering
       (request errors, client retries; no wedge/restart), so it does not block
       the stop-the-restarts goal — but it does block P1.2's "0 error classes"
       exit.

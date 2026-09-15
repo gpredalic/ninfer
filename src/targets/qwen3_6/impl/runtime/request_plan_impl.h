@@ -1330,6 +1330,22 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
         .final_removed            = source_resources,
         .final_added              = final_added,
     };
+    if (source != nullptr && is_rewrite_checkpoint_restore(plan->reuse)) {
+        const StateImageHandle sel = selected_state(*source, plan->reuse, plan->selected_checkpoint);
+        const int sel_res =
+            state_store->valid(sel) ? static_cast<int>(state_store->residency(sel)) : -1;
+        const int rw_res =
+            source->rewrite_state ? static_cast<int>(state_store->residency(*source->rewrite_state))
+                                  : -1;
+        std::fprintf(stderr,
+                     "[plan-state] rewrite-restore slots=%u opt_dev=%u opt_host=%u "
+                     "needs_transfer=%d fork=%d disp=%d sel_res=%d rw_res=%d\n",
+                     plan->demand.active_entitlement.device.state_slots,
+                     plan->active_optional_resources.device.state_slots,
+                     plan->active_optional_resources.host.state_slots,
+                     plan->needs_transfer ? 1 : 0, plan->state_fork_required ? 1 : 0,
+                     static_cast<int>(plan->rewrite_disposition), sel_res, rw_res);
+    }
     return AdmissionCandidate(std::move(plan));
 }
 
