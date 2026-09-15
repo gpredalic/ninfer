@@ -91,7 +91,7 @@ while true; do
     fi
   fi
   # no signal: hold armed state (a wedged engine goes silent)
-  if [ "$armed_since" != "0" ] && [ $((now - armed_since)) -ge 90 ] \
+  if [ "$armed_since" != "0" ] && [ $((now - armed_since)) -ge 150 ] \
      && [ "$now" -ge "$grace_until" ] && [ "$stopped" = "0" ]; then
     if [ "$window_start" = "0" ] || [ $((now - window_start)) -ge 1800 ]; then
       window_start=$now
