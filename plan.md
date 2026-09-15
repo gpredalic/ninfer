@@ -593,7 +593,15 @@ shared meter.
       footprint. This also converts a would-be unclean "no selected
       StateImage" throw (selected image gone, another image resident) into
       the clean root fallback. The "KV without state" pressure loss remains
-      as the secondary class for the increments below. Increments:
+      as the secondary class for the increments below.
+      **Shipped `87916492`, LIVE-VERIFIED 2026-09-16 00:07–00:17:** the new
+      binary completed 45 requests with **0** `no resident state` / fallback
+      lines (was 18–81% of completed requests per 20-min window pre-fix), and
+      the previously-failing path now restores: 3 `reuse=private_turn_closure`
+      completions with `cache=143110`/`157548` (~143k–157k tokens from cache,
+      tail-only prefill) instead of a full root re-prefill. The per-handle
+      DIAG stays as a canary for the secondary class (it now fires only on a
+      genuine `None` residency — the selected image actually gone). Increments:
       - **Increment 1 — spill-before-loss (kill the unit split).** At the
         point a unit's state is about to lose its LAST replica (device-slot
         release under pressure; host-replica drop/eviction), if the unit's KV
