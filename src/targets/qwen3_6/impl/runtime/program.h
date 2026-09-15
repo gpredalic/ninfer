@@ -494,6 +494,14 @@ struct SequenceState {
     // follow-ups (preserve_thinking=off) can find the continuation.
     // Device KV operations use the full ledger (unchanged).
     std::vector<TokenId> compact_prefix;
+
+    // P2.3: this unit's KV + state can fit the shared host budget (arena +
+    // state pool) as a whole. Set at admission (root: the new unit;
+    // continuation: re-validated on the source unit as it grows) and
+    // checked by the safety-net spill, which SKIPs ineligible units instead
+    // of attempting a spill that can never complete. One-way: the unit's
+    // cost only grows, so eligibility only downgrades.
+    bool retention_eligible = true;
 };
 
 struct SharedPrefixState {
@@ -1184,6 +1192,14 @@ private:
     resident_resources(const SharedPrefixState& shared) const noexcept;
     [[nodiscard]] detail::PhysicalResources physical_occupancy() const noexcept;
     [[nodiscard]] bool physical_peak_fits(detail::PhysicalResources peak) const noexcept;
+    // P2.3: true when a unit whose KV spans `text_pages` + `backend_pages`
+    // (plus its endpoint + rewrite-checkpoint state images) fits the TOTAL
+    // shared host budget (KV arena + host state pool). A unit that cannot
+    // fit an empty budget can never be retained, so admission marks it
+    // retention-ineligible (the spill SKIPs it). Occupancy-independent by
+    // design — occupancy-aware fitting is P2.5's unit LRU.
+    [[nodiscard]] bool retention_eligible(std::uint32_t text_pages,
+                                         std::uint32_t backend_pages) const noexcept;
     [[nodiscard]] StateImageHandle
     selected_state(const SequenceState& sequence, ReusePath reuse,
                    std::optional<runtime::CheckpointRef> checkpoint) const;

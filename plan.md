@@ -491,6 +491,44 @@ shared meter.
       the shared host budget; `rewrite_checkpoint_invalid` becomes an admission
       *failure*, not a degraded half-spill. *Exit:* 0 `ckpt_frontier=0` units
       in e2e + journal.
+      **Design (2026-09-15, scoped from the admission/spill paths):**
+      *Unit completeness* — a retained unit is complete iff its endpoint state
+      image is present AND (no rewrite checkpoint is expected for it OR its
+      rewrite checkpoint state was captured). Sessions that never have a
+      rewrite checkpoint are complete with endpoint state alone (their
+      `ckpt_frontier=0` is not a half-unit). Two increments:
+      - **Increment 1 — atomic spill (no half-unit retention).** In
+        `spill_victim_to_host_kv_safety_net`: (a) endpoint state missing +
+        checkpoint state present (the `endpoint_fallback` class) → retain
+        NOTHING (the unit is incomplete at its execution frontier; the
+        checkpoint-only form is not a unit — today it is retained with an
+        untruncated ledger/identity, an inconsistent frontier/state/ledger
+        correspondence); (b) rewrite checkpoint expected but uncapturable
+        (`rewrite_state_null`/`rewrite_state_invalid`/`capture_logic_failed`)
+        → retain NOTHING (today: retained as a `ckpt_frontier=0` half-unit).
+        Both become logged ABORTs. Also: the `prefix_identity.swap` out of the
+        sequence moves to just before the successful `add()` — today an ABORT
+        destroys the sequence's identity (a latent bug for demoted-not-evicted
+        victims, which keep living with an empty identity → silent root
+        re-prefills every turn).
+      - **Increment 2 — shared-budget retention gate at admission.** At
+        `reserve_materialization` (root path) and re-validated at continuation
+        admissions: unit host cost = `kv_bytes(prompt frontier, text+backend
+        strides) + 2 × image_bytes` (endpoint + rewrite checkpoint, the max
+        the unit carries) vs the total shared host budget = arena capacity +
+        state-pool bytes (`admission_capacity().host` dimensions). Cost >
+        total budget ⇒ the unit is **retention-ineligible** (one-way flag on
+        the continuation; cost only grows) — the spill SKIPs it with a clear
+        log instead of attempting a spill that can never complete. Strict
+        rule (fits the *total* budget, occupancy-independent): a unit that
+        cannot fit an empty budget can never be retained; occupancy-aware
+        fitting (evict-to-make-room at admission) is P2.5's unit LRU. The
+        e2e `no room for a complete unit` churn (arena full of demotion
+        extents, net empty) is NOT fixed here — that is the P2.4/P2.5
+        shared-budget problem; increment 2 makes retention a *planned*
+        property and kills the pathological-unit class.
+      *Exit:* 0 retained units that expected a rewrite checkpoint but lack
+      it, 0 endpoint_fallback units, 0 half-units in e2e + journal.
 - [ ] **P2.4 — Slice 3: atomic spill/restore.** The unit moves to host / back
       as one; the safety-net spill (already whole-unit) becomes the only spill
       path; restore reassembles into the SAME unit (no 3× duplication: device

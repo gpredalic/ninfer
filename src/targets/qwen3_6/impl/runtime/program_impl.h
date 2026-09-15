@@ -4256,6 +4256,46 @@ ProgramImplCore::reserve_materialization(AdmissionCandidate&& plan, PreparedProm
         }
     }
 
+    // P2.3: shared host budget gate. A unit that cannot fit the shared host
+    // budget (KV arena + state pool) even when empty is admitted as
+    // non-retainable: the safety-net spill SKIPs it (retention is a planned
+    // property, not a spill-time accident). Root: the new unit's slot.
+    // ConsumedToActive: the source unit grows to this prompt (one-way
+    // downgrade). Retained sources do not grow — left untouched.
+    {
+        const bool eligible =
+            retention_eligible(details.text_kv_page_entitlement,
+                               details.backend_kv_page_entitlement);
+        if (transaction.root_continuation_index) {
+            SequenceState& root_unit =
+                continuation_states[*transaction.root_continuation_index];
+            root_unit.retention_eligible = eligible;
+            if (!eligible) {
+                std::fprintf(stderr,
+                             "[retention-gate] root slot=%u — unit host cost (text=%u "
+                             "backend=%u pages + 2 state images) exceeds the shared host "
+                             "budget; admitted as non-retainable\n",
+                             *transaction.root_continuation_index,
+                             details.text_kv_page_entitlement,
+                             details.backend_kv_page_entitlement);
+            }
+        }
+        if (!eligible && details.has_source &&
+            details.source_disposition == runtime::ClaimDisposition::ConsumedToActive) {
+            SequenceState& unit = continuation_states[details.source_index];
+            if (unit.retention_eligible) {
+                std::fprintf(stderr,
+                             "[retention-gate] unit index=%u frontier=%u — grown unit host cost "
+                             "(text=%u backend=%u pages + 2 state images) exceeds the shared "
+                             "host budget; downgraded to non-retainable\n",
+                             details.source_index, unit.execution_frontier,
+                             details.text_kv_page_entitlement,
+                             details.backend_kv_page_entitlement);
+            }
+            unit.retention_eligible = false;
+        }
+    }
+
     const auto host_started = Clock::now();
     transaction.plan.emplace(std::move(plan));
     AdmissionCandidateImpl& request_plan = *transaction.plan->impl_;
@@ -6076,6 +6116,16 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index) no
                          host_kv_arena ? 1 : 0);
             return;
         }
+        // P2.3: admission decided this unit can never fit the shared host
+        // budget — retention is a planned property, not a spill-time
+        // accident. Skip before any allocation/copy work.
+        if (!sequence.retention_eligible) {
+            std::fprintf(stderr,
+                         "[safety-spill] SKIP: index=%u frontier=%u — unit not retention-"
+                         "eligible (host cost exceeds the shared host budget), nothing retained\n",
+                         index, sequence.execution_frontier);
+            return;
+        }
         const SequenceKVBundle& kv = *sequence.kv;
 
         // Determine page counts from the address spaces.
@@ -6495,7 +6545,10 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index) no
         HostKVSafetyNetEntry entry;
         entry.session_key = const_cast<SequenceState&>(sequence).session_key;
         entry.compact_prefix = const_cast<SequenceState&>(sequence).compact_prefix;
-        entry.prefix_identity.swap(const_cast<SequenceState&>(sequence).prefix_identity);
+        // P2.3: prefix_identity is swapped in only on the successful retain
+        // (below) — an ABORT must not destroy the sequence's identity: a
+        // demoted-not-evicted victim keeps living and must keep matching on
+        // its next turn.
         entry.ledger = sequence.ledger;
         entry.execution_frontier = sequence.execution_frontier;
         {
@@ -6547,52 +6600,46 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index) no
         entry.checkpoint_frontier = checkpoint_frontier;
         entry.checkpoint_state_host = std::move(checkpoint_state_host);
         entry.checkpoint_state_bytes = checkpoint_state_bytes;
-        // An entry needs at least one state image for restore. Prefer the
-        // endpoint state; if missing (state store evicted the endpoint),
-        // fall back to the checkpoint state as the restore state.
-        bool endpoint_fallback = false;
+        // P2.3 atomic retention: a cache unit is {attention KV + GDN state}
+        // and is retained whole or not at all. A unit is COMPLETE iff its
+        // endpoint state image is present AND (no rewrite checkpoint is
+        // expected for it, or its rewrite checkpoint state was captured).
+        // Two incompleteness classes used to be retained as half-units; both
+        // are now ABORTs:
+        //  (a) endpoint state missing — the unit's state at its execution
+        //      frontier is gone (state-pool LRU evicted it, the 19s class).
+        //      The old endpoint_fallback consumed the earlier checkpoint
+        //      state as the endpoint state while the ledger/identity kept
+        //      the full execution frontier — a frontier/state/ledger
+        //      mismatch. The unit is incomplete at its frontier: retain
+        //      nothing (P2.5's unit LRU stops the eviction that causes this).
+        //  (b) rewrite checkpoint expected but uncaptured — the
+        //      thinking-mode follow-up's restore frontier has no state. The
+        //      ckpt-miss diagnostic above already logged the reason; a
+        //      half unit is not a unit, so retain nothing.
+        const bool checkpoint_expected =
+            sequence.rewrite_checkpoint.valid && sequence.rewrite_checkpoint.frontier != 0;
         if (entry.state_bytes == 0 || entry.state_host.empty()) {
-            // Endpoint state missing — fall back to the checkpoint state so the unit
-            // still carries a state image (an entry without one is never retained).
-            if (entry.checkpoint_valid && entry.checkpoint_state_bytes > 0 &&
-                !entry.checkpoint_state_host.empty()) {
-                entry.state_bytes = entry.checkpoint_state_bytes;
-                entry.state_host = std::move(entry.checkpoint_state_host);
-                entry.checkpoint_valid = false;
-                entry.checkpoint_state_bytes = 0;
-                entry.execution_frontier = checkpoint_frontier;
-                endpoint_fallback = true;
-                std::fprintf(stderr,
-                             "[safety-spill] FALLBACK: using checkpoint state as endpoint "
-                             "(index=%u frontier=%u ckpt_frontier=%u)\n",
-                             index, entry.execution_frontier, checkpoint_frontier);
-            } else {
-                std::fprintf(stderr,
-                             "[safety-spill] SKIP: no endpoint or checkpoint state image "
-                             "(index=%u frontier=%u)\n",
-                             index, entry.execution_frontier);
-            }
-        }
-        if (entry.state_bytes == 0 || entry.state_host.empty()) {
-            // No state image after the fallback. {@code KV + state} is the unit, so an
-            // entry without its state is not a cache unit: retain nothing.
             std::fprintf(stderr,
-                         "[safety-spill] ABORT: index=%u frontier=%u — no state image; "
-                         "KV and state are one atomic unit, nothing retained\n",
+                         "[safety-spill] ABORT: index=%u frontier=%u reason=endpoint_state_missing "
+                         "— the unit is incomplete at its execution frontier (KV and state are "
+                         "one atomic unit); [checkpoint] unit-not-retained\n",
                          index, sequence.execution_frontier);
+        } else if (checkpoint_expected && !checkpoint_valid) {
+            std::fprintf(stderr,
+                         "[safety-spill] ABORT: index=%u frontier=%u reason=rewrite_checkpoint_uncaptured "
+                         "(ckpt_frontier=%u) — a half unit is not a unit; "
+                         "[checkpoint] unit-not-retained\n",
+                         index, sequence.execution_frontier,
+                         sequence.rewrite_checkpoint.frontier);
         } else {
-            // Log the capture outcome (checkpoint_valid/checkpoint_frontier are the
-            // pre-fallback values: whether a checkpoint was captured at spill time).
-            // fallback=1 means the endpoint state was missing and the captured
-            // checkpoint was consumed as the restore state, so the entry's execution
-            // frontier is the (earlier) checkpoint frontier while the ledger keeps
-            // the full endpoint length.
+            // Complete unit: move the identity in and retain.
+            entry.prefix_identity.swap(const_cast<SequenceState&>(sequence).prefix_identity);
             std::fprintf(stderr,
                          "[safety-spill] OK: index=%u frontier=%u ckpt_valid=%d ckpt_frontier=%u "
-                         "fallback=%d ledger=%zu identity=%zu\n",
+                         "ledger=%zu identity=%zu\n",
                          index, entry.execution_frontier, static_cast<int>(checkpoint_valid),
-                         checkpoint_frontier, static_cast<int>(endpoint_fallback),
-                         entry.ledger.size(), entry.prefix_identity.size());
+                         checkpoint_frontier, entry.ledger.size(), entry.prefix_identity.size());
             host_kv_safety_net.add(std::move(entry));
         }
     } catch (const std::exception& e) {
@@ -7936,6 +7983,42 @@ bool ProgramImplCore::physical_peak_fits(detail::PhysicalResources peak) const n
                     limits.device.backend_kv_pages) &&
            fits_u32(occupied.host.state_slots, peak.host.state_slots, limits.host.state_slots) &&
            fits_size(occupied.host.kv_bytes, peak.host.kv_bytes, limits.host.kv_bytes);
+}
+
+bool ProgramImplCore::retention_eligible(std::uint32_t text_pages,
+                                         std::uint32_t backend_pages) const noexcept {
+    if (!host_kv_arena || !state_images) { return true; }  // no host retention to gate
+    const std::uint64_t image_bytes = state_images->host_layout().image_bytes;
+    std::uint64_t budget = host_kv_arena->capacity_bytes();
+    if (host_state_images) {
+        const std::uint64_t pool =
+            static_cast<std::uint64_t>(host_state_images->capacity()) *
+            static_cast<std::uint64_t>(host_state_images->layout().image_bytes);
+        if (budget > std::numeric_limits<std::uint64_t>::max() - pool) { return true; }
+        budget += pool;
+    }
+    if (budget == 0) { return true; }  // nothing can be retained anyway; the spill skips at its guard
+    const std::uint64_t max = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t cost = 0;
+    if (text_pages != 0) {
+        if (text_host_kv_page_stride == 0 ||
+            text_pages > max / static_cast<std::uint64_t>(text_host_kv_page_stride) ||
+            cost > max - static_cast<std::uint64_t>(text_pages) * text_host_kv_page_stride) {
+            return false;
+        }
+        cost += static_cast<std::uint64_t>(text_pages) * text_host_kv_page_stride;
+    }
+    if (backend_pages != 0) {
+        if (backend_host_kv_page_stride == 0 ||
+            backend_pages > max / static_cast<std::uint64_t>(backend_host_kv_page_stride) ||
+            cost > max - static_cast<std::uint64_t>(backend_pages) * backend_host_kv_page_stride) {
+            return false;
+        }
+        cost += static_cast<std::uint64_t>(backend_pages) * backend_host_kv_page_stride;
+    }
+    // Both state images (endpoint + rewrite checkpoint) ride the unit.
+    if (image_bytes > max / 2U || cost > max - 2U * image_bytes) { return false; }
+    return cost + 2U * image_bytes <= budget;
 }
 
 StateImageHandle
