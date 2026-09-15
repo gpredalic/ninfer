@@ -987,6 +987,12 @@ private:
         // start_sequence must restore the checkpoint state image, not the
         // endpoint state (they differ).
         bool host_kv_restore_checkpoint = false;
+        // P1.7(b): pages the safety-net restore adopted from still-resident
+        // frozen shared pages instead of re-materializing. resident_resources
+        // excludes shared pages from an owner's exact transition effect, so
+        // the post-materialization entitlement check adds these back.
+        std::uint32_t restore_adopted_main_pages     = 0;
+        std::uint32_t restore_adopted_backend_pages  = 0;
         bool prefix_forks_ready             = false;
         bool source_prepared                = false;
         bool cancel_pending                 = false;

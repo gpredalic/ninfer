@@ -8255,6 +8255,13 @@ StartResult ProgramImplCore::start_request(MaterializationTransaction& transacti
         start_sequence(lane, sequence, transaction);
         detail::PhysicalResources actual         = resident_resources(sequence);
         actual.device.active_lanes               = 1;
+        // P1.7(b): a safety-net restore may adopt pages from still-resident
+        // frozen shared pages instead of re-materializing them.
+        // resident_resources() excludes shared pages from an owner's exact
+        // transition effect, but the planned entitlement still counts them —
+        // add the adopted pages back so the check compares like with like.
+        actual.device.main_kv_pages += transaction.restore_adopted_main_pages;
+        actual.device.backend_kv_pages += transaction.restore_adopted_backend_pages;
         const detail::PhysicalResources expected = active;
         if (actual != expected) {
             throw std::logic_error("materialized sequence does not match its active entitlement");
@@ -11203,15 +11210,14 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
         // match, restore the cached prefix KV from host RAM to device. This replaces
         // the first N tokens of prefill with a bulk H2D copy.
         if (transaction.host_kv_restore_frontier > 0 && sequence.kv) {
-            // P1.7(b): adoption bookkeeping, declared in the enclosing scope
-            // (not the try block) so the catch below can tear down an adopted
-            // prefix if the restore fails after the adoption (state H2D,
-            // stream sync) — the root-prefill fallback must start from an
-            // empty address space.
-            std::uint32_t restore_adopted_text     = 0;
-            std::uint32_t restore_adopted_backend  = 0;
-            std::uint32_t restore_planned_text_entitlement     = 0;
-            std::uint32_t restore_planned_backend_entitlement  = 0;
+            // P1.7(b): adoption bookkeeping. The adopted-page counts live on
+            // the transaction (the post-materialization entitlement check
+            // adds them back); the planned entitlements are declared here so
+            // the catch below can rebaseline after a post-adoption failure —
+            // the root-prefill fallback must start from an empty address
+            // space.
+            std::uint32_t planned_text_entitlement     = 0;
+            std::uint32_t planned_backend_entitlement  = 0;
          try {
             std::fprintf(stderr, "[restore] frontier=%u entry=%s checkpoint=%d\n",
                          transaction.host_kv_restore_frontier,
@@ -11242,7 +11248,7 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                     // Only full pages are adopted: a partial tail page would
                     // be the prefill's writer tail after the restore.
                     std::uint32_t text_shared = 0;
-                    restore_planned_text_entitlement =
+                    planned_text_entitlement =
                         text_kv_addresses->entitlement(sequence.kv->text);
                     if (entry.text_allocations.size() == 1 && !entry.text_source_pages.empty()) {
                         const std::uint32_t limit = std::min(
@@ -11285,8 +11291,8 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                         // to the reservation — rebaseline to the planned
                         // entitlement so the fit gate sees the freed pages.
                         text_kv_addresses->resize_entitlement(
-                            sequence.kv->text, restore_planned_text_entitlement);
-                        restore_adopted_text = text_shared;
+                            sequence.kv->text, planned_text_entitlement);
+                        transaction.restore_adopted_main_pages = text_shared;
                         std::fprintf(stderr,
                                      "[restore] identity-share: %u/%u text pages adopted\n",
                                      text_shared, text_pages);
@@ -11337,7 +11343,7 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                 if (backend_pages > 0 && backend_pages <= entry.backend_page_count) {
                     // P1.7(b) backend: same identity-based restore as text.
                     std::uint32_t backend_shared = 0;
-                    restore_planned_backend_entitlement =
+                    planned_backend_entitlement =
                         backend_kv_addresses->entitlement(*sequence.kv->backend);
                     if (entry.backend_allocations.size() == 1 &&
                         !entry.backend_source_pages.empty()) {
@@ -11370,8 +11376,8 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                                 entry.backend_source_pages.data(), backend_shared),
                             device.transfer_stream);
                         backend_kv_addresses->resize_entitlement(
-                            *sequence.kv->backend, restore_planned_backend_entitlement);
-                        restore_adopted_backend = backend_shared;
+                            *sequence.kv->backend, planned_backend_entitlement);
+                        transaction.restore_adopted_backend_pages = backend_shared;
                         std::fprintf(stderr,
                                      "[restore] identity-share: %u/%u backend pages adopted\n",
                                      backend_shared, backend_pages);
@@ -11498,16 +11504,17 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
             // P1.7(b): if the restore failed after an adoption, the address
             // space holds shared frozen pages a root prefill cannot write —
             // return it to its empty activated state first.
-            if (restore_adopted_text > 0) {
-                text_kv_addresses->release_adopted_prefix(sequence.kv->text, restore_adopted_text);
+            if (transaction.restore_adopted_main_pages > 0) {
+                text_kv_addresses->release_adopted_prefix(
+                    sequence.kv->text, transaction.restore_adopted_main_pages);
                 text_kv_addresses->resize_entitlement(sequence.kv->text,
-                                                      restore_planned_text_entitlement);
+                                                      planned_text_entitlement);
             }
-            if (restore_adopted_backend > 0 && sequence.kv->backend) {
-                backend_kv_addresses->release_adopted_prefix(*sequence.kv->backend,
-                                                             restore_adopted_backend);
+            if (transaction.restore_adopted_backend_pages > 0 && sequence.kv->backend) {
+                backend_kv_addresses->release_adopted_prefix(
+                    *sequence.kv->backend, transaction.restore_adopted_backend_pages);
                 backend_kv_addresses->resize_entitlement(*sequence.kv->backend,
-                                                         restore_planned_backend_entitlement);
+                                                         planned_backend_entitlement);
             }
             transaction.host_kv_restore_frontier = 0;
             staged.base = 0;
