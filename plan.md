@@ -182,15 +182,28 @@ development. Each is verified with the P0 e2e gate + the live journal.
       a saturated e2e + journal window — **met via the live window** (the
       32k e2e swap was skipped: the live traffic already exercised the same
       episodes, and the swap would freeze the user's sessions).
-      **New class 06:44:52 (req 25) + 06:55:22 (req 11): `sequence StateImage
-      entitlement is inconsistent`** — first live firings today, both
-      auxiliary ~64k-token requests admitted via the rewrite-checkpoint
-      restore path during high-pressure windows (footprint > plan entitlement
-      at `reserve_state_entitlement`, `program_impl.h:11778`). Mechanism not
-      yet pinned; diagnostics added (`576302d1`, deployed 06:57) log the
-      footprint breakdown (read/write/rewrite residency, reserved, device
-      anchors, fork_pending) on both mismatch branches — the next firing
-      reveals it.
+      **New class 06:44:52 (req 25) + 06:55:22 (req 11) + 07:12:31 (req 133):
+      `sequence StateImage entitlement is inconsistent`** — **pre-existing**
+      (13 journal lines on Sep 14, ≈4 firings, before any of today's changes;
+      my increased demotion pressure under pool saturation likely raised the
+      frequency, not the bug). All three are the rewrite-restore path with a
+      HostOnly checkpoint. **Mechanism pinned** via the `576302d1` diagnostic
+      (`footprint=2 slots=1 read=1 write=1 rewrite=3 reserved=0 anchors=0
+      fork_pending=0`; residency None=0/Dev=1/Host=2/Both=3): the sequence
+      holds 2 device images — the active state `X` (read==write, DeviceOnly)
+      and the retained rewrite checkpoint `Y` (Both after a mandatory H2D
+      restore) — but the plan promised 1 device slot. Root cause: the plan's
+      rewrite-restore optional-states loop (`request_plan_impl.h:680–711`)
+      counts a `HostOnly` retained checkpoint as a **host** slot only (the
+      device credit at :702–705 requires `DeviceOnly`/`Both`), but the
+      rewrite-restore runtime path *always* H2D-restores it to device (→Both),
+      so the plan undercounts by 1 device slot. **Fix direction (not yet
+      applied — plan-side admission change, needs a careful pass + test):**
+      in the rewrite-restore path, a retained `HostOnly` checkpoint that will
+      be H2D-restored must also count a device state slot. Self-recovering
+      (request errors, client retries; no wedge/restart), so it does not block
+      the stop-the-restarts goal — but it does block P1.2's "0 error classes"
+      exit.
 - [x] **P1.3 — device KV: free pages from idle sessions.** `47406f79`. While a
       fit-gate defer is in flight and free pages have not grown for 15s, the
       gate demotes the largest idle continuation to the host safety net and
@@ -304,6 +317,18 @@ development. Each is verified with the P0 e2e gate + the live journal.
       **shipped for the admission-wedge class by `20213d4b` (re-arm + bounded
       fail-all); verify in a live window**; (c) 0 sentinel firings over a
       full day of live use.
+- [ ] **P1.7 — planner H2D demand + identity-based restore (Slice 0 of #7).**
+      Two standalone fixes that ship before the unit refactor and address
+      today's live pain: (a) model the restore's new device state slot when the
+      source is HostOnly at materialization time (the planner H2D demand gap,
+      `program_impl.h:11076–11080, 5186–5196`) — this also fixes the
+      `entitlement is inconsistent` class (P1.2), the same undercount on the
+      rewrite-restore path; (b) identity-based restore — extend the
+      `prepare_kv_restores` dedup to the safety-net root restore so an
+      already-device-resident prefix is not re-allocated (the P1.5 overcommit
+      episodes re-consume freed pages). *Exit:* 0 "no resident state" →
+      root-fallback lines under pool pressure; 0 `entitlement is inconsistent`;
+      the 06:31/06:50 overcommit episodes stop re-consuming freed pages.
 
 *P1 exit criteria:* a 1-hour saturated window (3 concurrent large
 conversations) with **0 request errors, 0 deadline aborts, no restart.**
@@ -311,35 +336,73 @@ conversations) with **0 request errors, 0 deadline aborts, no restart.**
 ### P2 — #7: the unit (checkpoint + KV as one unit) — the main development effort
 
 The standing plan already declares the invariant; the code violates it in four
-ways: (1) two independent host budgets (KV pool vs state-slot pool); (2)
-independent LRU — the state pool evicts a live continuation while the KV pool
-sits 25% full; (3) half-units get stored (`ckpt-miss:
+ways: (1) two independent host **occupancy/eviction** pools (KV arena + safety
+net vs the 48-slot HostStatePool) — note the joint *demand* model already
+exists (`PhysicalResources` + `physical_peak_fits` checks all six dims
+together; RM holds no budget of its own, it delegates fit to the program);
+(2) independent LRU — the state pool evicts a live continuation while its KV
+stays resident (the 19s class); (3) half-units get stored (`ckpt-miss:
 rewrite_checkpoint_invalid`, `ckpt_frontier=0`); (4) "state without KV" is a
-retained form (the 19s safety-net class). #7 implements the invariant.
+retained form (shared-prefix relief frees device KV, the state slot stays —
+`program_impl.h:4816–4830`). #7 implements the invariant.
 **Subsumes:** #1a (planner-side H2D demand), #1b (pool right-sizing), #4a
 (per-session slot guarantee), #4b (idle-aware retention), the 19s safety-net
 class, the ckpt-miss class — and structurally dissolves the P1 error classes
 (the unit is no longer torn apart mid-eviction).
 
-- [ ] **P2.1 — scope in plan mode.** Refactor spans `StateImageStore`/
-      `HostStatePool`, the host-KV pool, spill/safety-net paths, RM accounting,
-      and the planner cost model. *Exit:* approved plan with slice boundaries.
+**P2.1 scope findings (2026-09-15, three exploration passes):** 12 KV/state
+seams where the two halves move independently (state-image agent); 6 half-unit
+conditions incl. the 19s class (state-slot LRU evicts a live continuation's
+state while its KV stays → next turn falls to Root → only the shared-prefix
+half matches → partial re-prefill); the identity-restore gap (safety-net root
+restore allocates fresh device pages even when the prefix is already
+device-resident — `program_impl.h:5065/5077, 11188/11233`, only
+`prepare_kv_restores:5146–5154` dedups); and the planner H2D demand gap (a
+checkpoint DeviceOnly at admission that is post-admission-demoted to HostOnly
+needs a NEW device slot at restore that was never in demand —
+`program_impl.h:11076–11080, 5186–5196`, band-aided by
+`demote_checkpoints_to_make_room(1)`). The safety net already stores state
+images inside the KV arena's budget (`set_state_budget_bytes`,
+`program_impl.h:938`) and spills whole units — that's the template for the
+shared meter.
+
+- [x] **P2.1 — scope in plan mode.** *Exit:* approved plan with slice
+      boundaries — **done** (findings above; slices below).
+- [ ] **P1.7 — Slice 0: standalone fixes (ship before the refactor).** Two
+      small, high-leverage fixes for today's live pain, no unit refactor:
+      (a) **planner H2D demand** — model the restore's new device slot when the
+      source is HostOnly at materialization time (re-validate residency at the
+      fit gate and schedule relief for the delta); this also fixes the
+      `entitlement is inconsistent` class (P1.2) which is the same undercount
+      on the rewrite-restore path. (b) **identity-based restore** — extend the
+      `prepare_kv_restores` dedup to the safety-net root restore (`find()`
+      consults device residency; skip allocation for already-resident prefix
+      pages). *Exit:* 0 "no resident state" → root-fallback lines under pool
+      pressure; the 06:31/06:50 overcommit episodes stop re-consuming freed
+      pages; 0 `entitlement is inconsistent`.
 - [ ] **P2.2 — Slice 1: unit identity + cost model.** A continuation owns one
       unit {KV replica, frontier checkpoint, compact prefix}; one cost =
-      `kv_bytes + state_image_bytes`; RM accounts one number.
-      *Exit:* unit-identity unit tests; accounting matches the sum of parts.
+      `kv_bytes + state_image_bytes`; one shared meter over host occupancy
+      (KV arena + state pool), the safety net's in-arena state budget as the
+      template. *Exit:* unit-identity unit tests; accounting matches the sum
+      of parts.
 - [ ] **P2.3 — Slice 2: atomic admission.** Admit only when the whole unit fits
       the shared host budget; `rewrite_checkpoint_invalid` becomes an admission
-      *failure*, not a degraded half-spill.
-      *Exit:* 0 `ckpt_frontier=0` units in e2e + journal.
-- [ ] **P2.4 — Slice 3: atomic spill/restore.** The unit moves to host / back as
-      one; "KV on host + no resident state" becomes impossible.
+      *failure*, not a degraded half-spill. *Exit:* 0 `ckpt_frontier=0` units
+      in e2e + journal.
+- [ ] **P2.4 — Slice 3: atomic spill/restore.** The unit moves to host / back
+      as one; the safety-net spill (already whole-unit) becomes the only spill
+      path; restore reassembles into the SAME unit (no 3× duplication: device
+      slot + pool slot + net vector; no bypass of StateImageStore residency at
+      `program_impl.h:11285–11298`). Kills the "state without KV" forms.
       *Exit:* 0 "no resident state" lines under pool pressure (e2e phase 12).
-- [ ] **P2.5 — Slice 4: unit LRU/retention + per-session guarantee.** Evict
-      whole units, cost-aware smallest-first; protect an interactive session's
-      unit (≥2 slots: turn-closure + checkpoint); idle-aware recency weight.
-      *Exit:* 0 mid-instance full-root re-prefills in a long-session e2e; the
-      19s safety-net class is gone.
+- [ ] **P2.5 — Slice 4: unit LRU/retention + per-session guarantee.** One LRU
+      over the shared budget, evicting whole units cost-aware smallest-first
+      (kills the 19s class: state can no longer outlive its KV's retention
+      decision); protect an interactive session's unit (≥2 slots: turn-closure
+      + checkpoint); idle-aware recency weight. *Exit:* 0 mid-instance
+      full-root re-prefills in a long-session e2e; the 19s safety-net class is
+      gone.
 - [ ] **P2.6 — config.** `--host-state-slots` derived from (or replaced by) the
       shared budget; document the single `--host-cache-mib`.
 
