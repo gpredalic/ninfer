@@ -395,6 +395,20 @@ shared meter.
       (KV arena + state pool), the safety net's in-arena state budget as the
       template. *Exit:* unit-identity unit tests; accounting matches the sum
       of parts.
+      **Increment 1 shipped `05b77241` (13:55):** `cache_unit.h` —
+      `CacheUnitCost` (kv_bytes + state_image_bytes, overflow-checked,
+      residency-independent by construction) + `cache_unit_kv_bytes`
+      (pages × stride) + `CacheUnitOccupancy` meter (add/remove with
+      overflow/underflow guards). `tests/test_cache_unit.cpp` pins the exit
+      criteria (7 tests, all pass; the page-overflow test caught a real wrap
+      bug in the first draft). Zero existing code touched — the meter is
+      adopted by the pools in P2.4/P2.5. **Increment 2 (next):** wire the
+      meter into the safety-net add/evict/restore sites + expose
+      `host_unit_occupied_bytes` in /stats (needs a deploy + live-window
+      check that the meter tracks entry count × typical cost).
+      The `[plan-state]` diagnostic was removed after the entitlement fix
+      verified live (`45e9450b`, deployed 13:57); the error-only
+      `[state-entitlement]` diagnostic stays until 0 firings over a full day.
       **Concrete design (2026-09-15):**
       - *Unit identity — no new object.* The unit already exists in two forms:
         device = `SequenceState` (`program.h:447`: `kv` bundle + `state`
