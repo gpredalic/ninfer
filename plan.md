@@ -395,6 +395,42 @@ shared meter.
       (KV arena + state pool), the safety net's in-arena state budget as the
       template. *Exit:* unit-identity unit tests; accounting matches the sum
       of parts.
+      **Concrete design (2026-09-15):**
+      - *Unit identity — no new object.* The unit already exists in two forms:
+        device = `SequenceState` (`program.h:447`: `kv` bundle + `state`
+        ActiveStateBinding + `rewrite_state` + `compact_prefix`/`prefix_identity`);
+        host = the safety-net entry (`host_kv_safety_net.h:49–149`: prefix
+        identity + `execution_frontier` + KV allocations + `state_host`/
+        `state_bytes` + checkpoint). P2.2 adds a `unit_cost()` view over both,
+        not a new container.
+      - *One cost (residency-independent).* `unit_cost = kv_bytes +
+        state_image_bytes`. `kv_bytes` = (text_pages + backend_pages) ×
+        page_stride (from the KV bundle / net entry's page counts);
+        `state_image_bytes` = the fixed image size (`host_layout().image_bytes`,
+        independent of frontier — it's the GDN/SSM recurrent state). The cost
+        is the same whether the unit is device- or host-resident — that
+        residency-independence is the whole point (one unit, one cost, so the
+        two pools can be metered together).
+      - *One shared meter (accounting only — eviction stays per-pool until
+        P2.4/P2.5).* Introduce a host-unit byte meter: `occupied = Σ unit_cost`
+        over retained host units. The KV arena's byte occupancy and the state
+        images' bytes are already jointly charged (the safety net stores state
+        images inside the KV arena's byte budget, `set_state_budget_bytes`,
+        `program_impl.h:938`) — that's the template. The HostStatePool's slot
+        count converts to bytes (`slots × image_bytes`) for the meter. RM
+        already snapshots both (`host_kv_occupied_bytes` +
+        `host_state_occupied_slots`, `resource_manager.h:1133–1159`); P2.2
+        combines them into one number. The meter informs admission/retention
+        reasoning; it does not yet drive eviction (that's the LRU slice).
+      - *Unit-identity unit tests (the exit — ctest, no server):* (a) a unit's
+        cost = kv_bytes + state_bytes (assert the arithmetic); (b) the meter's
+        occupancy = Σ unit_cost over retained units; (c) adding/removing a unit
+        changes the meter by exactly its cost; (d) the device and host forms of
+        the same unit report the same cost (residency-independence).
+      - *Regression guard:* the meter is additive (a new cost view + meter),
+        not a rip-out of the two-pool accounting — the existing per-pool
+        eviction keeps working unchanged, so a meter bug degrades to "no
+        improvement," not "wrong eviction."
 - [ ] **P2.3 — Slice 2: atomic admission.** Admit only when the whole unit fits
       the shared host budget; `rewrite_checkpoint_invalid` becomes an admission
       *failure*, not a degraded half-spill. *Exit:* 0 `ckpt_frontier=0` units
