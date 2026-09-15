@@ -785,6 +785,8 @@ public:
     checkpoint_recovery_ns(const SharedPrefixHandle<Variant>& owner,
                            runtime::CheckpointRef checkpoint,
                            const runtime::ContextMachineCostModel& machine_cost) const;
+    [[nodiscard]] bool valid_continuation(const ContinuationHandle<Variant>& handle) const noexcept;
+    [[nodiscard]] bool valid_shared_prefix(const SharedPrefixHandle<Variant>& handle) const noexcept;
     [[nodiscard]] AdmissionCandidate<Variant>
     make_capture_pressure_candidate(const CaptureAssessment& assessment,
                                     const runtime::ContextMachineCostModel& machine_cost) const;

@@ -712,6 +712,10 @@ public:
                         entry.transaction_pins != 0 || entry.summary.active_references != 0) {
                         continue;
                     }
+                    if (!program.valid_shared_prefix(*entry.handle)) {
+                        clear_shared_entry(entry);
+                        continue;
+                    }
                     CaptureAssessment assessment = program.inspect_capture(
                         offer, nullptr, &*entry.handle, private_replacement, true, cost_model_);
                     if (!assessment.publishes_shared) { continue; }
@@ -742,9 +746,13 @@ public:
                 });
             };
             for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
-                const CatalogEntry& entry = catalog_[slot];
+                CatalogEntry& entry = catalog_[slot];
                 if (entry.state != CatalogState::Catalogued || !entry.handle ||
                     entry.active_references != 0) {
+                    continue;
+                }
+                if (!program.valid_continuation(*entry.handle)) {
+                    clear_catalog_entry(entry);
                     continue;
                 }
                 owner_policies.push_back(typename CapturePlanner::OwnerPolicy{
@@ -762,8 +770,12 @@ public:
                 }
             }
             for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
-                const SharedCatalogEntry& entry = shared_catalog_[slot];
+                SharedCatalogEntry& entry = shared_catalog_[slot];
                 if (entry.state != SharedCatalogState::Catalogued || !entry.handle) { continue; }
+                if (!program.valid_shared_prefix(*entry.handle)) {
+                    clear_shared_entry(entry);
+                    continue;
+                }
                 const std::uint32_t ordinal = catalog_count_ + slot;
                 owner_policies.push_back(typename CapturePlanner::OwnerPolicy{
                     .ordinal                  = ordinal,
@@ -1687,9 +1699,13 @@ private:
             checkpoint_policies.reserve(prefix_index_.size());
 
             for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
-                const CatalogEntry& entry = catalog_[slot];
+                CatalogEntry& entry = catalog_[slot];
                 if (entry.state != CatalogState::Catalogued || !entry.handle ||
                     entry.active_references != 0) {
+                    continue;
+                }
+                if (!program.valid_continuation(*entry.handle)) {
+                    clear_catalog_entry(entry);
                     continue;
                 }
                 private_owners.push_back(&*entry.handle);
@@ -1729,9 +1745,13 @@ private:
                 });
             }
             for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
-                const SharedCatalogEntry& entry = shared_catalog_[slot];
+                SharedCatalogEntry& entry = shared_catalog_[slot];
                 if (entry.state != SharedCatalogState::Catalogued || !entry.handle ||
                     entry.transaction_pins != 0 || entry.summary.active_references != 0) {
+                    continue;
+                }
+                if (!program.valid_shared_prefix(*entry.handle)) {
+                    clear_shared_entry(entry);
                     continue;
                 }
                 const std::uint32_t ordinal = catalog_count_ + slot;
@@ -1937,9 +1957,13 @@ private:
             });
         };
         for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
-            const CatalogEntry& entry = catalog_[slot];
+            CatalogEntry& entry = catalog_[slot];
             if (entry.state != CatalogState::Catalogued || !entry.handle ||
                 entry.active_references != 0 || slot == candidate.source_slot) {
+                continue;
+            }
+            if (!program.valid_continuation(*entry.handle)) {
+                clear_catalog_entry(entry);
                 continue;
             }
             projected_owners.push_back(ContextPortfolioOwnerPolicy{
@@ -1957,8 +1981,12 @@ private:
             }
         }
         for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
-            const SharedCatalogEntry& entry = shared_catalog_[slot];
+            SharedCatalogEntry& entry = shared_catalog_[slot];
             if (entry.state != SharedCatalogState::Catalogued || !entry.handle) { continue; }
+            if (!program.valid_shared_prefix(*entry.handle)) {
+                clear_shared_entry(entry);
+                continue;
+            }
             const std::uint32_t ordinal = catalog_count_ + slot;
             projected_owners.push_back(ContextPortfolioOwnerPolicy{
                 .ordinal                = ordinal,

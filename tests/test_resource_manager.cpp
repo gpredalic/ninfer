@@ -894,6 +894,14 @@ public:
         return 0;
     }
 
+    [[nodiscard]] bool valid_continuation(const FakeContinuationHandle&) const noexcept {
+        return true;
+    }
+
+    [[nodiscard]] bool valid_shared_prefix(const FakeSharedPrefixHandle&) const noexcept {
+        return true;
+    }
+
     [[nodiscard]] FakeAdmissionCandidate make_capture_pressure_candidate(
         const FakeCaptureAssessment& assessment,
         const ninfer::runtime::ContextMachineCostModel& machine_cost) const {

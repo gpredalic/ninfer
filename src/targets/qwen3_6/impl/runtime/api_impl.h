@@ -472,6 +472,16 @@ std::uint64_t Program<Variant>::checkpoint_recovery_ns(
 }
 
 template <>
+bool Program<Variant>::valid_continuation(const ContinuationHandle<Variant>& handle) const noexcept {
+    return impl_->valid_continuation(handle);
+}
+
+template <>
+bool Program<Variant>::valid_shared_prefix(const SharedPrefixHandle<Variant>& handle) const noexcept {
+    return impl_->valid_shared_prefix(handle);
+}
+
+template <>
 bool Program<Variant>::shared_capture_matches(const CaptureOffer<Variant>& offer,
                                               const SharedPrefixHandle<Variant>& shared) const {
     return impl_->shared_capture_matches(offer, shared);

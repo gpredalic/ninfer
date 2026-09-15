@@ -652,6 +652,8 @@ public:
     [[nodiscard]] std::uint64_t
     checkpoint_recovery_ns(const SharedPrefixHandle& owner, runtime::CheckpointRef checkpoint,
                            const runtime::ContextMachineCostModel& machine_cost) const;
+    [[nodiscard]] bool valid_continuation(const ContinuationHandle& handle) const noexcept;
+    [[nodiscard]] bool valid_shared_prefix(const SharedPrefixHandle& handle) const noexcept;
     [[nodiscard]] bool shared_capture_matches(const CaptureOffer& offer,
                                               const SharedPrefixHandle& shared) const;
     void skip_capture(CaptureOffer&& offer);
@@ -1159,8 +1161,6 @@ private:
         std::span<const std::uint8_t> terminal, std::span<const std::uint8_t> cancelled,
         runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] bool valid_sequence(SequenceHandle handle) const noexcept;
-    [[nodiscard]] bool valid_continuation(const ContinuationHandle& handle) const noexcept;
-    [[nodiscard]] bool valid_shared_prefix(const SharedPrefixHandle& handle) const noexcept;
     [[nodiscard]] bool valid_capture_offer(const CaptureOffer& offer) const noexcept;
     [[nodiscard]] bool materialization_pins(std::uint32_t index,
                                             std::uint64_t generation) const noexcept;
