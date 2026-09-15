@@ -1172,6 +1172,11 @@ public:
         return slot < catalog_count_ ? catalog_[slot].state : CatalogState::Vacant;
     }
 
+    [[nodiscard]] SharedCatalogState shared_catalog_state(std::uint32_t slot) const noexcept {
+        return slot < shared_catalog_count_ ? shared_catalog_[slot].state
+                                            : SharedCatalogState::Vacant;
+    }
+
     [[nodiscard]] LogicalLaneState lane_state(LaneId lane) const noexcept {
         return lane.value < lane_count_ ? lanes_[lane.value] : LogicalLaneState::Free;
     }

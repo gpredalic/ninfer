@@ -894,12 +894,15 @@ public:
         return 0;
     }
 
+    bool stale_private_probe = false;
+    bool stale_shared_probe  = false;
+
     [[nodiscard]] bool valid_continuation(const FakeContinuationHandle&) const noexcept {
-        return true;
+        return !stale_private_probe;
     }
 
     [[nodiscard]] bool valid_shared_prefix(const FakeSharedPrefixHandle&) const noexcept {
-        return true;
+        return !stale_shared_probe;
     }
 
     [[nodiscard]] FakeAdmissionCandidate make_capture_pressure_candidate(
@@ -2644,6 +2647,59 @@ void test_shared_capture_combines_two_pressure_owners() {
     (void)finish_active(manager, program, active);
 }
 
+void test_stale_shared_catalog_entry_is_self_healed() {
+    FakeManager manager = make_manager(2, 4, 1);
+    FakeProgram program;
+    const ActiveRequest first = start_active(manager, program, 41, make_base(41), 1);
+    (void)finish_active(manager, program, first);
+    const ActiveRequest second = start_active(manager, program, 42, make_base(42), 2);
+    (void)finish_active(manager, program, second);
+
+    FakeRequestBasePlan shared_request = make_base(43);
+    shared_request.cache.opportunities.push_back(FakeContextCache::Opportunity{
+        .kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+        .evidence = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+        .frontier = 64,
+    });
+    const ActiveRequest active           = start_active(manager, program, 43, shared_request, 3);
+    program.required_pressure_actions    = 2;
+    program.pressure_action_immediate_ns = 0;
+    program.capture_assessment           = FakeCaptureAssessment{
+                  .shortlist_key          = FakeShortlistKey{.digest = 43, .frontier = 64},
+                  .shared_evidence        = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+                  .protected_rebuild_work = PrefillWork{.tokens = 64},
+                  .projected_recovery_ns  = 0,
+                  .publishes_shared       = true,
+                  .physically_feasible    = false,
+    };
+    const auto reserved =
+        manager.reserve_active_capture(program, active.lane, FakeCaptureOffer{.id = 7}, 0, {});
+    require(reserved == FakeManager::ActiveCaptureReserveResult::Reserved,
+            "shared capture did not reserve a multi-owner pressure target");
+    auto progress = manager.progress_context_transaction(program, {});
+    (void)std::get<FakeManager::ActiveCaptureOutcome>(std::move(progress));
+    require(manager.shared_catalog_state(0) == FakeManager::SharedCatalogState::Catalogued,
+            "shared capture publication did not catalogue the shared entry");
+
+    // The runtime has since recycled the prefix's slot (e.g. fit-gate stage-2
+    // relief released the idle shared prefix), but RM's catalog still holds the
+    // entry: the next capture planning must not throw on the stale handle —
+    // it must self-heal (clear) the entry and plan around it.
+    program.stale_shared_probe = true;
+    const ActiveRequest third = start_active(manager, program, 44, make_base(44), 4);
+    program.capture_assessment = FakeCaptureAssessment{
+        .shortlist_key     = FakeShortlistKey{.digest = 44, .frontier = 24},
+        .publishes_private = true,
+    };
+    program.capture_summary.endpoint = endpoint(44, 24);
+    const auto rereserved =
+        manager.reserve_active_capture(program, third.lane, FakeCaptureOffer{.id = 8}, true, {});
+    require(rereserved == FakeManager::ActiveCaptureReserveResult::Reserved,
+            "stale shared catalog entry aborted the next capture planning");
+    require(manager.shared_catalog_state(0) == FakeManager::SharedCatalogState::Vacant,
+            "stale shared catalog entry was not self-healed");
+}
+
 void test_terminal_fallback_releases_failed_retention() {
     FakeManager manager = make_manager(1, 1);
     FakeProgram program;
@@ -2804,6 +2860,8 @@ int main() {
              test_repeated_private_reuse_selects_zero_prefill_shared_promotion);
     run_test("shared capture multi-owner pressure",
              test_shared_capture_combines_two_pressure_owners);
+    run_test("stale shared catalog self-heal",
+             test_stale_shared_catalog_entry_is_self_healed);
     run_test("terminal fallback", test_terminal_fallback_releases_failed_retention);
     run_test("terminal waits for resource transaction",
              test_terminal_settlement_waits_for_open_resource_transaction);
