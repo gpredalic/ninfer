@@ -551,6 +551,57 @@ shared meter.
       slot + pool slot + net vector; no bypass of StateImageStore residency at
       `program_impl.h:11285–11298`). Kills the "state without KV" forms.
       *Exit:* 0 "no resident state" lines under pool pressure (e2e phase 12).
+      **Design (2026-09-15, from prod evidence + topology map):** The e2e
+      exit (32k ctx, 4 GiB host KV) does NOT reproduce the prod loss class —
+      prod shows `[materialize] materialization source has no resident state —
+      falling back to root prefill` at 18–81% of completed requests per
+      20-min window (64 occurrences 22:00–23:38, pre-existing: 49 in the
+      88-min pre-P2.5 window). Episode 23:32:15: a 129k-prompt follow-up finds
+      catalogued sources (`prefix HIT (rewrite)`, frontiers 105k–127k), but
+      the chosen source has `device.state_slots==0 && host.state_slots==0`
+      (`program_impl.h:4930`) → throw → root prefill (ttft ~4× a restore).
+      Root cause: the unit invariant is enforced in the NET (P2.3/P2.5) but
+      NOT in the device/host pools — state and KV are demoted/evicted as
+      INDEPENDENT resources, so the two halves of a unit die separately:
+      - state-only demotes: `PressureStateDecision::Demote{Endpoint,Rewrite,
+        Shared}ToHost` (planner gate 1676–1730, prepare 5897–5928, publish
+        6025–6041) + `demote_checkpoints_to_make_room` 4766–4797;
+      - KV-only demotes: `PressureKVDecisionKind::DemoteToHost` →
+        `host_kv_extents` (prepare 5960–6000, publish 6042–6070) — the KV
+        stays restorable while its state is managed separately;
+      - replica drops: `make_host_slot_available` (state_image_store.h:401,
+        drops the coldest BOTH host replica) and `drop_device_replica`
+        (state_image_store.h:355) convert a Both unit to one-replica; the
+        last replica is then lost via object release / host-pool LRU.
+      Result: "KV without state" (KV device-resident or in extents, state
+      gone) → materialize has no state to restore → root prefill. The net
+      restore path (find/take_pinned, state H2D 11555–11590) is correct and
+      already runs at fallback time — the episode's safety-find missed only
+      because the unit was NOT in the net (its state was lost before any
+      spill happened). Increments:
+      - **Increment 1 — spill-before-loss (kill the unit split).** At the
+        point a unit's state is about to lose its LAST replica (device-slot
+        release under pressure; host-replica drop/eviction), if the unit's KV
+        is still retained (device-resident or in extents) and the unit is
+        retention-eligible, spill the COMPLETE unit to the net (existing
+        spill path; state host→host move, KV D2H or extent-backed) instead of
+        letting the state die. Net refuses (ineligible/full) → allow the loss
+        (graceful degrade = today's behavior, logged). Step 0: trace the exact
+        loss path in prod (which demote/drop/release sequence produces the
+        zero-residency state — the state-lease lines around a fallback show
+        the refusals). *Exit:* 0 prod `no resident state` fallbacks where the
+        unit's KV was still retained; e2e suite green.
+      - **Increment 2 — net as the unit's host home (census + move-not-copy).**
+        The net's `state_host` buffers are untracked host replicas (invisible
+        to the store census, state_image_store.h:166–205) and net restore
+        writes via raw `copy_from_host` (11580–11585). Unify: net entries
+        reference store host slots (kill the 6462–6470/6527–6530 memcpys) or
+        the census counts net buffers; after a net retain, release the store
+        replica so the net entry is the sole host copy (3× → 1×).
+      - **Increment 3 — retire per-replica demotes.** The pressure planner
+        demotes whole units, not replicas: retire the state-only and KV-only
+        demote decisions; the safety-net spill becomes the only device→host
+        path. (Largest risk; do last, after #7's full gate.)
 - [x] **P2.5 — Slice 4: unit LRU/retention + per-session guarantee.** One LRU
       over the shared budget, evicting whole units cost-aware smallest-first
       (kills the 19s class: state can no longer outlive its KV's retention

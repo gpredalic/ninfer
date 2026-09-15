@@ -4929,6 +4929,24 @@ bool ProgramImplCore::prepare_materialization(MaterializationTransaction& transa
                                           : nullptr;
     if (source_state != nullptr && resident_resources(*source_state).device.state_slots == 0 &&
         resident_resources(*source_state).host.state_slots == 0) {
+        // P2.4 step 0: trace the loss path — the zero-residency source's
+        // identity plus the store census at the moment materialization fails.
+        const SequenceState& src = *source_state;
+        const auto hist = state_store ? state_store->residency_histogram()
+                                      : StateImageStore::ResidencyHistogram{};
+        std::fprintf(stderr,
+                     "[materialize] DIAG no-resident-state: source=%u gen=%llu frontier=%u "
+                     "read_valid=%d write_valid=%d rewrite_valid=%d "
+                     "store(device=%u host=%u pend_d=%u pend_h=%u dual=%u hostonly=%u)\n",
+                     transaction.source_index,
+                     (unsigned long long)continuation_slots[transaction.source_index].generation,
+                     src.execution_frontier,
+                     (int)(state_store != nullptr && state_store->valid(src.state.read)),
+                     (int)(state_store != nullptr && state_store->valid(src.state.write)),
+                     (int)(src.rewrite_state.has_value() && state_store != nullptr &&
+                           state_store->valid(*src.rewrite_state)),
+                     hist.device_slots, hist.host_slots, hist.pending_device_slots,
+                     hist.pending_host_slots, hist.dual_resident, hist.host_only);
         throw std::logic_error("materialization source has no resident state");
     }
 
