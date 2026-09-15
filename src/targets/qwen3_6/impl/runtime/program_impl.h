@@ -6600,47 +6600,96 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index) no
         entry.checkpoint_frontier = checkpoint_frontier;
         entry.checkpoint_state_host = std::move(checkpoint_state_host);
         entry.checkpoint_state_bytes = checkpoint_state_bytes;
-        // P2.3 atomic retention: a cache unit is {attention KV + GDN state}
-        // and is retained whole or not at all. A unit is COMPLETE iff its
-        // endpoint state image is present AND (no rewrite checkpoint is
-        // expected for it, or its rewrite checkpoint state was captured).
-        // Two incompleteness classes used to be retained as half-units; both
-        // are now ABORTs:
-        //  (a) endpoint state missing — the unit's state at its execution
-        //      frontier is gone (state-pool LRU evicted it, the 19s class).
-        //      The old endpoint_fallback consumed the earlier checkpoint
-        //      state as the endpoint state while the ledger/identity kept
-        //      the full execution frontier — a frontier/state/ledger
-        //      mismatch. The unit is incomplete at its frontier: retain
-        //      nothing (P2.5's unit LRU stops the eviction that causes this).
-        //  (b) rewrite checkpoint expected but uncaptured — the
-        //      thinking-mode follow-up's restore frontier has no state. The
-        //      ckpt-miss diagnostic above already logged the reason; a
-        //      half unit is not a unit, so retain nothing.
+        // P2.5: retain the unit at its DEEPEST COMPLETE frontier. A unit is
+        // {KV[0..F] + state@F}: the retained state image must correspond to
+        // the retained KV prefix (KV columns are append-only, so a captured
+        // state@C corresponds to the current KV prefix [0..C]). Three cases:
+        //  (1) endpoint state present → retain at the endpoint frontier
+        //      (the full unit, with its checkpoint as a secondary restore
+        //      point when captured).
+        //  (2) endpoint state missing, checkpoint present → the endpoint was
+        //      superseded (a rewrite-restore rewind superseded it — the
+        //      thinking-mode norm) or lost to state-pool pressure (the 19s
+        //      class). The unit is still complete AT THE CHECKPOINT
+        //      FRONTIER: state@C corresponds to the immutable KV prefix
+        //      [0..C]. Retain it there, truncated to C — the next turn
+        //      matches the checkpoint prefix and restores from host instead
+        //      of re-prefilling from root.
+        //  (3) no state image anywhere → not a unit: retain nothing.
         const bool checkpoint_expected =
             sequence.rewrite_checkpoint.valid && sequence.rewrite_checkpoint.frontier != 0;
-        if (entry.state_bytes == 0 || entry.state_host.empty()) {
+        if (entry.state_bytes > 0 && !entry.state_host.empty()) {
+            if (!checkpoint_expected || checkpoint_valid) {
+                // Complete at the endpoint frontier. The identity is COPIED
+                // (not swapped): a demoted-not-evicted victim keeps living
+                // and must keep matching on its next turn.
+                entry.prefix_identity = const_cast<SequenceState&>(sequence).prefix_identity;
+                std::fprintf(stderr,
+                             "[safety-spill] OK: index=%u frontier=%u ckpt_valid=%d ckpt_frontier=%u "
+                             "ledger=%zu identity=%zu\n",
+                             index, entry.execution_frontier, static_cast<int>(checkpoint_valid),
+                             checkpoint_frontier, entry.ledger.size(), entry.prefix_identity.size());
+                host_kv_safety_net.add(std::move(entry));
+            } else {
+                // A thinking session with an uncaptured checkpoint cannot
+                // serve its next (rewound) turn from an endpoint-only unit,
+                // and the host arena is the binding resource — don't bank a
+                // unit the workload cannot use.
+                std::fprintf(stderr,
+                             "[safety-spill] ABORT: index=%u frontier=%u reason=rewrite_checkpoint_uncaptured "
+                             "(ckpt_frontier=%u) — a checkpoint-less unit cannot serve this "
+                             "session's rewound follow-up; [checkpoint] unit-not-retained\n",
+                             index, sequence.execution_frontier,
+                             sequence.rewrite_checkpoint.frontier);
+            }
+        } else if (checkpoint_valid && entry.checkpoint_state_bytes > 0 &&
+                   !entry.checkpoint_state_host.empty() && checkpoint_frontier > 0 &&
+                   checkpoint_frontier <= entry.execution_frontier) {
+            // Retain the unit at the checkpoint frontier — the deepest
+            // frontier with a state image.
+            const std::uint32_t frontier = checkpoint_frontier;
+            const std::uint32_t be_frontier =
+                (speculative_backend == SpeculativeBackend::Mtp && frontier > 0) ? frontier - 1U
+                                                                                 : frontier;
+            entry.state_bytes = entry.checkpoint_state_bytes;
+            entry.state_host  = std::move(entry.checkpoint_state_host);
+            entry.checkpoint_valid       = false;
+            entry.checkpoint_frontier    = 0;
+            entry.checkpoint_state_bytes = 0;
+            entry.checkpoint_state_host.clear();
+            entry.execution_frontier = frontier;
+            entry.ledger.resize(frontier);
+            entry.compact_prefix.resize(
+                std::min(entry.compact_prefix.size(), static_cast<std::size_t>(frontier)));
+            entry.text_page_count =
+                std::min(entry.text_page_count, kv_pages_for_frontier(frontier));
+            entry.backend_page_count =
+                backend_pages != 0
+                    ? std::min(entry.backend_page_count, kv_pages_for_frontier(be_frontier))
+                    : 0;
+            if (entry.text_source_pages.size() > entry.text_page_count) {
+                entry.text_source_pages.resize(entry.text_page_count);
+            }
+            if (entry.backend_source_pages.size() > entry.backend_page_count) {
+                entry.backend_source_pages.resize(entry.backend_page_count);
+            }
+            entry.prefix_identity = const_cast<SequenceState&>(sequence).prefix_identity;
+            if (entry.prefix_identity.size() > frontier) {
+                entry.prefix_identity.truncate(frontier);
+            }
             std::fprintf(stderr,
-                         "[safety-spill] ABORT: index=%u frontier=%u reason=endpoint_state_missing "
-                         "— the unit is incomplete at its execution frontier (KV and state are "
-                         "one atomic unit); [checkpoint] unit-not-retained\n",
-                         index, sequence.execution_frontier);
-        } else if (checkpoint_expected && !checkpoint_valid) {
-            std::fprintf(stderr,
-                         "[safety-spill] ABORT: index=%u frontier=%u reason=rewrite_checkpoint_uncaptured "
-                         "(ckpt_frontier=%u) — a half unit is not a unit; "
-                         "[checkpoint] unit-not-retained\n",
-                         index, sequence.execution_frontier,
-                         sequence.rewrite_checkpoint.frontier);
-        } else {
-            // Complete unit: move the identity in and retain.
-            entry.prefix_identity.swap(const_cast<SequenceState&>(sequence).prefix_identity);
-            std::fprintf(stderr,
-                         "[safety-spill] OK: index=%u frontier=%u ckpt_valid=%d ckpt_frontier=%u "
-                         "ledger=%zu identity=%zu\n",
-                         index, entry.execution_frontier, static_cast<int>(checkpoint_valid),
-                         checkpoint_frontier, entry.ledger.size(), entry.prefix_identity.size());
+                         "[safety-spill] OK: index=%u frontier=%u ckpt_valid=0 ckpt_frontier=%u "
+                         "ledger=%zu identity=%zu at-ckpt=1 — endpoint state superseded/evicted; "
+                         "unit retained complete at its checkpoint frontier\n",
+                         index, entry.execution_frontier, frontier,
+                         entry.ledger.size(), entry.prefix_identity.size());
             host_kv_safety_net.add(std::move(entry));
+        } else {
+            std::fprintf(stderr,
+                         "[safety-spill] ABORT: index=%u frontier=%u reason=no_state_image — no "
+                         "endpoint or checkpoint state image; KV and state are one atomic unit; "
+                         "[checkpoint] unit-not-retained\n",
+                         index, sequence.execution_frontier);
         }
     } catch (const std::exception& e) {
         // Safety net is best-effort. Log the error so silent failures are

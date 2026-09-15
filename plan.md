@@ -558,6 +558,74 @@ shared meter.
       + checkpoint); idle-aware recency weight. *Exit:* 0 mid-instance
       full-root re-prefills in a long-session e2e; the 19s safety-net class is
       gone.
+      **Design (2026-09-15, from the P2.3 e2e + live journal evidence):**
+      The dominant unit-loss class is `endpoint_state_missing` (95/95 in the
+      P2.3 e2e; live flood 19:20–19:31: 80k–297k-token units, all
+      `ckpt_valid=1`). Root cause traced in the e2e log: thinking-mode
+      follow-ups always rewind to the rewrite checkpoint (preserve_thinking=off
+      drops reasoning), and the rewrite-restore path releases the superseded
+      endpoint state (`program_impl.h:11194`) — the live unit of a thinking
+      session lives at the CHECKPOINT frontier, not the endpoint. The old
+      `endpoint_fallback` retained exactly this (state@C + KV,
+      execution_frontier=C) and was CORRECT: `find()` bounds matching by
+      `execution_frontier`, so the retained {KV[0..C], state@C} is a complete
+      unit — my P2.3 "frontier/state/ledger mismatch" analysis was wrong
+      (the ledger beyond C is never compared). P2.5 restores that retention,
+      done as a true complete unit:
+      - **Increment 1 — retain the deepest complete frontier.** In the spill:
+        endpoint state present → retain at the endpoint (with the checkpoint
+        if captured; a capture failure no longer aborts the whole unit — the
+        unit is complete at the endpoint, the ckpt-miss diagnostic stays).
+        Endpoint missing, checkpoint present → retain the unit TRUNCATED to
+        the checkpoint frontier (execution_frontier/ledger/identity/
+        compact_prefix/page counts all at C; the checkpoint state becomes the
+        unit's state; the dead tail KV[C..E] is not advertised — the arena
+        keeps the physical allocation until eviction, the meter counts the
+        logical unit). No state at all → abort (a true non-unit). Also: the
+        identity moves into the entry by COPY, not swap — a demoted-not-
+        evicted victim keeps its identity (fixes the latent silent-root-
+        re-prefill bug noted in P2.3). *Exit:* 0 `endpoint_state_missing`
+        aborts with `ckpt_valid=1` in e2e + journal; the 19s safety-net
+        restores return.
+      - **Increment 2 — per-session guarantee in net eviction.**
+        `select_eviction_victim` skips units whose session is currently
+        active (session_key matches a Catalogued/Active continuation) in the
+        live tier — idle sessions' units go first; an active session's unit
+        is evictable only when nothing else is. *Exit:* 0 evictions of an
+        active session's unit while idle units remain.
+      **Design (2026-09-15, from the P2.3 e2e + live journal evidence):**
+      The dominant unit-loss class is `endpoint_state_missing` (95/95 in the
+      P2.3 e2e; live flood 19:20–19:31: 80k–297k-token units, all
+      `ckpt_valid=1`). Root cause traced in the e2e log: thinking-mode
+      follow-ups always rewind to the rewrite checkpoint (preserve_thinking=off
+      drops reasoning), and the rewrite-restore path releases the superseded
+      endpoint state (`program_impl.h:11194`) — the live unit of a thinking
+      session lives at the CHECKPOINT frontier, not the endpoint. The old
+      `endpoint_fallback` retained exactly this (state@C + KV,
+      execution_frontier=C) and was correct: `find()` bounds matching by
+      `execution_frontier`, so the retained unit {KV[0..C], state@C} is
+      complete — my P2.3 "frontier/state/ledger mismatch" analysis was wrong
+      (the ledger beyond C is never compared). P2.5 restores that retention,
+      done as a true complete unit:
+      - **Increment 1 — retain the deepest complete frontier.** In the spill:
+        endpoint state present → retain at the endpoint (with the checkpoint
+        if captured; the `rewrite_checkpoint_uncaptured` abort stays — a
+        thinking unit without its checkpoint cannot serve its next turn and
+        the arena is the binding resource). Endpoint missing, checkpoint
+        present → retain the unit TRUNCATED to the checkpoint frontier
+        (execution_frontier/ledger/identity/compact_prefix/page counts all
+        at C; the checkpoint state becomes the unit's state; the dead tail
+        KV[C..E] is not advertised — the arena keeps the physical allocation
+        until eviction, the meter counts the logical unit). No state at all →
+        abort (a true non-unit). *Exit:* 0 `endpoint_state_missing` aborts
+        with `ckpt_valid=1` in e2e + journal; the 19s safety-net restores
+        return.
+      - **Increment 2 — per-session guarantee in net eviction.**
+        `select_eviction_victim` skips units whose session is currently
+        active (session_key matches a Catalogued/Active continuation) in the
+        live tier — idle sessions' units go first; active-session units are
+        evictable only when nothing else is evictable. *Exit:* 0 evictions
+        of an active session's unit while idle units remain.
 - [ ] **P2.6 — config.** `--host-state-slots` derived from (or replaced by) the
       shared budget; document the single `--host-cache-mib`.
 
