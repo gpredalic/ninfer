@@ -3,7 +3,13 @@
 #
 # Restarts ninfer.service when the engine is wedged: work pending, nothing
 # executing. Signature: running=0 prefilling=0 decode_ready=0 AND
-# (waiting>=1 OR materializing>=1), sustained 90s.
+# (waiting>=1 OR materializing>=1), sustained 150s.
+#
+# The threshold MUST exceed the engine's 120s fit-gate defer deadline: a
+# deferring request is in progress with a bounded deadline (it aborts
+# cleanly at 120s), not a wedge. 2026-09-15 06:33 episode: the old 90s
+# threshold restarted the server 23s before the engine's own clean abort,
+# destroying all caches (~55s root re-prefill per subsequent request).
 #
 #   Class A: request queued, engine idle        (waiting>=1, materializing=0)
 #   Class B: stuck in deferred materialization  (materializing>=1) — the
@@ -78,7 +84,7 @@ while true; do
     elif [ "$w" -ge 1 ] || [ "$m" -ge 1 ]; then
       if [ "$armed_since" = "0" ]; then
         armed_since=$now
-        echo "WEDGE ARMED: r=$r p=$p d=$d w=$w m=$m — restart in 90s if it persists"
+        echo "WEDGE ARMED: r=$r p=$p d=$d w=$w m=$m — restart in 150s if it persists"
       fi
     else
       armed_since=0

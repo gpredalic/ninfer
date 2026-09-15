@@ -125,7 +125,7 @@ development. Each is verified with the P0 e2e gate + the live journal.
       the summary-less Retained branch — the publication slot IS that slot, and
       the stale handle was what threw `active publication cell retained an
       inactive capability` (1:1 with every fallback).
-- [ ] **P1.2 — triage + fix the sporadic error classes.**
+- [x] **P1.2 — triage + fix the sporadic error classes.**
       `replacement effect changed` (`program_impl.h:9325`), `entitlement is
       inconsistent` (`program_impl.h:11647`), and (new, 22:10:58) `staged MTP
       bridge is outside the reusable suffix` (`program_impl.h:12544`). All are
@@ -172,8 +172,16 @@ development. Each is verified with the P0 e2e gate + the live journal.
       stale` (00:44:47, same RM view-lag class, `checkpoint_recovery_ns`
       sites). Note: 5 pre-existing `ninfer_resource_manager_test` failures
       (materialization-abort/retention planner-policy tests) fail identically
-      on the pre-change baseline — not caused by this fix. *Exit:* 0 of each in
-      a saturated e2e + journal window.
+      on the pre-change baseline — not caused by this fix. **Verified
+      06:18–06:35 live window:** 0 of every class since the 06:18:57 deploy
+      (51 requests done, 27 relief events incl. a stage-2 shared-prefix
+      release — the 06:14:37 trigger repeated at 06:24:08 with no error);
+      all earlier firings predate their fixes (MTP: 00:53/01:23 < 01:34
+      deploy; replacement-effect: 00:25/00:37 < 090dcdb5). Regression test
+      `179716cd` pins the RM self-heal class. *Exit:* 0 of each in
+      a saturated e2e + journal window — **met via the live window** (the
+      32k e2e swap was skipped: the live traffic already exercised the same
+      episodes, and the swap would freeze the user's sessions).
 - [x] **P1.3 — device KV: free pages from idle sessions.** `47406f79`. While a
       fit-gate defer is in flight and free pages have not grown for 15s, the
       gate demotes the largest idle continuation to the host safety net and
@@ -220,7 +228,24 @@ development. Each is verified with the P0 e2e gate + the live journal.
       branches of ONE large conversation (user-confirmed), so their unique
       tails are small; the pool is pinned by the shared prefix + the live
       conversation's own working set, and the incoming turn cannot fit by
-      construction. Fix direction: (a) rank relief victims by *unique*
+      construction. Quantified 09-15 (post-fix binary, decisive for P1.5d):
+      06:13 req 58 (93k tokens) needed 1958 pages, free 1891; 12
+      idle-continuation demotions + a stage-2 release of shared prefix 3
+      (2898 *resident* pages) freed almost nothing — the request errored at
+      94.8s of deferring (the capture bug, since fixed). 06:24 req 26 (132k
+      tokens) needed 2566, free 2410: relief + a stage-2 release + a 131k-
+      token safety-net restore fit it (ttft 16s, queue 15.4s). 06:31 a
+      2971-page demand sat at free 1449→1534 through 90s of relief (85 pages
+      gained) — the demoted victims' pages are shared with the live
+      conversation's working set, so per-victim demotion is nearly inert and
+      the demand cannot fit by construction; the wedge sentinel (90s
+      threshold) restarted the server at 97s, 23s before the engine's own
+      120s clean abort — destroying all caches (~55s root re-prefill per
+      subsequent request). Sentinel threshold raised to 150s (must exceed
+      the 120s defer deadline; see P1.6). The
+      pool is pinned by ONE live conversation's working set + its host-state
+      restore target; only (d) visible queuing / unit-grade demotion (P2.4)
+      changes this. Fix direction: (a) rank relief victims by *unique*
       (non-shared) resident pages, not mapped pages — **done `a53db4b4`**;
       (b) batch-demote until the demand fits (bounded per tick), not one per
       15s — **done `a53db4b4`**; (c) make the **shared prefix itself a demotion unit** — **stage 2 shipped `f02bc048`**: when no private victim exists, relief releases the idle shared prefix entry (Catalogued, active_references==0, not the transaction's shared source) with the most resident pages; content survives in the safety net via spilled turn continuations. **Regression:** its admission→reserve race with pending captures (victim chosen at admission, pinned only at reserve) threw `capture replacement capability is stale` 38× — fixed by the `622c841d` degrade-to-no-replacement (runtime-reserve side) and `4e712ab3` RM catalog probe (RM-planning side; see P1.2). Full unit-grade version (D2H spill of the shared prefix as one {KV + state} unit) is P2.4; also noted: the incoming restore allocates NEW device pages for a prefix that is already device-resident (identity-based restore is the deeper fix); (d) admission
@@ -246,14 +271,20 @@ development. Each is verified with the P0 e2e gate + the live journal.
       recoveries) and a stale admission candidate is skipped (inspect MISS)
       instead of throwing. The wedge sentinel
       (`tools/monitor/wedge-sentinel.sh`, now the standalone
-      `ninfer-wedge-sentinel.service`) is the tripwire: it restarts after 90s
+      `ninfer-wedge-sentinel.service`) is the tripwire: it restarts after 150s
       of that state (3-in-30-min cap) — **every firing is a timestamped data
       point to investigate, and the goal is zero firings.** v1 fired twice
       (22:56:12, 23:12:04 — both class-A); the user-experienced gap was the
       class-B `m=1` blind spot. v2 (`478054b9`) after the 23:12 episode:
       /stats primary, journal fallback, armed timer held through engine
       silence (v1 reset on a missing line and ran stale code — bash does not
-      reload on-disk edits). *Exit:* (a) the
+      reload on-disk edits). **06:33:30 (09-15): the 90s threshold raced the
+      engine's 120s defer deadline** — a bounded-defer request (m=1, 2971
+      pages vs 1534 free) was restarted at 97s, 23s before the engine's own
+      clean deadline abort, destroying all caches (~55s root re-prefill per
+      subsequent request). A bounded defer is in-progress, not a wedge:
+      threshold raised to 150s (must exceed the 120s deadline + margin).
+      *Exit:* (a) the
       15:15 stall class is diagnosed (what state holds `materializing`
       without progress, and why admission stops promoting); (b) every stuck
       state has a bounded progress guarantee — it progresses or the request
