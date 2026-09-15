@@ -679,11 +679,14 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
     }
     if (source != nullptr && is_rewrite_checkpoint_restore(plan->reuse) &&
         plan->source_disposition == runtime::ClaimDisposition::ConsumedToActive) {
+        const bool retain_rw =
+            plan->rewrite_disposition == RewriteCheckpointDisposition::RetainExisting &&
+            source->rewrite_state.has_value();
+        const StateImageHandle rw_state = retain_rw ? *source->rewrite_state : StateImageHandle{};
         std::vector<StateImageHandle> optional_states;
         optional_states.reserve(1U + source->long_anchors.size());
-        if (plan->rewrite_disposition == RewriteCheckpointDisposition::RetainExisting &&
-            source->rewrite_state) {
-            optional_states.push_back(*source->rewrite_state);
+        if (retain_rw) {
+            optional_states.push_back(rw_state);
         }
         for (const LongAnchorCheckpoint& anchor : source->long_anchors) {
             if (anchor.frontier > plan->reuse_base) { continue; }
@@ -699,8 +702,17 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
             unique.push_back(state);
             if (!state_exclusive_to_sequence(*source, state)) { continue; }
             const StateReplicaResidency residency = state_store->residency(state);
+            const bool is_rw = retain_rw && state == rw_state;
+            // The retained rewrite checkpoint is always device-resident after
+            // materialization (the rewrite-restore path H2D-restores it if it is
+            // HostOnly), so it counts a device slot even when currently HostOnly.
+            // A HostOnly rewrite checkpoint can never be the active state (which
+            // is always device-resident), so this cannot double-count. Anchors are
+            // not restored in this path, so they count a device slot only when
+            // already device-resident.
             if (residency == StateReplicaResidency::DeviceOnly ||
-                residency == StateReplicaResidency::Both) {
+                residency == StateReplicaResidency::Both ||
+                (is_rw && residency == StateReplicaResidency::HostOnly)) {
                 ++plan->active_optional_resources.device.state_slots;
             }
             if (residency == StateReplicaResidency::HostOnly ||
