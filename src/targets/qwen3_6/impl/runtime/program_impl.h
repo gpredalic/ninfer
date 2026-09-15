@@ -6656,6 +6656,28 @@ std::uint64_t ProgramImplCore::host_kv_net_state_bytes() const noexcept {
     return host_kv_safety_net.retained_state_bytes();
 }
 
+std::uint64_t ProgramImplCore::host_unit_occupied_bytes() const noexcept {
+    // P2.2 (#7 Slice 1): one number across the two host pools that were
+    // accounted separately — the safety net's retained units (KV page bytes +
+    // state image bytes per unit) plus the host state pool's demoted
+    // checkpoints (slots x image bytes).
+    std::uint64_t total = host_kv_safety_net.unit_occupied_bytes(text_host_kv_page_stride,
+                                                                 backend_host_kv_page_stride);
+    if (state_store && host_state_images) {
+        const std::uint64_t pool =
+            static_cast<std::uint64_t>(state_store->host_occupied()) *
+            static_cast<std::uint64_t>(host_state_images->layout().image_bytes);
+        total = total > std::numeric_limits<std::uint64_t>::max() - pool
+                    ? std::numeric_limits<std::uint64_t>::max()
+                    : total + pool;
+    }
+    return total;
+}
+
+std::uint32_t ProgramImplCore::host_unit_count() const noexcept {
+    return static_cast<std::uint32_t>(host_kv_safety_net.size());
+}
+
 std::uint64_t ProgramImplCore::host_kv_superseded_count() const noexcept {
     return host_kv_safety_net.superseded_count();
 }

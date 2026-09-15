@@ -26,6 +26,8 @@
 
 #include <cstdint>
 
+#include <limits>
+
 #include <optional>
 
 #include <span>
@@ -545,6 +547,45 @@ public:
                state_retained_bytes_;
     }
 
+    // P2.2 (#7 Slice 1): the shared meter over host unit occupancy — the sum of
+    // each retained unit's cost (KV page bytes + state image bytes). One number
+    // across the KV and state halves, instead of the two pools accounted
+    // separately. Computed on demand so it is always the sum of the parts (no
+    // incremental bookkeeping to drift); P2.4/P2.5 adopt the incremental
+    // CacheUnitOccupancy when eviction moves whole units. Saturates instead of
+    // throwing: this is a gauge, not an admission check.
+    [[nodiscard]] std::uint64_t unit_occupied_bytes(std::uint64_t text_stride,
+                                                    std::uint64_t backend_stride) const noexcept {
+        if (text_stride == 0 || backend_stride == 0) { return 0; }
+        std::uint64_t total = 0;
+        for (const HostKVSafetyNetEntry& entry : entries_) {
+            const std::uint64_t text_pages    = entry.text_page_count;
+            const std::uint64_t backend_pages = entry.backend_page_count;
+            const std::uint64_t text_bytes =
+                text_pages > std::numeric_limits<std::uint64_t>::max() / text_stride
+                    ? std::numeric_limits<std::uint64_t>::max()
+                    : text_pages * text_stride;
+            const std::uint64_t backend_bytes =
+                backend_pages > std::numeric_limits<std::uint64_t>::max() / backend_stride
+                    ? std::numeric_limits<std::uint64_t>::max()
+                    : backend_pages * backend_stride;
+            const std::uint64_t kv_bytes =
+                text_bytes > std::numeric_limits<std::uint64_t>::max() - backend_bytes
+                    ? std::numeric_limits<std::uint64_t>::max() - backend_bytes
+                    : text_bytes + backend_bytes;
+            const std::uint64_t state_bytes = entry_state_bytes(entry);
+            const std::uint64_t unit =
+                kv_bytes > std::numeric_limits<std::uint64_t>::max() - state_bytes
+                    ? std::numeric_limits<std::uint64_t>::max() - kv_bytes
+                    : kv_bytes + state_bytes;
+            total = total > std::numeric_limits<std::uint64_t>::max() - unit
+                        ? std::numeric_limits<std::uint64_t>::max()
+                        : total + unit;
+        }
+        return total;
+    }
+
+
     [[nodiscard]] static std::size_t entry_state_bytes(const HostKVSafetyNetEntry& entry) noexcept {
         return entry.state_bytes + entry.checkpoint_state_bytes;
     }
@@ -568,6 +609,7 @@ public:
         return static_cast<std::size_t>(entry.text_page_count) +
                static_cast<std::size_t>(entry.backend_page_count);
     }
+
 
     // Victim selection shared by both eviction loops (retain_state_capture and
     // the spill's evict loop). Two tiers:

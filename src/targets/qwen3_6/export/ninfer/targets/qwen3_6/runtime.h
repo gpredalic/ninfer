@@ -736,6 +736,11 @@ public:
     // Host-KV safety-net gauges: entry count and retained state-image bytes.
     [[nodiscard]] std::uint32_t host_kv_net_entries() const noexcept;
     [[nodiscard]] std::uint64_t host_kv_net_state_bytes() const noexcept;
+    // P2.2 (#7 Slice 1): shared meter over host unit occupancy — the sum of
+    // each retained unit's cost (KV page bytes + state image bytes) across the
+    // safety net, plus the host state pool's demoted-checkpoint bytes.
+    [[nodiscard]] std::uint64_t host_unit_occupied_bytes() const noexcept;
+    [[nodiscard]] std::uint32_t host_unit_count() const noexcept;
     // Cumulative entries dropped by supersede-on-add (a newer entry for the
     // same conversation made them redundant).
     [[nodiscard]] std::uint64_t host_kv_superseded_count() const noexcept;

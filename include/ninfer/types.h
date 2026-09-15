@@ -899,6 +899,12 @@ struct RuntimeStats {
     // (the net's heap state images, distinct from the host state pool slots).
     std::uint32_t host_kv_net_entries     = 0;
     std::uint64_t host_kv_net_state_bytes = 0;
+    // P2.2 (#7 Slice 1): the shared meter over host unit occupancy — the sum of
+    // each retained unit's cost (KV page bytes + state image bytes) across the
+    // safety net, plus the host state pool's demoted-checkpoint bytes. One
+    // number across the two pools that were accounted separately.
+    std::uint64_t host_unit_occupied_bytes = 0;
+    std::uint32_t host_unit_count          = 0;
     // Cumulative entries dropped by supersede-on-add (monotonic).
     std::uint64_t host_kv_superseded = 0;
     // release() refusals in noexcept teardown paths (monotonic): each one

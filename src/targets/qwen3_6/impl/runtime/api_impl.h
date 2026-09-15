@@ -339,6 +339,16 @@ std::uint64_t Program<Variant>::host_kv_net_state_bytes() const noexcept {
 }
 
 template <>
+std::uint64_t Program<Variant>::host_unit_occupied_bytes() const noexcept {
+    return impl_ ? impl_->host_unit_occupied_bytes() : 0;
+}
+
+template <>
+std::uint32_t Program<Variant>::host_unit_count() const noexcept {
+    return impl_ ? impl_->host_unit_count() : 0;
+}
+
+template <>
 std::uint64_t Program<Variant>::host_kv_superseded_count() const noexcept {
     return impl_ ? impl_->host_kv_superseded_count() : 0;
 }
