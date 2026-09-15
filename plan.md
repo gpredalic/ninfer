@@ -561,9 +561,9 @@ shared meter.
       **Design (2026-09-15, from the P2.3 e2e + live journal evidence):**
       The dominant unit-loss class is `endpoint_state_missing` (95/95 in the
       P2.3 e2e; live flood 19:20–19:31: 80k–297k-token units, all
-      `ckpt_valid=1`). Traced in the e2e log: thinking-mode follow-ups always
-      rewind to the rewrite checkpoint (preserve_thinking=off drops
-      reasoning), and the rewrite-restore path releases the superseded
+      `ckpt_valid=1`). Root cause traced in the e2e log: thinking-mode
+      follow-ups always rewind to the rewrite checkpoint (preserve_thinking=off
+      drops reasoning), and the rewrite-restore path releases the superseded
       endpoint state (`program_impl.h:11194`) — the live unit of a thinking
       session lives at the CHECKPOINT frontier, not the endpoint. The old
       `endpoint_fallback` retained exactly this and was CORRECT: `find()`
@@ -581,9 +581,11 @@ shared meter.
         C; the checkpoint state becomes the unit's state; the dead tail
         KV[C..E] is not advertised — the arena keeps the physical allocation
         until eviction, the meter counts the logical unit). No state at all →
-        abort (a true non-unit). *Exit:* 0 `endpoint_state_missing` aborts
-        with `ckpt_valid=1` in e2e + journal; the 19s safety-net restores
-        return.
+        abort (a true non-unit). The identity moves into the entry by COPY,
+        not swap — a demoted-not-evicted victim keeps its identity (fixes the
+        latent silent-root-re-prefill bug noted in P2.3). *Exit:* 0
+        `endpoint_state_missing` aborts with `ckpt_valid=1` in e2e + journal;
+        the 19s safety-net restores return.
       - **Increment 2 — per-session guarantee in net eviction.**
         `select_eviction_victim` skips units whose session is currently
         active (session_key matches a Catalogued/Active continuation) in the
@@ -591,9 +593,9 @@ shared meter.
         is evictable only when nothing else is. *Exit:* 0 evictions of an
         active session's unit while idle units remain.
       **Increment 1 shipped `b9e6b244`, e2e-verified 2026-09-15 (phases
-      9–12, rc=0: 17 PASS / 3 WARN / 0 FAIL) and LIVE-VERIFIED 19:59–20:12:
+      4–12, rc=0: 37 PASS / 10 WARN / 0 FAIL) and LIVE-VERIFIED 19:59–21:30:
       0 `endpoint_state_missing` aborts since deploy (was ~1/min, 80k–297k
-      tokens), 3 checkpoint-frontier retains of 385k/396k-token units, 0
+      tokens), 40+ checkpoint-frontier retains of 100k–420k-token units, 0
       error classes.**
 - [ ] **P2.6 — config.** `--host-state-slots` derived from (or replaced by) the
       shared budget; document the single `--host-cache-mib`.
