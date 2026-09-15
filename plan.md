@@ -159,7 +159,20 @@ development. Each is verified with the P0 e2e gate + the live journal.
       (the freed slot is exactly what the no-replacement branch reserves); a
       stale-but-not-Free slot is a genuine conflict and still errors.
       Structural home: P2.3 atomic admission (commit only a path
-      whose unit is resident or atomically restorable). *Exit:* 0 of each in
+      whose unit is resident or atomically restorable). **06:14:37 live
+      firing (post-622c841d):** req 58 (93k tokens) errored 12s after a
+      stage-2 release of shared prefix 3 — the throw was the **RM planning
+      path**, not the runtime-reserve path: RM's shared catalog still held
+      the released prefix as Catalogued with a stale handle and passed it to
+      `inspect_capture` as the replacement. **Fixed 06:18 (`4e712ab3`):**
+      `valid_continuation`/`valid_shared_prefix` added to the export API;
+      every RM catalog loop probes before use and self-heals a stale entry
+      (`clear_catalog_entry`/`clear_shared_entry` + skip) — the 20213d4b
+      skip-stale pattern. This also fixes `checkpoint recovery owner is
+      stale` (00:44:47, same RM view-lag class, `checkpoint_recovery_ns`
+      sites). Note: 5 pre-existing `ninfer_resource_manager_test` failures
+      (materialization-abort/retention planner-policy tests) fail identically
+      on the pre-change baseline — not caused by this fix. *Exit:* 0 of each in
       a saturated e2e + journal window.
 - [x] **P1.3 — device KV: free pages from idle sessions.** `47406f79`. While a
       fit-gate defer is in flight and free pages have not grown for 15s, the
@@ -210,7 +223,7 @@ development. Each is verified with the P0 e2e gate + the live journal.
       construction. Fix direction: (a) rank relief victims by *unique*
       (non-shared) resident pages, not mapped pages — **done `a53db4b4`**;
       (b) batch-demote until the demand fits (bounded per tick), not one per
-      15s — **done `a53db4b4`**; (c) make the **shared prefix itself a demotion unit** — **stage 2 shipped `f02bc048`**: when no private victim exists, relief releases the idle shared prefix entry (Catalogued, active_references==0, not the transaction's shared source) with the most resident pages; content survives in the safety net via spilled turn continuations. **Regression:** its admission→reserve race with pending captures (victim chosen at admission, pinned only at reserve) threw `capture replacement capability is stale` 38× — fixed by the `622c841d` degrade-to-no-replacement (see P1.2). Full unit-grade version (D2H spill of the shared prefix as one {KV + state} unit) is P2.4; also noted: the incoming restore allocates NEW device pages for a prefix that is already device-resident (identity-based restore is the deeper fix); (d) admission
+      15s — **done `a53db4b4`**; (c) make the **shared prefix itself a demotion unit** — **stage 2 shipped `f02bc048`**: when no private victim exists, relief releases the idle shared prefix entry (Catalogued, active_references==0, not the transaction's shared source) with the most resident pages; content survives in the safety net via spilled turn continuations. **Regression:** its admission→reserve race with pending captures (victim chosen at admission, pinned only at reserve) threw `capture replacement capability is stale` 38× — fixed by the `622c841d` degrade-to-no-replacement (runtime-reserve side) and `4e712ab3` RM catalog probe (RM-planning side; see P1.2). Full unit-grade version (D2H spill of the shared prefix as one {KV + state} unit) is P2.4; also noted: the incoming restore allocates NEW device pages for a prefix that is already device-resident (identity-based restore is the deeper fix); (d) admission
       should see the pool's shared-prefix occupancy and queue the request
       (visible queue position) instead of a 120s silent defer. *Exit:* a
       5th-conversation e2e scenario completes (via shared-prefix demotion or
