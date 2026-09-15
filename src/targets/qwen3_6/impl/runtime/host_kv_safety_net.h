@@ -556,7 +556,9 @@ public:
     // throwing: this is a gauge, not an admission check.
     [[nodiscard]] std::uint64_t unit_occupied_bytes(std::uint64_t text_stride,
                                                     std::uint64_t backend_stride) const noexcept {
-        if (text_stride == 0 || backend_stride == 0) { return 0; }
+        if (text_stride == 0 && backend_stride == 0) { return 0; }
+        if (text_stride == 0) { text_stride = backend_stride; }
+        if (backend_stride == 0) { backend_stride = text_stride; }
         std::uint64_t total = 0;
         for (const HostKVSafetyNetEntry& entry : entries_) {
             const std::uint64_t text_pages    = entry.text_page_count;
@@ -584,7 +586,6 @@ public:
         }
         return total;
     }
-
 
     [[nodiscard]] static std::size_t entry_state_bytes(const HostKVSafetyNetEntry& entry) noexcept {
         return entry.state_bytes + entry.checkpoint_state_bytes;
