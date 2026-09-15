@@ -389,7 +389,7 @@ shared meter.
       pages). *Exit:* 0 "no resident state" → root-fallback lines under pool
       pressure; the 06:31/06:50 overcommit episodes stop re-consuming freed
       pages; 0 `entitlement is inconsistent`.
-- [ ] **P2.2 — Slice 1: unit identity + cost model.** A continuation owns one
+- [x] **P2.2 — Slice 1: unit identity + cost model.** A continuation owns one
       unit {KV replica, frontier checkpoint, compact prefix}; one cost =
       `kv_bytes + state_image_bytes`; one shared meter over host occupancy
       (KV arena + state pool), the safety net's in-arena state budget as the
