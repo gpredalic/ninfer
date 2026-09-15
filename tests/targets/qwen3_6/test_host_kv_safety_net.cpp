@@ -20,6 +20,7 @@
 
 using namespace ninfer::targets::qwen3_6::detail;
 using ninfer::TokenId;
+using ninfer::targets::qwen3_6::PreparedSessionKey;
 
 namespace {
 
@@ -166,12 +167,151 @@ void test_select_victim_directly() {
     check(victim.has_value() && *victim == 1, "pinned entry eligible in phase 2");
 }
 
+// P2.5 per-session guarantee: a unit whose session is still active (its
+// continuation exists) is evicted only after every dead and idle-session unit
+// is gone. Protection is ordering only — the protected tier is exhausted
+// before selection gives up.
+void test_session_protection() {
+    const auto now = std::chrono::steady_clock::now();
+    const std::size_t sb = 1024;
+
+    auto make_key = [](const char* name) {
+        PreparedSessionKey key;
+        const std::size_t n = std::strlen(name);
+        std::memcpy(key.bytes.data(), name, n);
+        key.size = static_cast<std::uint16_t>(n);
+        return key;
+    };
+    const PreparedSessionKey key_live = make_key("live-session");
+    const PreparedSessionKey key_idle = make_key("idle-session");
+
+    // Only `live-session` is active; every other key (and no key at all) is idle.
+    const auto is_live = [&key_live](const std::optional<PreparedSessionKey>& k) {
+        return k.has_value() && *k == key_live;
+    };
+
+    // Direct selection: the protected tier is exhausted last.
+    {
+        auto big_unkeyed = make_entry(9000, 0, sb);  // live, no session key
+        big_unkeyed.ever_matched = true;
+        big_unkeyed.last_matched = now;
+        auto small_live = make_entry(1000, 1000000, sb);  // live, active session
+        small_live.ever_matched = true;
+        small_live.last_matched = now;
+        small_live.session_key = key_live;
+        std::vector<HostKVSafetyNetEntry> entries;
+        entries.push_back(std::move(big_unkeyed));
+        entries.push_back(std::move(small_live));
+
+        auto victim = HostKVSafetyNet::select_eviction_victim(entries, now, std::chrono::minutes(15),
+                                                             /*allow_pinned=*/false, is_live,
+                                                             /*protect_live_sessions=*/true);
+        check(victim.has_value() && *victim == 0,
+              "unprotected live evicted before a smaller protected unit");
+
+        // Nothing unprotected left: the protected unit is the last resort.
+        entries.erase(entries.begin());
+        victim = HostKVSafetyNet::select_eviction_victim(entries, now, std::chrono::minutes(15),
+                                                         /*allow_pinned=*/false, is_live,
+                                                         /*protect_live_sessions=*/true);
+        check(victim.has_value() && *victim == 0,
+              "protected unit evicted only when nothing else is");
+    }
+
+    // The dead tier still precedes protection: an unmatched-past-TTL unit of a
+    // live session is reaped largest-first like any dead unit.
+    {
+        auto dead_live = make_entry(40000, 5000000, sb);
+        dead_live.ever_matched = true;
+        dead_live.last_matched = now - std::chrono::hours(2);
+        dead_live.session_key = key_live;
+        auto live_idle = make_entry(5000, 6000000, sb);
+        live_idle.ever_matched = true;
+        live_idle.last_matched = now;
+        std::vector<HostKVSafetyNetEntry> entries;
+        entries.push_back(std::move(dead_live));
+        entries.push_back(std::move(live_idle));
+        auto victim = HostKVSafetyNet::select_eviction_victim(entries, now, std::chrono::minutes(15),
+                                                             /*allow_pinned=*/false, is_live,
+                                                             /*protect_live_sessions=*/true);
+        check(victim.has_value() && *victim == 0,
+              "dead tier precedes session protection (TTL reaping intact)");
+    }
+
+    // State-pool loop: an active session's unit survives while idle units exist.
+    {
+        HostKVSafetyNet net;
+        net.set_dead_ttl(std::chrono::minutes(15));
+        net.set_state_budget_bytes(2 * sb);
+        net.set_session_is_live(is_live);
+
+        auto p = make_entry(10000, 0, sb);  // the active session's unit
+        p.ever_matched = true;
+        p.last_matched = now;
+        p.session_key = key_live;
+        net.add(std::move(p));
+
+        auto q = make_entry(5000, 1000000, sb);  // an idle session's unit
+        q.ever_matched = true;
+        q.last_matched = now;
+        q.session_key = key_idle;
+        net.add(std::move(q));
+
+        // Two idle adds, each evicting one entry. Both must evict the idle
+        // unit (or its idle replacement), never the active session's unit.
+        for (std::uint32_t round = 0; round < 2; ++round) {
+            auto r = make_entry(7000 + round * 1000, 2000000 + round * 1000000, sb);
+            r.ever_matched = true;
+            r.last_matched = now;
+            r.session_key = key_idle;
+            net.add(std::move(r));
+            check(net.size() == 2, "pool holds two units at 2x budget");
+            bool saw_p = false;
+            for (std::size_t i = 0; i < net.size(); ++i) {
+                const auto& e = net.at(i);
+                if (e.session_key && *e.session_key == key_live) { saw_p = true; }
+            }
+            check(saw_p, "active session's unit survived an idle eviction");
+        }
+    }
+
+    // Exhaustion: when the pool holds only the active session's unit, an
+    // incoming idle capture evicts it (last resort) rather than being dropped.
+    {
+        HostKVSafetyNet net;
+        net.set_dead_ttl(std::chrono::minutes(15));
+        net.set_state_budget_bytes(sb);
+        net.set_session_is_live(is_live);
+
+        auto p = make_entry(10000, 0, sb);
+        p.ever_matched = true;
+        p.last_matched = now;
+        p.session_key = key_live;
+        net.add(std::move(p));
+        check(net.size() == 1, "active unit fits a 1x budget");
+
+        auto r = make_entry(4000, 1000000, sb);
+        r.ever_matched = true;
+        r.last_matched = now;
+        r.session_key = key_idle;
+        net.add(std::move(r));
+        check(net.size() == 1, "incoming idle unit displaced the active unit");
+        bool saw_p = false;
+        for (std::size_t i = 0; i < net.size(); ++i) {
+            const auto& e = net.at(i);
+            if (e.session_key && *e.session_key == key_live) { saw_p = true; }
+        }
+        check(!saw_p, "protected unit evicted only when nothing else was");
+    }
+}
+
 }  // namespace
 
 int main() {
     test_supersede_on_add();
     test_liveness_eviction();
     test_select_victim_directly();
+    test_session_protection();
     if (failures == 0) {
         std::fprintf(stderr, "PASS: host_kv_safety_net lifecycle\n");
         return 0;

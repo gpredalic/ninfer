@@ -597,6 +597,22 @@ shared meter.
       0 `endpoint_state_missing` aborts since deploy (was ~1/min, 80k–297k
       tokens), 40+ checkpoint-frontier retains of 100k–420k-token units, 0
       error classes.**
+      **Increment 2 implemented 2026-09-15 (unit-tested; e2e pending):**
+      three-tier selection — dead-largest, live-smallest, then
+      protected-live-smallest (an active session's unit, evicted only when
+      nothing else is). Protection is ORDERING only: the protected tier is
+      exhausted before selection gives up, so a re-spill of the same session
+      still displaces its own older unit (supersede) rather than being
+      rejected. Both eviction loops respect it: the spill loop via
+      `select_victim`, the state-pool loop (`retain_state_capture`) routed
+      through the same selection. The program wires `set_session_is_live`
+      with a predicate over `continuation_states`/`continuation_slots`
+      (Active or Catalogued role + session_key match). The dead tier still
+      precedes protection — a live session's unit unmatched past the 15-min
+      TTL is reaped largest-first like any dead unit (TTL reaping intact).
+      Unit tests: `test_session_protection` (protected tier exhausted last,
+      dead tier precedes protection, active unit survives idle evictions in
+      the state-pool loop, exhaustion displaces it only when alone).
 - [ ] **P2.6 — config.** `--host-state-slots` derived from (or replaced by) the
       shared budget; document the single `--host-cache-mib`.
 

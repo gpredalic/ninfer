@@ -936,6 +936,22 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         // footprint of the context cache.
         host_kv_safety_net.set_shared_arena(host_kv_arena.get());
         host_kv_safety_net.set_state_budget_bytes(plan.context_cache.host_kv_capacity_bytes);
+        // P2.5: per-session eviction guarantee — a unit whose session still has a
+        // live continuation (Active or Catalogued) is evicted from the net only
+        // after every dead and idle-session unit is gone.
+        host_kv_safety_net.set_session_is_live(
+            [this](const std::optional<qwen3_6::PreparedSessionKey>& key) {
+                if (!key) { return false; }
+                for (std::size_t i = 0; i < continuation_slots.size(); ++i) {
+                    const ContinuationSlotRole role = continuation_slots[i].role;
+                    if (role != ContinuationSlotRole::Active &&
+                        role != ContinuationSlotRole::Catalogued) {
+                        continue;
+                    }
+                    if (continuation_states[i].session_key == *key) { return true; }
+                }
+                return false;
+            });
         std::size_t minimum_stride = layouts.front().page_stride;
         for (const HostKVPageLayout& layout : layouts) {
             minimum_stride = std::min(minimum_stride, layout.page_stride);

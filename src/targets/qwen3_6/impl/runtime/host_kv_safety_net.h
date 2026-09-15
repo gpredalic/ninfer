@@ -40,6 +40,7 @@
 #include <cstdio>
 
 #include <utility>
+#include <functional>
 
 #include <vector>
 
@@ -538,14 +539,27 @@ public:
 
     // Dead-TTL for liveness-based eviction (see select_eviction_victim).
     void set_dead_ttl(std::chrono::seconds ttl) noexcept { dead_ttl_ = ttl; }
+
+    // P2.5: predicate marking a session as currently active (its
+    // continuation still exists). Set once by the program. A live
+    // session's unit is a last-resort eviction victim: idle sessions'
+    // units go first, an active session's unit only when nothing else
+    // is evictable.
+    void set_session_is_live(std::function<bool(const std::optional<qwen3_6::PreparedSessionKey>&)> pred) {
+        session_is_live_ = std::move(pred);
+    }
     [[nodiscard]] std::chrono::seconds dead_ttl() const noexcept { return dead_ttl_; }
 
-    // Pick the next eviction victim under the shared two-tier policy
-    // (dead-largest, then live-smallest). The spill loop drives the pinned
-    // phase through allow_pinned.
+    // Pick the next eviction victim under the shared three-tier policy
+    // (dead-largest, live-smallest, active-session-smallest). The spill loop
+    // drives the pinned phase through allow_pinned. P2.5: one pass covers
+    // every candidate — a protected live unit is returned only when nothing
+    // dead or unprotected-live remains (the per-session guarantee), so a
+    // second unprotected pass could never find more.
     [[nodiscard]] std::optional<std::size_t> select_victim(bool allow_pinned) const noexcept {
         return select_eviction_victim(entries_, std::chrono::steady_clock::now(), dead_ttl_,
-                                      allow_pinned);
+                                      allow_pinned, session_is_live_,
+                                      /*protect_live_sessions=*/true);
     }
 
     // Host KV pages and retained state images share ONE host memory budget. The
@@ -624,7 +638,7 @@ public:
 
 
     // Victim selection shared by both eviction loops (retain_state_capture and
-    // the spill's evict loop). Two tiers:
+    // the spill's evict loop). Three tiers:
     //   dead  — never matched, or unmatched for longer than the dead TTL.
     //           The conversation is gone, so re-prefill cost is ZERO: evict
     //           the LARGEST dead entry first (frees the most arena). This is
@@ -632,17 +646,28 @@ public:
     //   live  — matched within the TTL. Re-prefill cost scales with context
     //           length, so evict the SMALLEST first; oldest last-match breaks
     //           ties. (plan.md's cost model, with liveness as the primary key.)
+    //   protected-live — P2.5: live units whose session is still active
+    //           (session_is_live matches a Catalogued/Active continuation)
+    //           are evicted only after every dead and unprotected live unit
+    //           is gone: an active session's unit is a last-resort victim
+    //           (the per-session guarantee). Protection is ordering only —
+    //           the tier is exhausted before selection gives up.
     // Pinned entries are candidates only in the spill loop's phase 2
     // (allow_pinned); they are always live (pinned right after a find hit).
     [[nodiscard]] static std::optional<std::size_t>
     select_eviction_victim(const std::vector<HostKVSafetyNetEntry>& entries,
                            std::chrono::steady_clock::time_point now,
-                           std::chrono::seconds dead_ttl, bool allow_pinned) noexcept {
+                           std::chrono::seconds dead_ttl, bool allow_pinned,
+                           const std::function<bool(const std::optional<qwen3_6::PreparedSessionKey>&)>& session_is_live = nullptr,
+                           bool protect_live_sessions = false) noexcept {
         std::optional<std::size_t> dead;
         std::size_t dead_size = 0;
         std::optional<std::size_t> live;
         std::size_t live_size = 0;
         std::chrono::steady_clock::time_point live_time{};
+        std::optional<std::size_t> live_protected;
+        std::size_t live_protected_size = 0;
+        std::chrono::steady_clock::time_point live_protected_time{};
         for (std::size_t i = 0; i < entries.size(); ++i) {
             const HostKVSafetyNetEntry& candidate = entries[i];
             if (candidate.pinned && !allow_pinned) { continue; }
@@ -652,6 +677,14 @@ public:
             const std::size_t size = unit_context_pages(candidate);
             if (is_dead) {
                 if (!dead || size > dead_size) { dead = i; dead_size = size; }
+            } else if (protect_live_sessions && candidate.session_key &&
+                       session_is_live && session_is_live(*candidate.session_key)) {
+                if (!live_protected || size < live_protected_size ||
+                    (size == live_protected_size && candidate.last_matched < live_protected_time)) {
+                    live_protected = i;
+                    live_protected_size = size;
+                    live_protected_time = candidate.last_matched;
+                }
             } else if (!live || size < live_size ||
                        (size == live_size && candidate.last_matched < live_time)) {
                 live = i;
@@ -660,25 +693,25 @@ public:
             }
         }
         if (dead) { return dead; }
-        return live;
+        if (live) { return live; }
+        return live_protected;
     }
 
     // Reclaim whole units until `incoming` fits the shared host budget. Eviction
     // is cost-aware (see select_eviction_victim): dead weight goes first
-    // (largest), then the smallest live unit. Returns false when the capture
-    // cannot be retained at all, so the caller degrades by not retaining
-    // instead of by growing host memory.
+    // (largest), then the smallest live unit, and only as a last resort an
+    // active session's smallest unit (the per-session guarantee). Returns false
+    // when the capture cannot be retained at all, so the caller degrades by not
+    // retaining instead of by growing host memory.
     [[nodiscard]] bool retain_state_capture(std::size_t incoming) noexcept {
         if (state_budget_bytes_ == 0) { return true; }
         if (incoming > state_budget_bytes_) { return false; }
         while (shared_occupied_bytes() + incoming > state_budget_bytes_) {
-            const std::optional<std::size_t> victim =
-                select_eviction_victim(entries_, std::chrono::steady_clock::now(), dead_ttl_,
-                                       /*allow_pinned=*/false);
+            const std::optional<std::size_t> victim = select_victim(/*allow_pinned=*/false);
             if (!victim) { return false; }
             std::fprintf(stderr,
                          "[host-state-pool] evict=%zu ctx_pages=%zu state_bytes=%zu retained=%zu "
-                         "shared=%zu budget=%zu (dead-largest, then live-smallest)\n",
+                         "shared=%zu budget=%zu (dead-largest, live-smallest, active-session-last)\n",
                          *victim, unit_context_pages(entries_[*victim]),
                          entry_state_bytes(entries_[*victim]),
                          state_retained_bytes_, shared_occupied_bytes(), state_budget_bytes_);
@@ -900,6 +933,7 @@ private:
     // largest-first). 15 minutes: a live conversation matches every turn, so
     // silence this long means the conversation is gone (compacted, abandoned).
     std::chrono::seconds dead_ttl_{15 * 60};
+    std::function<bool(const std::optional<qwen3_6::PreparedSessionKey>&)> session_is_live_;
 
 };
 
