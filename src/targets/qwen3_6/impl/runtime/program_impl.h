@@ -8857,6 +8857,23 @@ runtime::ContextTransactionReserveStatus ProgramImplCore::reserve_active_capture
         skip_capture(std::move(offer));
         return runtime::ContextTransactionReserveStatus::Aborted;
     }
+    // A planned replacement victim may have been released by fit-gate stage-2
+    // relief between admission and this reserve (a P1.5c race: the victim is
+    // chosen at admission but only pinned to ReservedReplacement at reserve
+    // time, so the gap lets the relief release it). If its slot is now Free,
+    // the room it was meant to free is already free — proceed as a
+    // no-replacement capture, which reserves a free slot (the freed one). A
+    // stale-but-not-Free slot is a genuine inconsistency and still errors.
+    if (replacement != nullptr && !valid_shared_prefix(*replacement)) {
+        const std::uint32_t idx = ContractAccess::index(*replacement);
+        if (idx < shared_prefix_capacity &&
+            shared_prefix_slots[idx].role == SharedPrefixSlotRole::Free) {
+            std::fprintf(stderr,
+                         "[capture] replacement victim slot %u was released by fit-gate "
+                         "relief — proceeding without replacement\n", idx);
+            replacement = nullptr;
+        }
+    }
     const CaptureAssessment assessment =
         inspect_capture(offer, exact_shared, replacement, private_replacement,
                         permit_shared_publication, machine_cost);
