@@ -6561,7 +6561,7 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index) no
                          "[compact-prefix] spill: index=%u size=%zu hash=%llu frontier=%u ckpt_frontier=%u\n",
                          index, entry.compact_prefix.size(),
                          static_cast<unsigned long long>(cp_hash),
-                         entry.execution_frontier, entry.checkpoint_frontier);
+                         entry.execution_frontier, checkpoint_frontier);
         }
         // Atomicity: a cache unit is {attention KV + GDN state}. If the KV could not be
         // copied, this is not a cache unit. KV without its state cannot resume (the
