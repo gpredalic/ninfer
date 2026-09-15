@@ -11775,10 +11775,55 @@ void ProgramImplCore::refresh_state_views(SequenceState& sequence) {
 void ProgramImplCore::reserve_state_entitlement(SequenceState& sequence, std::uint32_t slots) {
     const std::uint32_t footprint = state_footprint(sequence);
     if (slots == 0 || footprint > slots) {
+        std::uint32_t anchors_device = 0;
+        for (const LongAnchorCheckpoint& anchor : sequence.long_anchors) {
+            if (state_store->valid(anchor.state) &&
+                (state_store->residency(anchor.state) == StateReplicaResidency::DeviceOnly ||
+                 state_store->residency(anchor.state) == StateReplicaResidency::Both)) {
+                ++anchors_device;
+            }
+        }
+        std::fprintf(stderr,
+                     "[state-entitlement] MISMATCH footprint=%u slots=%u "
+                     "read=%d write=%d rewrite=%d reserved=%u anchors_device=%u "
+                     "fork_pending=%u\n",
+                     footprint, slots,
+                     static_cast<int>(state_store->residency(sequence.state.read)),
+                     static_cast<int>(state_store->residency(sequence.state.write)),
+                     sequence.rewrite_state
+                         ? static_cast<int>(state_store->residency(*sequence.rewrite_state))
+                         : -1,
+                     sequence.reserved_state ? 1U : 0U, anchors_device,
+                     sequence.state.fork_pending ? 1U : 0U);
         throw std::logic_error("sequence StateImage entitlement is inconsistent");
     }
     if (footprint == slots) { return; }
     if (slots - footprint != 1 || sequence.reserved_state) {
+        std::fprintf(stderr,
+                     "[state-entitlement] MISMATCH footprint=%u slots=%u "
+                     "read=%d write=%d rewrite=%d reserved=%u anchors_device=%u "
+                     "fork_pending=%u\n",
+                     footprint, slots,
+                     static_cast<int>(state_store->residency(sequence.state.read)),
+                     static_cast<int>(state_store->residency(sequence.state.write)),
+                     sequence.rewrite_state
+                         ? static_cast<int>(state_store->residency(*sequence.rewrite_state))
+                         : -1,
+                     sequence.reserved_state ? 1U : 0U,
+                     [&]() {
+                         std::uint32_t count = 0;
+                         for (const LongAnchorCheckpoint& anchor : sequence.long_anchors) {
+                             if (state_store->valid(anchor.state) &&
+                                 (state_store->residency(anchor.state) ==
+                                      StateReplicaResidency::DeviceOnly ||
+                                  state_store->residency(anchor.state) ==
+                                      StateReplicaResidency::Both)) {
+                                 ++count;
+                             }
+                         }
+                         return count;
+                     }(),
+                     sequence.state.fork_pending ? 1U : 0U);
         throw std::logic_error("sequence StateImage reservation is not a single destination");
     }
     std::optional<StateImageHandle> reserved = state_store->reserve_destination();
