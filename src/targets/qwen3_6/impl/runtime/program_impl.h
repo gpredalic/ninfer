@@ -10937,7 +10937,7 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
     const std::uint32_t initial_mtp_extent = staged.initial_mtp_extent;
     request.lifecycle                      = Lifecycle::Empty;
     try {
-        const std::uint32_t state_slots = request_plan.demand.active_entitlement.device.state_slots;
+        std::uint32_t state_slots = request_plan.demand.active_entitlement.device.state_slots;
         const bool preserving_source =
             (transaction.has_source || transaction.has_shared_source) &&
             transaction.source_disposition == runtime::ClaimDisposition::Retained;
@@ -11383,6 +11383,12 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                         sequence.rewrite_checkpoint.frontier);
                     sequence.rewrite_state.reset();
                     sequence.rewrite_checkpoint = {};
+                    // P2.4: the planner reserved a slot for this replacement
+                    // (active_entitlement includes it); it was not realized,
+                    // so the entitlement must match the materialized unit or
+                    // reserve_state_entitlement throws "not a single
+                    // destination" (slots - footprint != 1).
+                    --state_slots;
                 }
             } else if (!preserve_rewrite) {
                 sequence.rewrite_state.reset();
