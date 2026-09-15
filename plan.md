@@ -197,20 +197,18 @@ development. Each is verified with the P0 e2e gate + the live journal.
       counts a `HostOnly` retained checkpoint as a **host** slot only (the
       device credit at :702–705 requires `DeviceOnly`/`Both`), but the
       rewrite-restore runtime path *always* H2D-restores it to device (→Both),
-      so the plan undercounts by 1 device slot. **Fix direction (not yet
-      applied — plan-side admission change, needs a careful pass + test):**
-      in the rewrite-restore path, a retained `HostOnly` checkpoint that will
-      be H2D-restored must also count a device state slot. **Plan-side
-      diagnostic deployed** (`[plan-state] rewrite-restore slots=… opt_dev=…
-      opt_host=… needs_transfer=… fork=… disp=… sel_res=… rw_res=…`,
-      `request_plan_impl.h` before `return AdmissionCandidate`): the next
-      firing correlates the plan's exact accounting with the runtime
-      `[state-entitlement] MISMATCH` line to pin whether the undercount is the
-      selected state (`needs_transfer`, the +1 at `request_plan_impl.h:1208–1215`
-      skips `HostOnly`) or the retained rewrite checkpoint (the optional-states
-      loop `:680–711` counts `HostOnly` as host-only). Self-recovering
+      so the plan undercounts by 1 device slot. **Fixed `e49d6f22` (07:35):**
+      the failing case was `RetainExisting` + a `HostOnly` rewrite checkpoint
+      (the `[plan-state]` diagnostic showed `disp=1`=Replace already counted
+      its slot via `:626`; the undercount was the RetainExisting path). The
+      optional-states loop now counts a device slot for a `HostOnly` retained
+      rewrite checkpoint (it is always H2D-restored to device in this path, and
+      a `HostOnly` checkpoint can never be the active state, so no
+      double-count); anchors are unchanged. The `[plan-state]` +
+      `[state-entitlement]` diagnostics are kept for the verification window
+      (remove once 0 firings over a full day). Self-recovering
       (request errors, client retries; no wedge/restart), so it does not block
-      the stop-the-restarts goal — but it does block P1.2's "0 error classes"
+      the stop-the-restarts goal — but it did block P1.2's "0 error classes"
       exit.
 - [x] **P1.3 — device KV: free pages from idle sessions.** `47406f79`. While a
       fit-gate defer is in flight and free pages have not grown for 15s, the
@@ -331,7 +329,10 @@ development. Each is verified with the P0 e2e gate + the live journal.
       source is HostOnly at materialization time (the planner H2D demand gap,
       `program_impl.h:11076–11080, 5186–5196`) — this also fixes the
       `entitlement is inconsistent` class (P1.2), the same undercount on the
-      rewrite-restore path; (b) identity-based restore — extend the
+      rewrite-restore path; **(a) done `e49d6f22`** (the rewrite-restore
+      RetainExisting + HostOnly checkpoint case — the specific undercount that
+      was firing; the general post-admission-demotion H2D gap remains for the
+      unit work). (b) identity-based restore — extend the
       `prepare_kv_restores` dedup to the safety-net root restore so an
       already-device-resident prefix is not re-allocated (the P1.5 overcommit
       episodes re-consume freed pages). *Exit:* 0 "no resident state" →
