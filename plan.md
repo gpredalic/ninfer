@@ -332,10 +332,22 @@ development. Each is verified with the P0 e2e gate + the live journal.
       rewrite-restore path; **(a) done `e49d6f22`** (the rewrite-restore
       RetainExisting + HostOnly checkpoint case — the specific undercount that
       was firing; the general post-admission-demotion H2D gap remains for the
-      unit work). (b) identity-based restore — extend the
-      `prepare_kv_restores` dedup to the safety-net root restore so an
-      already-device-resident prefix is not re-allocated (the P1.5 overcommit
-      episodes re-consume freed pages). *Exit:* 0 "no resident state" →
+      unit work). (b) identity-based restore — the safety-net root restore
+      re-allocated device pages for a prefix that was still device-resident
+      (shared under a live continuation / shared-prefix slot), re-consuming
+      exactly the pages fit-gate relief had just freed. **Shipped** (this
+      session): the spill records the victim's logical pages in the entry
+      (`text_source_pages`/`backend_source_pages`); the restore probes the
+      longest prefix still *frozen-shareable* (device-resident, full, no
+      writer — append-only content, so aliasing is exact), materializes +
+      H2D-copies only the unshared suffix, then `adopt_resident_prefix`
+      swaps the fresh prefix pages for the shared ones and rebases the
+      reservation so the fit gate sees the freed pages. Adoption is the LAST
+      mutation (after all H2D + sync), so a pre-adoption failure falls back
+      exactly as before; a post-adoption failure (state H2D, stream sync)
+      tears down via `release_adopted_prefix` before the root-prefill
+      fallback. Only full pages are adopted (a partial tail would be the
+      prefill's writer tail). *Exit:* 0 "no resident state" →
       root-fallback lines under pool pressure; 0 `entitlement is inconsistent`;
       the 06:31/06:50 overcommit episodes stop re-consuming freed pages.
 
@@ -383,10 +395,13 @@ shared meter.
       source is HostOnly at materialization time (re-validate residency at the
       fit gate and schedule relief for the delta); this also fixes the
       `entitlement is inconsistent` class (P1.2) which is the same undercount
-      on the rewrite-restore path. (b) **identity-based restore** — extend the
-      `prepare_kv_restores` dedup to the safety-net root restore (`find()`
-      consults device residency; skip allocation for already-resident prefix
-      pages). *Exit:* 0 "no resident state" → root-fallback lines under pool
+      on the rewrite-restore path. (b) **identity-based restore** — the
+      safety-net root restore skips allocation for already-resident prefix
+      pages: the spill records the victim's logical pages in the entry, the
+      restore adopts the longest frozen-shareable prefix (device-resident,
+      full, no writer) instead of re-materializing + H2D-copying it, and
+      rebases the reservation so the fit gate sees the freed pages.
+      *Exit:* 0 "no resident state" → root-fallback lines under pool
       pressure; the 06:31/06:50 overcommit episodes stop re-consuming freed
       pages; 0 `entitlement is inconsistent`.
 - [x] **P2.2 — Slice 1: unit identity + cost model.** A continuation owns one

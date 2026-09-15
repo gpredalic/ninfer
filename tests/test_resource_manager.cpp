@@ -581,8 +581,6 @@ public:
     [[nodiscard]] std::uint64_t host_kv_net_state_bytes() const noexcept { return 0; }
     [[nodiscard]] std::uint64_t host_unit_occupied_bytes() const noexcept { return 0; }
     [[nodiscard]] std::uint32_t host_unit_count() const noexcept { return 0; }
-    [[nodiscard]] std::uint64_t host_unit_occupied_bytes() const noexcept { return 0; }
-    [[nodiscard]] std::uint32_t host_unit_count() const noexcept { return 0; }
     [[nodiscard]] std::uint64_t host_kv_superseded_count() const noexcept { return 0; }
     [[nodiscard]] std::uint64_t host_slot_release_failures() const noexcept { return 0; }
 

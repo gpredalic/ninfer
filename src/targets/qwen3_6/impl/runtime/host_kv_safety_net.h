@@ -12,6 +12,7 @@
 
 #include "core/host_kv_arena.h"
 
+#include "targets/qwen3_6/impl/runtime/logical_kv_store.h"
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
 
 
@@ -169,6 +170,16 @@ struct HostKVSafetyNetEntry {
     // ledger for prefix matching.
 
     std::vector<TokenId> compact_prefix;
+
+    // The logical device pages this entry was spilled from, in page order
+    // (P1.7(b) identity-based restore). At restore, the longest prefix of
+    // these still shareable (device-resident, full, no writer — frozen) is
+    // adopted into the restored address space instead of re-materialized +
+    // H2D-copied, so an already-resident prefix is not re-allocated.
+
+    std::vector<LogicalKVPageHandle> text_source_pages;
+
+    std::vector<LogicalKVPageHandle> backend_source_pages;
 
 };
 

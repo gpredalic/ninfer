@@ -6525,6 +6525,22 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index) no
         entry.backend_page_count = backend_allocations.empty() ? 0 : backend_pages;
         entry.text_allocations = std::move(text_allocations);
         entry.backend_allocations = std::move(backend_allocations);
+        // P1.7(b): record the logical pages this unit was spilled from. At
+        // restore, the longest prefix of these still shareable (device-
+        // resident, full, no writer) is adopted instead of re-materialized +
+        // H2D-copied — the victim's shared pages survive its release and are
+        // exactly the pages the overcommit episodes re-consumed.
+        entry.text_source_pages.reserve(text_pages);
+        for (std::uint32_t p = 0; p < text_pages; ++p) {
+            entry.text_source_pages.push_back(text_kv_addresses->logical_page(kv.text, p));
+        }
+        if (backend_pages != 0) {
+            entry.backend_source_pages.reserve(backend_pages);
+            for (std::uint32_t p = 0; p < backend_pages; ++p) {
+                entry.backend_source_pages.push_back(
+                    backend_kv_addresses->logical_page(*kv.backend, p));
+            }
+        }
         entry.state_host = std::move(state_host);
         entry.state_bytes = state_bytes;
         entry.checkpoint_valid = checkpoint_valid;
@@ -11187,6 +11203,15 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
         // match, restore the cached prefix KV from host RAM to device. This replaces
         // the first N tokens of prefill with a bulk H2D copy.
         if (transaction.host_kv_restore_frontier > 0 && sequence.kv) {
+            // P1.7(b): adoption bookkeeping, declared in the enclosing scope
+            // (not the try block) so the catch below can tear down an adopted
+            // prefix if the restore fails after the adoption (state H2D,
+            // stream sync) — the root-prefill fallback must start from an
+            // empty address space.
+            std::uint32_t restore_adopted_text     = 0;
+            std::uint32_t restore_adopted_backend  = 0;
+            std::uint32_t restore_planned_text_entitlement     = 0;
+            std::uint32_t restore_planned_backend_entitlement  = 0;
          try {
             std::fprintf(stderr, "[restore] frontier=%u entry=%s checkpoint=%d\n",
                          transaction.host_kv_restore_frontier,
@@ -11207,8 +11232,65 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
             if (!entry.text_allocations.empty() && restore_frontier > 0) {
                 const std::uint32_t text_pages = kv_pages_for_frontier(restore_frontier);
                 if (text_pages > 0 && text_pages <= entry.text_page_count) {
+                    // P1.7(b) identity-based restore: the entry records the
+                    // logical pages it was spilled from. The longest prefix of
+                    // them still shareable (device-resident, full, no writer —
+                    // frozen) is adopted into this address space instead of
+                    // re-materialized + H2D-copied, so an already-resident
+                    // prefix is not re-allocated (the overcommit episodes
+                    // re-consumed exactly these pages after fit-gate relief).
+                    // Only full pages are adopted: a partial tail page would
+                    // be the prefill's writer tail after the restore.
+                    std::uint32_t text_shared = 0;
+                    restore_planned_text_entitlement =
+                        text_kv_addresses->entitlement(sequence.kv->text);
+                    if (entry.text_allocations.size() == 1 && !entry.text_source_pages.empty()) {
+                        const std::uint32_t limit = std::min(
+                            {text_pages,
+                             restore_frontier / static_cast<std::uint32_t>(kPagedKVPageSize),
+                             static_cast<std::uint32_t>(entry.text_source_pages.size())});
+                        while (text_shared < limit &&
+                               text_kv_pages->can_share_frozen_page(
+                                   entry.text_source_pages[text_shared])) {
+                            ++text_shared;
+                        }
+                    }
                     text_kv_addresses->materialize_to_tokens(
                         sequence.kv->text, restore_frontier, device.transfer_stream);
+                    if (text_shared > 0) {
+                        // The (single) allocation covers every entry page; the
+                        // adopted prefix needs no copy — its device replicas
+                        // are already the destination. Copy only the unshared
+                        // suffix.
+                        const std::uint32_t copy_pages = text_pages - text_shared;
+                        std::vector<DeviceKVPageHandle> text_destinations(copy_pages);
+                        for (std::uint32_t page = 0; page < copy_pages; ++page) {
+                            text_destinations[page] =
+                                text_kv_addresses->physical_page(sequence.kv->text,
+                                                                 text_shared + page);
+                        }
+                        text_kv_pages->physical_pool().copy_from_host(
+                            host_kv_arena->view(entry.text_allocations.front())
+                                .subview(text_shared, copy_pages),
+                            text_destinations, device.transfer_stream);
+                        // Adoption is the LAST mutation: every H2D above is
+                        // enqueued, so a failure from here on cannot leave a
+                        // half-copied prefix.
+                        text_kv_addresses->adopt_resident_prefix(
+                            sequence.kv->text,
+                            std::span<const LogicalKVPageHandle>(
+                                entry.text_source_pages.data(), text_shared),
+                            device.transfer_stream);
+                        // The adopted pages returned their fresh physical pages
+                        // to the reservation — rebaseline to the planned
+                        // entitlement so the fit gate sees the freed pages.
+                        text_kv_addresses->resize_entitlement(
+                            sequence.kv->text, restore_planned_text_entitlement);
+                        restore_adopted_text = text_shared;
+                        std::fprintf(stderr,
+                                     "[restore] identity-share: %u/%u text pages adopted\n",
+                                     text_shared, text_pages);
+                    } else {
                     // Copy H2D for the (single) text allocation.
                     std::uint32_t page_offset = 0;
                     for (const auto& alloc : entry.text_allocations) {
@@ -11224,6 +11306,7 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                             text_destinations, device.transfer_stream);
                         page_offset += alloc_pages;
                     }
+                    }
                     text_kv_addresses->commit_frontier(sequence.kv->text, restore_frontier);
                     // Record the H2D restore for byte accounting — the safety-net
                     // restore path previously never observed its transfers, so
@@ -11236,8 +11319,8 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                         auto observation = context_transfer_observation(
                             runtime::ContextResourceClass::MainKV,
                             runtime::ContextTransferDirection::HostToDevice, TransferWork{},
-                            text_pages);
-                        observation.units     = layout->page_stride * text_pages;
+                            text_pages - text_shared);
+                        observation.units     = layout->page_stride * (text_pages - text_shared);
                         observation.units_bytes = observation.units;
                         transaction.transfer_observations.push_back(std::move(observation));
                     }
@@ -11252,8 +11335,47 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                         : restore_frontier;
                 const std::uint32_t backend_pages = kv_pages_for_frontier(backend_frontier);
                 if (backend_pages > 0 && backend_pages <= entry.backend_page_count) {
+                    // P1.7(b) backend: same identity-based restore as text.
+                    std::uint32_t backend_shared = 0;
+                    restore_planned_backend_entitlement =
+                        backend_kv_addresses->entitlement(*sequence.kv->backend);
+                    if (entry.backend_allocations.size() == 1 &&
+                        !entry.backend_source_pages.empty()) {
+                        const std::uint32_t limit = std::min(
+                            {backend_pages,
+                             backend_frontier / static_cast<std::uint32_t>(kPagedKVPageSize),
+                             static_cast<std::uint32_t>(entry.backend_source_pages.size())});
+                        while (backend_shared < limit &&
+                               backend_kv_pages->can_share_frozen_page(
+                                   entry.backend_source_pages[backend_shared])) {
+                            ++backend_shared;
+                        }
+                    }
                     backend_kv_addresses->materialize_to_tokens(
                         *sequence.kv->backend, backend_frontier, device.transfer_stream);
+                    if (backend_shared > 0) {
+                        const std::uint32_t copy_pages = backend_pages - backend_shared;
+                        std::vector<DeviceKVPageHandle> backend_destinations(copy_pages);
+                        for (std::uint32_t page = 0; page < copy_pages; ++page) {
+                            backend_destinations[page] = backend_kv_addresses->physical_page(
+                                *sequence.kv->backend, backend_shared + page);
+                        }
+                        backend_kv_pages->physical_pool().copy_from_host(
+                            host_kv_arena->view(entry.backend_allocations.front())
+                                .subview(backend_shared, copy_pages),
+                            backend_destinations, device.transfer_stream);
+                        backend_kv_addresses->adopt_resident_prefix(
+                            *sequence.kv->backend,
+                            std::span<const LogicalKVPageHandle>(
+                                entry.backend_source_pages.data(), backend_shared),
+                            device.transfer_stream);
+                        backend_kv_addresses->resize_entitlement(
+                            *sequence.kv->backend, restore_planned_backend_entitlement);
+                        restore_adopted_backend = backend_shared;
+                        std::fprintf(stderr,
+                                     "[restore] identity-share: %u/%u backend pages adopted\n",
+                                     backend_shared, backend_pages);
+                    } else {
                     // Copy H2D for the (single) backend allocation.
                     std::uint32_t backend_page_offset = 0;
                     for (const auto& alloc : entry.backend_allocations) {
@@ -11270,6 +11392,7 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                             backend_destinations, device.transfer_stream);
                         backend_page_offset += alloc_pages;
                     }
+                    }
                     backend_kv_addresses->commit_frontier(*sequence.kv->backend, backend_frontier);
                     if (const HostKVPageLayout* layout =
                             host_kv_arena
@@ -11279,8 +11402,8 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                         auto observation = context_transfer_observation(
                             runtime::ContextResourceClass::BackendKV,
                             runtime::ContextTransferDirection::HostToDevice, TransferWork{},
-                            backend_pages);
-                        observation.units     = layout->page_stride * backend_pages;
+                            backend_pages - backend_shared);
+                        observation.units     = layout->page_stride * (backend_pages - backend_shared);
                         observation.units_bytes = observation.units;
                         transaction.transfer_observations.push_back(std::move(observation));
                     }
@@ -11372,6 +11495,20 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
             // prefill — the slot is already activated/zeroed. Sync any
             // in-flight H2D copies before continuing.
             try { cudaStreamSynchronize(device.transfer_stream); } catch (...) {}
+            // P1.7(b): if the restore failed after an adoption, the address
+            // space holds shared frozen pages a root prefill cannot write —
+            // return it to its empty activated state first.
+            if (restore_adopted_text > 0) {
+                text_kv_addresses->release_adopted_prefix(sequence.kv->text, restore_adopted_text);
+                text_kv_addresses->resize_entitlement(sequence.kv->text,
+                                                      restore_planned_text_entitlement);
+            }
+            if (restore_adopted_backend > 0 && sequence.kv->backend) {
+                backend_kv_addresses->release_adopted_prefix(*sequence.kv->backend,
+                                                             restore_adopted_backend);
+                backend_kv_addresses->resize_entitlement(*sequence.kv->backend,
+                                                         restore_planned_backend_entitlement);
+            }
             transaction.host_kv_restore_frontier = 0;
             staged.base = 0;
             staged.cursor = 0;

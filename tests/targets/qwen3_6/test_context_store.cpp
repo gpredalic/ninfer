@@ -578,6 +578,110 @@ void test_kv_store(ninfer::DeviceContext& device) {
            "staged retained fork closes Device and Host ownership without leaks");
 }
 
+void test_resident_prefix_adoption(ninfer::DeviceContext& device) {
+    ninfer::LayoutBuilder builder;
+    ninfer::DeviceKVPagePoolSpec page_spec{
+        .page_group_count = 8,
+        .geometry =
+            {
+                .page_tokens        = static_cast<std::uint32_t>(ninfer::kPagedKVPageSize),
+                .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
+                .planes = {{.dtype = ninfer::DType::BF16, .leading_extent = 8, .head_extent = 2}},
+            },
+    };
+    const ninfer::DeviceKVPagePoolLayout page_layout =
+        ninfer::plan_device_kv_page_pool(builder, page_spec);
+    const ninfer::KVExecutionTableLayout table_layout =
+        ninfer::plan_kv_execution_tables(builder, {.logical_page_capacity = 4, .table_rows = 2});
+    ninfer::DeviceArena arena(builder.finish(256));
+    const ninfer::DeviceSpan backing{arena.base(), arena.capacity()};
+    ninfer::DeviceKVPagePool physical_pages(backing, page_layout);
+    ninfer::KVExecutionTablePool physical_tables(backing, table_layout, physical_pages);
+    store::LogicalKVPageStore pages(physical_pages, physical_pages.capacity_pages() + 8U);
+    store::KVAddressSpaceStore addresses(pages, physical_tables, 4, 4);
+
+    // Source: two full pages, then deactivated so they are frozen (writer-free).
+    const auto source = addresses.create_active(2, 0);
+    expect(source.has_value(), "adoption source allocation");
+    addresses.materialize_to_tokens(*source, 128, device.stream);
+    addresses.commit_frontier(*source, 128);
+    const store::LogicalKVPageHandle s0 = addresses.logical_page(*source, 0);
+    const store::LogicalKVPageHandle s1 = addresses.logical_page(*source, 1);
+    expect(!pages.can_share_frozen_page(s0), "an active writer page is not shareable");
+    addresses.deactivate(*source);
+    expect(pages.can_share_frozen_page(s0) && pages.can_share_frozen_page(s1),
+           "deactivated full pages are frozen-shareable");
+
+    // Destination: the restore's fresh materialization (two pages, uncommitted).
+    const auto destination = addresses.create_active(4, 1);
+    expect(destination.has_value(), "adoption destination allocation");
+    const std::uint32_t planned = addresses.entitlement(*destination);
+    expect(planned == 4, "destination holds its full planned entitlement");
+    addresses.materialize_to_tokens(*destination, 128, device.stream);
+    expect(addresses.mapped_pages(*destination) == 2 &&
+               addresses.committed_frontier(*destination) == 0,
+           "destination materialized a fresh, uncommitted restore prefix");
+
+    const std::uint32_t allocated_before = physical_pages.allocated_pages();
+    // Adopt only the first frozen page — the destination's second page stays
+    // fresh, so the teardown must dematerialize it as well.
+    const std::array src{s0};
+    addresses.adopt_resident_prefix(*destination, src, device.transfer_stream);
+    device.synchronize();
+
+    expect(addresses.logical_page(*destination, 0) == s0 &&
+               addresses.mapped_pages(*destination) == 2,
+           "adoption aliases the destination prefix to the shared frozen page");
+    expect(pages.address_references(s0) == 2 && pages.address_references(s1) == 1,
+           "adoption retains a reference on the shared page only");
+    expect(pages.active_address_references(s0) == 1 && pages.writer_references(s0) == 0,
+           "adoption retains an active reference and keeps the page writer-free");
+    expect(physical_pages.allocated_pages() == allocated_before - 1,
+           "adoption frees the fresh physical page instead of re-allocating");
+    addresses.resize_entitlement(*destination, planned);
+    expect(addresses.entitlement(*destination) == planned,
+           "adoption rebases the reservation to the planned entitlement");
+
+    // Rejection: a partial (non-full) page is not shareable.
+    const auto partial = addresses.create_active(2, 0);
+    expect(partial.has_value(), "partial-page source allocation");
+    addresses.materialize_to_tokens(*partial, 65, device.stream);
+    addresses.commit_frontier(*partial, 65);
+    const store::LogicalKVPageHandle partial_tail = addresses.logical_page(*partial, 1);
+    expect(!pages.can_share_frozen_page(partial_tail),
+           "a partial tail page is not frozen-shareable");
+    bool partial_rejected = false;
+    try {
+        const std::array partial_src{s0, partial_tail};
+        addresses.adopt_resident_prefix(*destination, partial_src, device.transfer_stream);
+    } catch (const std::logic_error&) {
+        partial_rejected = true;
+    }
+    expect(partial_rejected, "adoption rejects a non-shareable source page");
+    expect(addresses.mapped_pages(*destination) == 2,
+           "a rejected adoption leaves the destination untouched");
+
+    // Teardown: release_adopted_prefix returns the destination to its empty
+    // activated state (the root-prefill fallback path): the adopted page's
+    // reference is dropped, the fresh suffix is dematerialized.
+    addresses.release_adopted_prefix(*destination, 1);
+    addresses.resize_entitlement(*destination, planned);
+    expect(addresses.mapped_pages(*destination) == 0 &&
+               addresses.committed_frontier(*destination) == 0 &&
+               addresses.entitlement(*destination) == planned,
+           "release_adopted_prefix returns the destination to its empty activated state");
+    expect(pages.address_references(s0) == 1 && pages.active_address_references(s0) == 0,
+           "teardown drops only the destination's reference to the shared page");
+    expect(physical_pages.allocated_pages() == 4 && physical_pages.reserved_pages() == 4,
+           "teardown frees the destination's fresh page and restores its reservation");
+    addresses.deactivate(*destination);
+    addresses.deactivate(*partial);
+    expect(addresses.release(*destination) && addresses.release(*partial) &&
+               addresses.release(*source) && pages.occupied() == 0 &&
+               physical_pages.allocated_pages() == 0 && physical_pages.reserved_pages() == 0,
+           "resident-prefix adoption closes Device ownership without leaks");
+}
+
 } // namespace
 
 int main() {
@@ -593,6 +697,7 @@ int main() {
         ninfer::DeviceContext device(0);
         test_state_store(device);
         test_kv_store(device);
+        test_resident_prefix_adoption(device);
         device.synchronize();
     } catch (const std::exception& error) {
         std::cerr << "FAIL: unexpected exception: " << error.what() << '\n';
