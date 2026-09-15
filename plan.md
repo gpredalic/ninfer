@@ -613,7 +613,20 @@ shared meter.
       and the request 500ed (9× in 20 min) instead of restoring. Fix: count
       the fork's write slot in `active_optional_resources.device.state_slots`
       when `state_fork_required`. Live-verified: 0 mismatches on the new
-      binary. Increments:
+      binary. **BOTH REVERTED `e82f4837`/`4913da7c` (2026-09-16 00:39):** the
+      entitlement fix was incomplete — with the gate unblocked, the rewrite-
+      restore path overflowed the device state pool (`max_concurrency +
+      device_state_slots` = 3+5 = 8 total, working set needs 3 concurrent × 3
+      slots = 9) and produced THREE error classes: `entitlement is
+      inconsistent`, `std::bad_alloc` (pool full at `reserve_state_entitlement`),
+      and `reservation is not a single destination` (the +1 over-corrected in
+      some cases). The entitlement model (base 1 + optional slots vs the
+      fork/anchor footprint) is not fully understood, and the device state
+      pool is the binding constraint — that is P1.5. Reverted to the known-
+      good baseline (clean root-prefill fallback, 0 hard 500s); DIAG canary
+      (a4629fac) stays. Re-land the gate fix ONLY after P1.5 makes the device
+      state pool fit the working set AND the entitlement model is fixed.
+      Increments:
       - **Increment 1 — spill-before-loss (kill the unit split).** At the
         point a unit's state is about to lose its LAST replica (device-slot
         release under pressure; host-replica drop/eviction), if the unit's KV
