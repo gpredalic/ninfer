@@ -139,7 +139,26 @@ development. Each is verified with the P0 e2e gate + the live journal.
       recovery also failed every other in-flight request. The runtime Begin
       is content-verified, so the documented downgrade (committed non-Root →
       runtime Root) is now accepted with a diagnostic; all other changes
-      stay fatal. Structural home: P2.3 atomic admission (commit only a path
+      stay fatal. **Fixed 02:03 (`ea934911`): `staged MTP bridge is outside
+      the reusable suffix`** (req 2, first turn after a restart, 22:10:58):
+      the root fallback reset reuse to Root but left the staged BeforeSuffix
+      bridge computed against the old base (the bridge invariant is
+      `cursor==base && base!=0`); the bridge site threw on the now-Root
+      reuse. Fix: the root-fallback reset clears `mtp_bridge = None` on both
+      the prefill and the plan (a Root reuse has no reusable suffix), and the
+      bridge site degrades gracefully (log + prefill without the bridge)
+      instead of throwing. **Fixed 05:58 (`622c841d`): `capture replacement
+      capability is stale` — a P1.5c regression**: 0× Sep 14, 38× Sep 15,
+      every firing 1–3s after a `[relief-kv] … released idle shared prefix`
+      line (stage 2, `f02bc048`, deployed ~01:00). Root cause: stage 2
+      releases idle shared prefixes, but a pending capture may have chosen
+      one as its replacement victim at admission — the victim is only pinned
+      to ReservedReplacement at reserve time, so the relief releases it in
+      the admission→reserve gap and `inspect_capture` threw. Fix: at reserve,
+      if the victim slot is now Free, degrade to a no-replacement capture
+      (the freed slot is exactly what the no-replacement branch reserves); a
+      stale-but-not-Free slot is a genuine conflict and still errors.
+      Structural home: P2.3 atomic admission (commit only a path
       whose unit is resident or atomically restorable). *Exit:* 0 of each in
       a saturated e2e + journal window.
 - [x] **P1.3 — device KV: free pages from idle sessions.** `47406f79`. While a
@@ -191,7 +210,7 @@ development. Each is verified with the P0 e2e gate + the live journal.
       construction. Fix direction: (a) rank relief victims by *unique*
       (non-shared) resident pages, not mapped pages — **done `a53db4b4`**;
       (b) batch-demote until the demand fits (bounded per tick), not one per
-      15s — **done `a53db4b4`**; (c) make the **shared prefix itself a demotion unit** — **stage 2 shipped `f02bc048`**: when no private victim exists, relief releases the idle shared prefix entry (Catalogued, active_references==0, not the transaction's shared source) with the most resident pages; content survives in the safety net via spilled turn continuations. Full unit-grade version (D2H spill of the shared prefix as one {KV + state} unit) is P2.4; also noted: the incoming restore allocates NEW device pages for a prefix that is already device-resident (identity-based restore is the deeper fix); (d) admission
+      15s — **done `a53db4b4`**; (c) make the **shared prefix itself a demotion unit** — **stage 2 shipped `f02bc048`**: when no private victim exists, relief releases the idle shared prefix entry (Catalogued, active_references==0, not the transaction's shared source) with the most resident pages; content survives in the safety net via spilled turn continuations. **Regression:** its admission→reserve race with pending captures (victim chosen at admission, pinned only at reserve) threw `capture replacement capability is stale` 38× — fixed by the `622c841d` degrade-to-no-replacement (see P1.2). Full unit-grade version (D2H spill of the shared prefix as one {KV + state} unit) is P2.4; also noted: the incoming restore allocates NEW device pages for a prefix that is already device-resident (identity-based restore is the deeper fix); (d) admission
       should see the pool's shared-prefix occupancy and queue the request
       (visible queue position) instead of a 120s silent defer. *Exit:* a
       5th-conversation e2e scenario completes (via shared-prefix demotion or
