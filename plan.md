@@ -276,7 +276,7 @@ development. Each is verified with the P0 e2e gate + the live journal.
       changes this. Fix direction: (a) rank relief victims by *unique*
       (non-shared) resident pages, not mapped pages — **done `a53db4b4`**;
       (b) batch-demote until the demand fits (bounded per tick), not one per
-      15s — **done `a53db4b4`**; (c) make the **shared prefix itself a demotion unit** — **stage 2 shipped `f02bc048`**: when no private victim exists, relief releases the idle shared prefix entry (Catalogued, active_references==0, not the transaction's shared source) with the most resident pages; content survives in the safety net via spilled turn continuations. **Regression:** its admission→reserve race with pending captures (victim chosen at admission, pinned only at reserve) threw `capture replacement capability is stale` 38× — fixed by the `622c841d` degrade-to-no-replacement (runtime-reserve side) and `4e712ab3` RM catalog probe (RM-planning side; see P1.2). Full unit-grade version (D2H spill of the shared prefix as one {KV + state} unit) is P2.4; also noted: the incoming restore allocates NEW device pages for a prefix that is already device-resident (identity-based restore is the deeper fix); (d) admission
+      15s — **done `a53db4b4`**; (c) make the **shared prefix itself a demotion unit** — **stage 2 shipped `f02bc048`**: when no private victim exists, relief releases the idle shared prefix entry (Catalogued, active_references==0, not the transaction's shared source) with the most resident pages; content survives in the safety net via spilled turn continuations. **Regression:** its admission→reserve race with pending captures (victim chosen at admission, pinned only at reserve) threw `capture replacement capability is stale` 38× — fixed by the `622c841d` degrade-to-no-replacement (runtime-reserve side) and `4e712ab3` RM catalog probe (RM-planning side; see P1.2). Full unit-grade version (D2H spill of the shared prefix as one {KV + state} unit) is P2.4; also noted: the incoming restore allocates NEW device pages for a prefix that is already device-resident (identity-based restore is the deeper fix — shipped `33c53fb9`/`a1cd9dda`, see P1.7); (d) admission
       should see the pool's shared-prefix occupancy and queue the request
       (visible queue position) instead of a 120s silent defer. *Exit:* a
       5th-conversation e2e scenario completes (via shared-prefix demotion or
@@ -347,9 +347,33 @@ development. Each is verified with the P0 e2e gate + the live journal.
       exactly as before; a post-adoption failure (state H2D, stream sync)
       tears down via `release_adopted_prefix` before the root-prefill
       fallback. Only full pages are adopted (a partial tail would be the
-      prefill's writer tail). *Exit:* 0 "no resident state" →
+      prefill's writer tail). **Shipped `33c53fb9` + `a1cd9dda`, e2e-verified
+      (2026-09-15, 4 swaps):** the spill records the victim's logical pages;
+      the restore adopts the longest frozen-shareable prefix and rebases the
+      reservation. First e2e run caught a real bug — the post-materialization
+      entitlement check (`resident_resources` excludes shared pages from an
+      owner's exact transition effect, but the plan counts the adopted pages)
+      threw `materialized sequence does not match its active entitlement`
+      (500s on both concurrent requests) right after a 187/188 adoption;
+      fixed by adding the adopted counts back at the check site (`a1cd9dda`).
+      Live adoption observed: `identity-share: 187/188 text + 187/188 backend
+      pages adopted` (a 12015-token restore H2D-copied 1 page instead of
+      188). Subsequent runs: 0 entitlement errors, 0 error classes, suite
+      green (17 PASS / 3 WARN / 0 FAIL on the focused concurrent→state-lease
+      group; the 3 WARNs are the pre-existing ckpt-miss + demotion classes).
+      *Exit:* 0 "no resident state" →
       root-fallback lines under pool pressure; 0 `entitlement is inconsistent`;
       the 06:31/06:50 overcommit episodes stop re-consuming freed pages.
+      **Note:** adoption fires only when the victim's pages are still
+      device-resident via another owner (shared prefix / live sibling) —
+      non-deterministic in e2e (0 of 3 post-fix runs reproduced it; the
+      demotion path absorbs most reuse in the 4 GiB e2e arena). The live
+      monitor greps `identity-share` so a prod firing is visible in the feed.
+      Also observed (pre-existing, not a regression): with the 4 GiB e2e
+      arena, demoted catalog extents can saturate it so a safety-net spill
+      fails `no room for a complete unit` with `reclaimable=0` (empty net —
+      the arena is shared between demotion extents and net units, with no
+      joint budget). That is the P2.3/P2.5 shared-meter problem, not P1.7.
 
 *P1 exit criteria:* a 1-hour saturated window (3 concurrent large
 conversations) with **0 request errors, 0 deadline aborts, no restart.**
@@ -389,18 +413,21 @@ shared meter.
 
 - [x] **P2.1 — scope in plan mode.** *Exit:* approved plan with slice
       boundaries — **done** (findings above; slices below).
-- [ ] **P1.7 — Slice 0: standalone fixes (ship before the refactor).** Two
+- [x] **P1.7 — Slice 0: standalone fixes (ship before the refactor).** Two
       small, high-leverage fixes for today's live pain, no unit refactor:
       (a) **planner H2D demand** — model the restore's new device slot when the
       source is HostOnly at materialization time (re-validate residency at the
       fit gate and schedule relief for the delta); this also fixes the
       `entitlement is inconsistent` class (P1.2) which is the same undercount
-      on the rewrite-restore path. (b) **identity-based restore** — the
-      safety-net root restore skips allocation for already-resident prefix
-      pages: the spill records the victim's logical pages in the entry, the
-      restore adopts the longest frozen-shareable prefix (device-resident,
-      full, no writer) instead of re-materializing + H2D-copying it, and
-      rebases the reservation so the fit gate sees the freed pages.
+      on the rewrite-restore path. **(a) done `e49d6f22`.** (b) **identity-based
+      restore** — the safety-net root restore skips allocation for
+      already-resident prefix pages: the spill records the victim's logical
+      pages in the entry, the restore adopts the longest frozen-shareable
+      prefix (device-resident, full, no writer) instead of re-materializing +
+      H2D-copying it, and rebases the reservation so the fit gate sees the
+      freed pages. **(b) done `33c53fb9` + `a1cd9dda` (entitlement-check fix
+      caught by the first e2e run), e2e-verified 2026-09-15 — see the P1.7
+      entry above for the run log.**
       *Exit:* 0 "no resident state" → root-fallback lines under pool
       pressure; the 06:31/06:50 overcommit episodes stop re-consuming freed
       pages; 0 `entitlement is inconsistent`.
