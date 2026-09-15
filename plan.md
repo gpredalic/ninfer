@@ -182,6 +182,15 @@ development. Each is verified with the P0 e2e gate + the live journal.
       a saturated e2e + journal window — **met via the live window** (the
       32k e2e swap was skipped: the live traffic already exercised the same
       episodes, and the swap would freeze the user's sessions).
+      **New class 06:44:52 (req 25) + 06:55:22 (req 11): `sequence StateImage
+      entitlement is inconsistent`** — first live firings today, both
+      auxiliary ~64k-token requests admitted via the rewrite-checkpoint
+      restore path during high-pressure windows (footprint > plan entitlement
+      at `reserve_state_entitlement`, `program_impl.h:11778`). Mechanism not
+      yet pinned; diagnostics added (`576302d1`, deployed 06:57) log the
+      footprint breakdown (read/write/rewrite residency, reserved, device
+      anchors, fork_pending) on both mismatch branches — the next firing
+      reveals it.
 - [x] **P1.3 — device KV: free pages from idle sessions.** `47406f79`. While a
       fit-gate defer is in flight and free pages have not grown for 15s, the
       gate demotes the largest idle continuation to the host safety net and
@@ -284,7 +293,10 @@ development. Each is verified with the P0 e2e gate + the live journal.
       clean deadline abort, destroying all caches (~55s root re-prefill per
       subsequent request). A bounded defer is in-progress, not a wedge:
       threshold raised to 150s (must exceed the 120s deadline + margin).
-      *Exit:* (a) the
+      **Follow-on 06:52:10:** the first edit changed the header + ARMED
+      message but not the `ge 90` comparison — it fired at 96s (killing a
+      request 10s before it would have fit); the comparison is now 150s for
+      real. *Exit:* (a) the
       15:15 stall class is diagnosed (what state holds `materializing`
       without progress, and why admission stops promoting); (b) every stuck
       state has a bounded progress guarantee — it progresses or the request
