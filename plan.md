@@ -551,7 +551,7 @@ shared meter.
       slot + pool slot + net vector; no bypass of StateImageStore residency at
       `program_impl.h:11285–11298`). Kills the "state without KV" forms.
       *Exit:* 0 "no resident state" lines under pool pressure (e2e phase 12).
-- [ ] **P2.5 — Slice 4: unit LRU/retention + per-session guarantee.** One LRU
+- [x] **P2.5 — Slice 4: unit LRU/retention + per-session guarantee.** One LRU
       over the shared budget, evicting whole units cost-aware smallest-first
       (kills the 19s class: state can no longer outlive its KV's retention
       decision); protect an interactive session's unit (≥2 slots: turn-closure
@@ -597,8 +597,11 @@ shared meter.
       0 `endpoint_state_missing` aborts since deploy (was ~1/min, 80k–297k
       tokens), 40+ checkpoint-frontier retains of 100k–420k-token units, 0
       error classes.**
-      **Increment 2 implemented 2026-09-15 (unit-tested; e2e pending):**
-      three-tier selection — dead-largest, live-smallest, then
+      **Increment 2 implemented `ae416669`, e2e-verified 2026-09-15 23:28
+      (phases 4–12, rc=0: 36 PASS / 10 WARN / 0 FAIL — same as increment 1;
+      0 new error classes; state-lease: zero orphaned state images, zero
+      'private source result is missing') and deployed to prod 23:28.**
+      Design: three-tier selection — dead-largest, live-smallest, then
       protected-live-smallest (an active session's unit, evicted only when
       nothing else is). Protection is ORDERING only: the protected tier is
       exhausted before selection gives up, so a re-spill of the same session
