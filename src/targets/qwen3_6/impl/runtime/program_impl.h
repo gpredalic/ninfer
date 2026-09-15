@@ -4927,41 +4927,8 @@ bool ProgramImplCore::prepare_materialization(MaterializationTransaction& transa
     SharedPrefixState* shared_state = transaction.has_shared_source
                                           ? &shared_prefix_states[transaction.shared_source_index]
                                           : nullptr;
-    // P2.4: gate on the SELECTED state image's residency, not the sequence's
-    // exclusive footprint. Restore reads the selected image's replica, so a
-    // shared image (checkpoint_refs > owned) is fully restorable. The old
-    // exclusive-ownership test (resident_resources) threw a false "no resident
-    // state" on every shared rewrite checkpoint — 18-81% of prod requests —
-    // forcing a full root re-prefill.
-    const StateReplicaResidency selected_residency = [&]() -> StateReplicaResidency {
-        if (source_state == nullptr || state_store == nullptr) {
-            return StateReplicaResidency::None;
-        }
-        const SequenceState& sel = *source_state;
-        const ReusePath sel_reuse = details.reuse;
-        if (sel_reuse == ReusePath::PrivateEndpoint) {
-            return sel.endpoint_valid && state_store->valid(sel.state.read)
-                       ? state_store->residency(sel.state.read)
-                       : StateReplicaResidency::None;
-        }
-        if (is_rewrite_checkpoint_restore(sel_reuse) && sel.rewrite_state &&
-            state_store->valid(*sel.rewrite_state)) {
-            return state_store->residency(*sel.rewrite_state);
-        }
-        if (sel_reuse == ReusePath::PrivateLongAnchor && details.selected_checkpoint &&
-            details.selected_checkpoint->kind == runtime::CheckpointKind::LongAnchor) {
-            for (const LongAnchorCheckpoint& anchor : sel.long_anchors) {
-                if (anchor.frontier == details.selected_checkpoint->frontier &&
-                    anchor.ordinal == details.selected_checkpoint->ordinal &&
-                    state_store->valid(anchor.state)) {
-                    return state_store->residency(anchor.state);
-                }
-            }
-        }
-        return StateReplicaResidency::None;
-    }();
-
-    if (source_state != nullptr && selected_residency == StateReplicaResidency::None) {
+    if (source_state != nullptr && resident_resources(*source_state).device.state_slots == 0 &&
+        resident_resources(*source_state).host.state_slots == 0) {
         // P2.4 step 0: trace the loss path — the zero-residency source's
         // identity plus the store census at the moment materialization fails.
         const SequenceState& src = *source_state;
