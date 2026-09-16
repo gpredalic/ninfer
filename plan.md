@@ -790,6 +790,28 @@ shared meter.
         `entitlement_mismatch` / `no_resident_state` counters parse and gate
         (positive replan path verified live, not in e2e — relief did not
         fire in the e2e run, non-deterministic WARN as before).
+        **Shipped `0c364877`, e2e-verified 2026-09-16 13:41 (phases 11–13,
+        16P/6W/0F):** the backstop is live. `retain_unit_before_state_loss()`
+        at the top of `release_continuation_slot`: if the slot holds a live
+        unit (KV retained + identity + frontier) and the net does not retain
+        it, the existing spill path captures the complete unit before the
+        state half dies; net refuses → the loss is allowed (graceful
+        degrade, logged). Scope analysis: after the gate fix + pre-consume
+        spill (start_request) + victim-path spills, the superseded-endpoint
+        / dropped-rewrite release sites (11316/11369/9421) lose only
+        frontiers no future request references (clients always rewind to the
+        LATEST rewrite), so the slot release is the single site where a
+        NEEDED frontier can lose its last restorable copy. `retains()`
+        mirrors find(): an entry covers the unit at its OWN execution or
+        checkpoint frontier, matched by ledger tokens AND identity (the
+        identity alone — token types/positions — cannot distinguish
+        same-shape units; caught by the unit test), or by session key
+        (thinking-mode fallback); a longer entry does not cover a shorter
+        frontier (the state image rides at the entry's frontier). Phase 13:
+        **13 backstops fired** (the guard's positive path, e2e-verified),
+        zero orphaned state images, zero 'private source result is missing';
+        the only worker recovery was the known P4.2 class. Unit tests pin
+        the retains() semantics (test_host_kv_safety_net.cpp).
       - **Increment 2 — net as the unit's host home (census + move-not-copy).**
         The net's `state_host` buffers are untracked host replicas (invisible
         to the store census, state_image_store.h:166–205) and net restore
