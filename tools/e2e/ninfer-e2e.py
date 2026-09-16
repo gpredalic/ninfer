@@ -446,6 +446,7 @@ def parse_serve_log(path, skip_lines=0):
         "pressure_expansion_fail",
         "state_replan",
         "entitlement_mismatch",
+        "no_resident_state",
     ]}
     d["evict_pages"] = []
     d["checkpoint_frontiers"] = []
@@ -562,6 +563,12 @@ def parse_serve_log(path, skip_lines=0):
                 # The strict check still rejects a core-incomplete mismatch.
                 if "[entitlement] MISMATCH" in line:
                     d["entitlement_mismatch"] += 1
+                # P2.4 exit criterion: a materialization whose selected state
+                # image has no replica anywhere (true last-replica loss) —
+                # the request degrades to root prefill, so this is a WARN,
+                # not a hard FAIL (the unit invariant is enforced upstream).
+                if "no resident state" in line:
+                    d["no_resident_state"] += 1
                 # The adopt-path error that followed the leak in prod: the
                 # root-prefill fallback publishes no source, but the admission
                 # claim still expects one.
@@ -590,6 +597,8 @@ def evaluate(phase_name, sessions, stats0, stats1, log, expect_trash=False):
         v.append(f"FAIL: {log['bad_alloc']} std::bad_alloc — OOM was not prevented")
     if log.get("hostonly_restore_fail", 0) > 0:
         v.append(f"WARN: {log['hostonly_restore_fail']} HostOnly restore failures (aborted to root prefill)")
+    if log.get("no_resident_state", 0) > 0:
+        v.append(f"WARN: {log['no_resident_state']} 'no resident state' losses (P2.4 exit criterion is 0; degraded to root prefill)")
     if log.get("kv_not_resident_no_device", 0) > 0:
         v.append(f"WARN: {log['kv_not_resident_no_device']} pages with no device replica (demoted to host)")
     if log.get("mixed_copy_ok", 0) > 0:
