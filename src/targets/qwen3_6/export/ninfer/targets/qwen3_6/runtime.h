@@ -716,6 +716,7 @@ public:
     // exhaustion (device state pool full) is the parallel-large-session bad_alloc
     // signature; KV-page exhaustion rules the page pool in or out.
     [[nodiscard]] std::uint64_t materialize_state_slot_alloc_failures() const noexcept;
+    [[nodiscard]] std::uint64_t materialize_dual_device_replica_drops() const noexcept;
     [[nodiscard]] std::uint64_t materialize_kv_page_alloc_failures() const noexcept;
     // Per-pool KV reservation failures: main (attention) vs backend (MTP/DFlash).
     [[nodiscard]] std::uint64_t materialize_kv_page_alloc_failures_main() const noexcept;

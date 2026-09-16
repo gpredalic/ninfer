@@ -277,6 +277,10 @@ template <>
 std::uint64_t Program<Variant>::materialize_state_slot_alloc_failures() const noexcept {
     return impl_ ? impl_->materialize_state_slot_alloc_failures() : 0;
 }
+template <>
+std::uint64_t Program<Variant>::materialize_dual_device_replica_drops() const noexcept {
+    return impl_ ? impl_->materialize_dual_device_replica_drops() : 0;
+}
 
 template <>
 std::uint64_t Program<Variant>::materialize_kv_page_alloc_failures() const noexcept {

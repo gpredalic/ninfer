@@ -72,7 +72,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--context-cost-presets FILE] "
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
            "[--media-preprocess-threads N] "
-           "[--device-state-slots N] [--host-state-slots N] [--host-kv-mib N] "
+           "[--device-state-slots N] [--host-state-slots N] [--host-kv-mib N] [--host-cache-mib N] "
            "[--max-private-continuations N] [--max-shared-prefixes N] "
            "[--max-long-anchors-per-continuation N] "
            "[--request-log-jsonl FILE] [--request-log-max-mib N] [--request-log-keep N] "
@@ -111,6 +111,10 @@ std::string serve_usage_text(const char* argv0) {
            "shared=concurrency, anchors=2; Host state=8 slots, Host KV=8192 MiB\n"
            "       --device-state-slots is extra checkpoint capacity beyond active lanes; "
            "--host-kv-mib uses MiB\n"
+           "       --host-cache-mib sets one total host cache budget (MiB): ~20% checkpoint "
+           "state pool (slot count derived from the model's state image size), ~80% host KV "
+           "arena; explicit --host-state-slots / --host-kv-mib keep their values and are "
+           "subtracted from the total\n"
            "       --default-thinking-budget caps model-origin thinking for enabled requests; "
            "control tokens count toward the request output limit\n"
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
@@ -228,6 +232,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--host-state-slots") {
             options.context_cache.host_state_slots = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--host-state-slots"), "host-state-slots"));
+            options.context_cache.host_state_slots_explicit = true;
             context_capacity_explicit = true;
         } else if (arg == "--host-kv-mib") {
             const std::uint64_t mib = parse_u64(require_value("--host-kv-mib"), "host-kv-mib");
@@ -235,7 +240,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 throw std::invalid_argument("--host-kv-mib is out of range");
             }
             options.context_cache.host_kv_capacity_bytes = static_cast<std::size_t>(mib << 20);
+            options.context_cache.host_kv_explicit       = true;
             context_capacity_explicit                    = true;
+        } else if (arg == "--host-cache-mib") {
+            const std::uint64_t mib = parse_u64(require_value("--host-cache-mib"), "host-cache-mib");
+            if (mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
+                throw std::invalid_argument("--host-cache-mib is out of range");
+            }
+            options.context_cache.host_cache_mib = mib;
+            context_capacity_explicit            = true;
         } else if (arg == "--max-private-continuations") {
             options.context_cache.max_private_continuations =
                 static_cast<std::uint32_t>(parse_nonnegative_int(

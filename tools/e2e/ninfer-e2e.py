@@ -442,6 +442,7 @@ def parse_serve_log(path, skip_lines=0):
         "state_lease_orphan",
         "missing_source_result",
         "relief_demote",
+        "relief_dual_drop",
     ]}
     d["evict_pages"] = []
     d["checkpoint_frontiers"] = []
@@ -536,11 +537,15 @@ def parse_serve_log(path, skip_lines=0):
                     d["state_lease_orphan"] += 1
                 elif "[state-lease] retained (shared prefix)" in line:
                     d["state_lease_leak"] += 1
-                # State relief: a checkpoint demoted to host to free a device
-                # slot for an H2D restore. Its presence proves the
-                # pool-saturation + restore path was exercised.
-                if "[relief] demoted" in line:
+                # State relief: freeing device state slots for an H2D restore —
+                # demoting a DeviceOnly checkpoint to host, or dropping the
+                # redundant device replica of a dual-resident checkpoint (its
+                # host half is current). Presence proves the pool-saturation +
+                # restore path was exercised.
+                if "[relief] demoted" in line or "[relief] freed" in line:
                     d["relief_demote"] += 1
+                    if " dropped " in line and "dropped 0 dual" not in line:
+                        d["relief_dual_drop"] += 1
                 # The adopt-path error that followed the leak in prod: the
                 # root-prefill fallback publishes no source, but the admission
                 # claim still expects one.
@@ -584,16 +589,16 @@ def evaluate(phase_name, sessions, stats0, stats1, log, expect_trash=False):
     if log["bad_alloc"] > 0 and phase_name in ("trash", "mixed", "concurrent", "tool-calling"):
         v.append(f"PASS: {log['bad_alloc']} std::bad_alloc caught and recovered (extreme pressure handled)")
 
-    # Pressure (skip for single-session phases)
+    # Pressure (skip for single-session phases and state-pool phases)
     pressure = evicted > 0 or degraded > 0
-    if phase_name not in ("checkpoint-advance", "tool-calling", "responses-tools", "reasoning-effort", "concurrent", "thinking-sig", "demotion"):
+    if phase_name not in ("checkpoint-advance", "tool-calling", "responses-tools", "reasoning-effort", "concurrent", "thinking-sig", "demotion", "state-saturation"):
         if not pressure and not expect_trash:
             v.append("FAIL: no KV pressure")
         if pressure:
             v.append(f"PASS: pressure (evicted={evicted}, degraded={degraded})")
 
-    # Cache reuse (skip for single-session phases)
-    if phase_name not in ("checkpoint-advance", "tool-calling", "responses-tools", "reasoning-effort", "concurrent", "thinking-sig", "demotion"):
+    # Cache reuse (skip for single-session phases and state-pool phases)
+    if phase_name not in ("checkpoint-advance", "tool-calling", "responses-tools", "reasoning-effort", "concurrent", "thinking-sig", "demotion", "state-saturation"):
         if reused > 0:
             v.append(f"PASS: cache reuse ({reused} tokens)")
         elif not expect_trash:
@@ -760,6 +765,8 @@ def evaluate(phase_name, sessions, stats0, stats1, log, expect_trash=False):
     # But restore without demotion would be unexpected
     if log["checkpoint_restored"] > 0 and log["checkpoint_demoted"] == 0:
         v.append(f"WARN: {log['checkpoint_restored']} restores without demotions (unexpected)")
+    if log["relief_dual_drop"] > 0:
+        v.append(f"PASS: {log['relief_dual_drop']} dual device-replica drops relieved a saturated state pool")
 
     # Concurrent sessions (concurrent phase)
     if phase_name == "concurrent":
@@ -863,7 +870,7 @@ def main():
     p.add_argument("--serve-log", default="/home/zenz/ninfer-serve.log")
     p.add_argument("--timeout", type=int, default=120)
     p.add_argument("--start-phase", type=int, default=1,
-                   help="run phases N..12 (for split runs across separate e2e server windows)")
+                   help="run phases N..13 (for split runs across separate e2e server windows)")
     args = p.parse_args()
 
     # Verify we're running against the test server, not production.
@@ -898,7 +905,7 @@ def main():
 
     all_verdicts = []
     phases = (phase_1, phase_2, phase_3, phase_4, phase_5, phase_6, phase_7,
-              phase_8, phase_9, phase_10, phase_11, phase_12)
+              phase_8, phase_9, phase_10, phase_11, phase_12, phase_13)
     for i, phase_fn in enumerate(phases, start=1):
         if i < args.start_phase:
             print(f"=== Phase {i}: skipped (--start-phase {args.start_phase}) ===")
@@ -1400,6 +1407,67 @@ def phase_12(args):
         all_verdicts.append(("state-lease", "WARN: no checkpoint demote/restore/relief observed — state pool never pressurized (H2D-restore path may be unexercised)"))
     else:
         all_verdicts.append(("state-lease", f"PASS: state pool pressurized (demoted={demoted}, restored={restored}, relief={log12['relief_demote']})"))
+    return all_verdicts
+
+
+def phase_13(args):
+    all_verdicts = []
+    # Phase 13: state-saturation — the device state pool at 100% with a
+    # HostOnly checkpoint that must be restored (H2D) while it stays full.
+    # This is the exact production class that 500ed on 2026-09-16: the
+    # rewrite-restore H2D takes a NEW device slot, and the emergency relief
+    # must free one (DeviceOnly demotion, or dropping the redundant device
+    # replica of a dual-resident checkpoint) or the materialization throws
+    # std::bad_alloc. Phases 11/12 pressurize the pool but do not saturate
+    # it (relief=0 in a full run), so this phase exists to force the
+    # saturated-restore path: more thinking sessions (5) than decode lanes
+    # (3), so the working set (endpoint + fork-write + rewrite checkpoint per
+    # active session) exceeds the 8-slot pool (3 cache + 5 active).
+    print("\n=== Phase 13: state-saturation (6 tool-calling sessions, 8 rounds, pool at 100%) ===")
+    log_off = count_log_lines(args.serve_log)
+    stats0 = get_stats(args)
+    # Tool-calling sessions (the production shape): every tool-call turn is a
+    # rewrite boundary, so turns capture rewrite checkpoints — the images the
+    # saturated H2D-restore relief path operates on. Plain thinking turns
+    # capture almost none (ckpt=0), which leaves the pool full of endpoints
+    # only and never triggers the relief path.
+    s13 = [ChatSession(f"SS{i}", 10000, 1500, args) for i in range(6)]
+    for s in s13:
+        s.args = type(args)(**vars(args))
+        s.args.max_output_tokens = 512
+    for r in range(1, 9):
+        print(f"Round {r}:")
+        errors = run_round(s13, r, args.timeout)
+        if errors:
+            for n, e in errors: print(f"  ERROR {n}: {e}")
+            print("  Retrying failed sessions...")
+            time.sleep(3)
+            failed = [s for s in s13 if s.name in [n for n, _ in errors]]
+            errors2 = run_round(failed, r, args.timeout)
+            if errors2:
+                for n, e in errors2: print(f"  ERROR {n}: {e}")
+            continue
+    stats1 = get_stats(args)
+    log13 = parse_serve_log(args.serve_log, log_off)
+    for v in evaluate("state-saturation", s13, stats0, stats1, log13):
+        all_verdicts.append(("state-saturation", v))
+    # Phase-specific gates: a saturated restore must never 500.
+    if log13["worker_recover"] > 0:
+        all_verdicts.append(("state-saturation", f"FAIL: {log13['worker_recover']} worker recoveries — saturated restore failed (relief did not free a slot)"))
+    else:
+        all_verdicts.append(("state-saturation", "PASS: zero worker recoveries (saturated restores resolved)"))
+    # Occupancy readout: did the pool actually reach its ceiling?
+    p1 = (stats1.get("pressure", {}) or {})
+    cap = p1.get("checkpoint_device_state_slots", 0)
+    occ = p1.get("device_state_occupied_slots", 0)
+    if cap and occ >= cap:
+        all_verdicts.append(("state-saturation", f"PASS: device state pool saturated ({occ}/{cap} at phase end)"))
+    else:
+        all_verdicts.append(("state-saturation", f"WARN: device state pool not saturated ({occ}/{cap} at phase end)"))
+    if log13["relief_demote"] > 0:
+        all_verdicts.append(("state-saturation", f"PASS: relief freed device state slots {log13['relief_demote']}x (dual drops: {log13['relief_dual_drop']})"))
+    else:
+        all_verdicts.append(("state-saturation", "WARN: relief never fired — pool may not have saturated (non-deterministic; the no-OOM gate still holds)"))
     return all_verdicts
 
 

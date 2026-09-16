@@ -222,11 +222,43 @@ public:
         return best;
     }
 
+    // Second relief tier: the least-recently-frozen DUAL (Both) checkpoint whose
+    // device replica is redundant — the host half is current (not stale), the
+    // image is unpinned, and no transfer is in flight. Dropping the device
+    // replica (drop_device_replica) frees a device slot with no copy, keeping
+    // the {KV + state} unit complete in the host pool. coldest_demotable_checkpoint
+    // (DeviceOnly -> host) is tried first; this tier is what makes materialization
+    // relief work in the post-spill steady state, where every device image
+    // already has a host replica and the first tier finds nothing.
+    [[nodiscard]] std::optional<StateImageHandle> coldest_dual_device_replica() const noexcept {
+        std::optional<StateImageHandle> best;
+        std::uint64_t best_epoch = 0;
+        for (std::size_t index = 0; index < objects_.size(); ++index) {
+            const Object& object = objects_[index];
+            if (object.role != StateImageRole::CheckpointImmutable || !object.device_slot ||
+                !object.host_slot || object.host_replica_stale || object.source_pins != 0 ||
+                object.destination_pinned || has_pending_replica(object)) {
+                continue;
+            }
+            if (!best || object.content_epoch < best_epoch) {
+                best = StateImageHandle(this, static_cast<std::uint32_t>(index), object.generation);
+                best_epoch = object.content_epoch;
+            }
+        }
+        return best;
+    }
+
     // Device state-slot allocation attempts that returned nothing because the
     // pool was exhausted (for /stats). This is the direct signature of the
     // 6/6 device-state-pool-full bad_alloc under parallel large sessions.
     [[nodiscard]] std::uint64_t state_slot_alloc_failures() const noexcept {
         return state_slot_alloc_failures_;
+    }
+
+    // Redundant device replicas dropped from dual-resident checkpoints by the
+    // materialization relief path (device slot freed, host half retained).
+    [[nodiscard]] std::uint64_t dual_device_replica_drops() const noexcept {
+        return dual_device_replica_drops_;
     }
 
     [[nodiscard]] std::optional<StateImageHandle> reserve_destination() noexcept {
@@ -354,12 +386,13 @@ public:
         if (!valid(handle)) { return false; }
         Object& object = objects_[handle.index_];
         if (object.role != StateImageRole::CheckpointImmutable || !object.device_slot ||
-            !object.host_slot || object.source_pins != 0 || object.destination_pinned ||
-            has_pending_replica(object)) {
+            !object.host_slot || object.host_replica_stale || object.source_pins != 0 ||
+            object.destination_pinned || has_pending_replica(object)) {
             return false;
         }
         return_device_slot(*object.device_slot);
         object.device_slot.reset();
+        ++dual_device_replica_drops_;
         return true;
     }
 
@@ -455,6 +488,7 @@ public:
             object.destination_pinned || has_pending_replica(object)) {
             throw std::logic_error("StateImage checkpoint is not thawable");
         }
+        if (object.host_slot) { object.host_replica_stale = true; }
         object.role = StateImageRole::ActiveMutable;
     }
 
@@ -683,6 +717,7 @@ public:
         case StateTransferDirection::DeviceToHost:
             source.host_slot = source.pending_host_slot;
             source.pending_host_slot.reset();
+            source.host_replica_stale = false;
             if (!keep_source_replica) {
                 return_device_slot(*source.device_slot);
                 source.device_slot.reset();
@@ -779,6 +814,11 @@ private:
         std::uint32_t checkpoint_references = 0;
         std::uint32_t source_pins           = 0;
         bool destination_pinned             = false;
+        // The device replica is newer than the host replica: the image was
+        // thawed (made writable) while retaining its host slot, so the host
+        // half no longer mirrors the device content. drop_device_replica must
+        // not touch such an image until a DeviceToHost publish refreshes it.
+        bool host_replica_stale             = false;
         StateImageRole role                 = StateImageRole::Free;
     };
 
@@ -858,6 +898,7 @@ private:
     std::uint32_t free_object_count_  = 0;
     std::uint32_t free_device_count_  = 0;
     std::uint64_t state_slot_alloc_failures_ = 0;
+    std::uint64_t dual_device_replica_drops_ = 0;
     std::uint64_t next_content_epoch_ = 0;
     std::uint64_t next_transfer_id_   = 0;
 };

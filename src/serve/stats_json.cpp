@@ -73,6 +73,7 @@ std::string format_stats_json(const StatsSnapshot& s) {
               {"device_backend_kv_occupied_pages", s.scheduler.device_backend_kv_occupied_pages},
               {"device_state_occupied_slots", s.scheduler.device_state_occupied_slots},
               {"materialize_state_slot_alloc_failures", s.scheduler.materialize_state_slot_alloc_failures},
+              {"materialize_dual_device_replica_drops", s.scheduler.materialize_dual_device_replica_drops},
               {"materialize_kv_page_alloc_failures", s.scheduler.materialize_kv_page_alloc_failures},
               {"materialize_kv_page_alloc_failures_main", s.scheduler.materialize_kv_page_alloc_failures_main},
               {"materialize_kv_page_alloc_failures_backend", s.scheduler.materialize_kv_page_alloc_failures_backend},

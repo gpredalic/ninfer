@@ -150,8 +150,47 @@ void test_state_store(ninfer::DeviceContext& device) {
                images.residency(*fork_one) == store::StateReplicaResidency::DeviceOnly &&
                images.residency(*fork_two) == store::StateReplicaResidency::DeviceOnly,
            "Host State forks publish independent Device destinations");
-    expect(images.release(*host_source) && images.release(*moved_device) &&
-               images.release(*fork_one) && images.release(*fork_two) && host.occupied() == 0,
+
+    // A checkpoint that became writable while retaining its host replica (stale
+    // host half) is never a drop candidate — the device half is the truth.
+    expect(images.release(*fork_two), "fork destination releases to free a device slot");
+    const auto stale_img = images.reserve_reset(device.stream);
+    expect(stale_img.has_value(), "stale dual source allocation");
+    images.freeze(*stale_img);
+    auto stale_d2h = images.begin_device_to_host(*stale_img, device.transfer_stream);
+    expect(stale_d2h.has_value(), "stale dual source D2H reservation");
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+    images.publish_transfer(std::move(*stale_d2h), true);
+    expect(images.residency(*stale_img) == store::StateReplicaResidency::Both,
+           "stale dual source publishes Both residency");
+    images.thaw(*stale_img);
+    images.freeze(*stale_img);
+    expect(images.coldest_dual_device_replica() == std::nullopt,
+           "stale host half excludes the image from dual relief");
+    expect(!images.drop_device_replica(*stale_img), "stale dual replica refuses to drop");
+    expect(images.release(*stale_img), "stale dual source releases");
+
+    // Dual-replica relief: a Both checkpoint whose host half is current is a
+    // candidate; dropping the device replica frees the device slot with no
+    // transfer and keeps the unit complete in the host pool.
+    const auto dual_img = images.reserve_reset(device.stream);
+    expect(dual_img.has_value(), "dual relief source allocation");
+    images.freeze(*dual_img);
+    auto dual_d2h = images.begin_device_to_host(*dual_img, device.transfer_stream);
+    expect(dual_d2h.has_value(), "dual relief source D2H reservation");
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+    images.publish_transfer(std::move(*dual_d2h), true);
+    expect(images.residency(*dual_img) == store::StateReplicaResidency::Both,
+           "dual relief source publishes Both residency");
+    expect(images.coldest_dual_device_replica() == *dual_img,
+           "dual relief candidate selection finds the only Both checkpoint");
+    expect(images.drop_device_replica(*dual_img), "dual device replica drops");
+    expect(images.residency(*dual_img) == store::StateReplicaResidency::HostOnly &&
+               images.dual_device_replica_drops() == 1,
+           "dual drop frees the device slot and keeps the Host replica");
+
+    expect(images.release(*host_source) && images.release(*dual_img) &&
+               images.release(*moved_device) && images.release(*fork_one) && host.occupied() == 0,
            "State Host/Device replica ownership closes without leaked slots");
 }
 

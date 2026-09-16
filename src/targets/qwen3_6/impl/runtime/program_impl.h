@@ -4765,33 +4765,56 @@ void ProgramImplCore::prepare_consumed_source(MaterializationTransaction& transa
 
 std::uint32_t ProgramImplCore::demote_checkpoints_to_make_room(std::uint32_t needed_device_slots) {
     if (state_store == nullptr || host_state_images == nullptr) { return 0; }
-    std::uint32_t demoted = 0;
+    std::uint32_t demoted    = 0;
+    std::uint32_t dropped    = 0;
+    bool dual_tier           = false;
     for (;;) {
         const std::uint32_t free_slots =
             state_store->device_capacity() - state_store->device_occupied();
         if (free_slots >= needed_device_slots) { break; }
-        const std::optional<StateImageHandle> candidate =
-            state_store->coldest_demotable_checkpoint();
-        if (!candidate) { break; }
-        std::optional<StateImageTransfer> transfer =
-            state_store->begin_device_to_host(*candidate, device.transfer_stream);
-        if (!transfer) { break; }  // Host pool full or the candidate changed
-        try {
-            // Synchronous demotion: the device slot is released at publication,
-            // so the D2H copy must complete first (the safety-net spill uses the
-            // same pattern).
-            CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
-            state_store->publish_transfer(std::move(*transfer), false);
+        if (!dual_tier) {
+            const std::optional<StateImageHandle> candidate =
+                state_store->coldest_demotable_checkpoint();
+            if (!candidate) {
+                dual_tier = true;
+                continue;
+            }
+            std::optional<StateImageTransfer> transfer =
+                state_store->begin_device_to_host(*candidate, device.transfer_stream);
+            if (!transfer) {
+                // Host pool full (or the candidate changed): a dual device-replica
+                // drop needs no host slot, so fall through to the second tier.
+                dual_tier = true;
+                continue;
+            }
+            try {
+                // Synchronous demotion: the device slot is released at publication,
+                // so the D2H copy must complete first (the safety-net spill uses the
+                // same pattern).
+                CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+                state_store->publish_transfer(std::move(*transfer), false);
+                ++demoted;
+            } catch (...) {
+                state_store->abort_transfer(std::move(*transfer));
+                break;
+            }
+        } else {
+            // Second tier: the pool is saturated with dual-resident checkpoints
+            // (every device image already has a host replica), so the first tier
+            // finds nothing. Drop the coldest redundant device replica — the host
+            // half is current, so the {KV + state} unit stays complete.
+            const std::optional<StateImageHandle> candidate =
+                state_store->coldest_dual_device_replica();
+            if (!candidate || !state_store->drop_device_replica(*candidate)) { break; }
             ++demoted;
-        } catch (...) {
-            state_store->abort_transfer(std::move(*transfer));
-            break;
+            ++dropped;
         }
     }
     if (demoted > 0) {
         std::fprintf(stderr,
-                     "[relief] demoted %u checkpoint state(s) to host (needed %u device slot(s))\n",
-                     demoted, needed_device_slots);
+                     "[relief] freed %u device state slot(s) (demoted %u to host, dropped %u "
+                     "dual) (needed %u)\n",
+                     demoted, demoted - dropped, dropped, needed_device_slots);
     }
     return demoted;
 }
@@ -6811,6 +6834,9 @@ std::uint64_t ProgramImplCore::host_kv_eviction_count() const noexcept {
 
 std::uint64_t ProgramImplCore::materialize_state_slot_alloc_failures() const noexcept {
     return state_store ? state_store->state_slot_alloc_failures() : 0;
+}
+std::uint64_t ProgramImplCore::materialize_dual_device_replica_drops() const noexcept {
+    return state_store ? state_store->dual_device_replica_drops() : 0;
 }
 
 std::uint64_t ProgramImplCore::materialize_kv_page_alloc_failures() const noexcept {
@@ -11335,14 +11361,17 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                 std::fprintf(stderr,
                     "[rewrite-restore] restoring HostOnly checkpoint to device (frontier=%u)\n",
                     sequence.rewrite_checkpoint.frontier);
-                // begin_host_to_device takes a NEW device slot. The planner
-                // modeled this state as device-resident (stale after a
-                // post-admission demotion), so no relief was scheduled.
-                // Demote the coldest demotable checkpoint until a slot is
-                // free — otherwise a saturated pool fails the restore and
-                // the request errors out ("no resident state" -> root
-                // fallback -> adopt contract error).
-                (void)demote_checkpoints_to_make_room(1);
+                // begin_host_to_device takes a NEW device slot, and
+                // reserve_state_entitlement below may reserve the planned
+                // destination slot on top of it. The planner modeled this
+                // state as device-resident (stale after a post-admission
+                // demotion), so no relief was scheduled: demote enough for
+                // the whole entitlement — a saturated pool otherwise fails
+                // the restore or the final destination reserve ("no resident
+                // state" / bad_alloc -> root fallback / adopt contract error).
+                const std::uint32_t footprint = state_footprint(sequence);
+                (void)demote_checkpoints_to_make_room(
+                    state_slots > footprint ? state_slots - footprint : 1);
                 auto restore = state_store->begin_host_to_device(checkpoint, device.transfer_stream);
                 if (!restore) {
                     throw std::logic_error("materialization source has no resident state");
@@ -12216,6 +12245,12 @@ void ProgramImplCore::reserve_state_entitlement(SequenceState& sequence, std::ui
         throw std::logic_error("sequence StateImage reservation is not a single destination");
     }
     std::optional<StateImageHandle> reserved = state_store->reserve_destination();
+    if (!reserved) {
+        // Saturated pool: free one slot (DeviceOnly demotion first, then a
+        // redundant dual device replica) and retry once.
+        (void)demote_checkpoints_to_make_room(1);
+        reserved = state_store->reserve_destination();
+    }
     if (!reserved) { throw std::bad_alloc(); }
     sequence.reserved_state = *reserved;
     if (state_footprint(sequence) != slots) {

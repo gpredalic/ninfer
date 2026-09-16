@@ -585,6 +585,7 @@ public:
     [[nodiscard]] std::uint64_t host_kv_eviction_count() const noexcept;
     // Materialization allocation failures by resource (for /stats).
     [[nodiscard]] std::uint64_t materialize_state_slot_alloc_failures() const noexcept;
+    [[nodiscard]] std::uint64_t materialize_dual_device_replica_drops() const noexcept;
     [[nodiscard]] std::uint64_t materialize_kv_page_alloc_failures() const noexcept;
     // Per-pool KV reservation failures: main (attention) vs backend (MTP/DFlash)
     // — the summed counter cannot say which pool is binding.

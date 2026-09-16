@@ -1134,6 +1134,7 @@ public:
         out.host_kv_compactions           = program.host_kv_compaction_count();
         out.host_kv_evictions             = program.host_kv_eviction_count();
         out.materialize_state_slot_alloc_failures = program.materialize_state_slot_alloc_failures();
+        out.materialize_dual_device_replica_drops = program.materialize_dual_device_replica_drops();
         out.materialize_kv_page_alloc_failures    = program.materialize_kv_page_alloc_failures();
         out.materialize_kv_page_alloc_failures_main    = program.materialize_kv_page_alloc_failures_main();
         out.materialize_kv_page_alloc_failures_backend = program.materialize_kv_page_alloc_failures_backend();

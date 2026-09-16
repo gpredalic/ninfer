@@ -561,6 +561,9 @@ public:
     [[nodiscard]] std::uint64_t materialize_state_slot_alloc_failures() const noexcept {
         return 0;
     }
+    [[nodiscard]] std::uint64_t materialize_dual_device_replica_drops() const noexcept {
+        return 0;
+    }
     [[nodiscard]] std::uint64_t materialize_kv_page_alloc_failures() const noexcept {
         return 0;
     }

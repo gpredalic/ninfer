@@ -92,6 +92,15 @@ struct ContextCacheOptions {
     // Host StateImages and Host KV bytes are independently configured pinned-memory capacities.
     std::uint32_t host_state_slots     = kDefaultHostStateSlots;
     std::size_t host_kv_capacity_bytes = kDefaultHostKvCapacityBytes;
+    // P2.6: single-knob host cache budget (MiB). When > 0, the total is split ~20%
+    // checkpoint state pool (slots derived from the model's state image size) /
+    // ~80% host KV arena, per component below unless that component was set
+    // explicitly (its explicit bytes/slots are subtracted from the total).
+    std::uint64_t host_cache_mib = 0;
+    // P2.6: set by the CLI when --host-state-slots / --host-kv-mib were given, so the
+    // host_cache_mib split leaves the explicit component untouched.
+    bool host_state_slots_explicit = false;
+    bool host_kv_explicit          = false;
     // Bounded private/shared logical catalogs and per-continuation long-anchor count.
     std::optional<std::uint32_t> max_private_continuations;
     std::optional<std::uint32_t> max_shared_prefixes;
@@ -873,6 +882,7 @@ struct RuntimeStats {
     // bad_alloc signature; KV-page and host-arena failures rule the others in
     // or out.
     std::uint64_t materialize_state_slot_alloc_failures = 0;
+    std::uint64_t materialize_dual_device_replica_drops = 0;
     std::uint64_t materialize_kv_page_alloc_failures    = 0;
     // Per-pool KV reservation failures: the summed counter cannot say which
     // pool (main attention vs MTP/DFlash backend) is binding.
