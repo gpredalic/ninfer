@@ -125,7 +125,8 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                 return true;
             }
             stream->started = true;
-            SseTransport transport(sink, stream->cancelled);
+            SseTransport transport(sink, stream->cancelled, SseTransport::kHeartbeatInterval,
+                                   SseTransport::Clock::now(), SseTransport::kHeartbeatAnthropic);
 
             try {
                 StreamSink output;
