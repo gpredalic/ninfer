@@ -778,6 +778,18 @@ shared meter.
         CORE image loses its last replica (the core check throws there by
         design). e2e: the parser tracks `[replan]` and `[entitlement]
         MISMATCH`; phase 13 gains PASS/FAIL lines for both.
+        **Live-verified + e2e-verified (2026-09-16):** deployed 13:01
+        (PID 252366). First live `[replan]` at 13:05:34 — the protected
+        request (122k-prompt, 121k-token checkpoint restore) completed
+        cleanly; 6+ replans by 13:09, **0 `[entitlement] MISMATCH`, 0 500s,
+        0 worker recoveries** since the restart (the class was 500ing every
+        ~30s pre-deploy). Full 13-phase e2e suite green (two runs: 1–11
+        capped at the 420s suite cap, 12–13 via `E2E_START_PHASE=12`):
+        0 FAIL total; phase 13 pool saturated 8/8, zero worker recoveries,
+        zero orphaned state images; the new `state_replan` /
+        `entitlement_mismatch` / `no_resident_state` counters parse and gate
+        (positive replan path verified live, not in e2e — relief did not
+        fire in the e2e run, non-deterministic WARN as before).
       - **Increment 2 — net as the unit's host home (census + move-not-copy).**
         The net's `state_host` buffers are untracked host replicas (invisible
         to the store census, state_image_store.h:166–205) and net restore
