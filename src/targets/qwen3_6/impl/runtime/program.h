@@ -578,6 +578,11 @@ public:
         const runtime::ContextMachineCostModel& machine_cost);
     // Copy a victim continuation's device KV to host RAM before eviction.
     void spill_victim_to_host_kv_safety_net(std::uint32_t index) noexcept;
+    // P2.4 Increment 1 (spill-before-loss): before a continuation slot is
+    // released, ensure the unit's complete {KV + state} is retained in the
+    // host safety net — the unit invariant forbids the state half losing its
+    // last restorable copy while the KV half is still retained.
+    void retain_unit_before_state_loss(std::uint32_t index) noexcept;
     [[nodiscard]] std::uint64_t safety_net_restore_count() const noexcept;
     // Host-KV arena fragmentation counters and safety-net evictions (for /stats).
     [[nodiscard]] std::uint64_t host_kv_single_alloc_failures() const noexcept;

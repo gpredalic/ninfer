@@ -722,6 +722,52 @@ public:
         return true;
     }
 
+    // P2.4 Increment 1 (spill-before-loss): is a unit with this identity still
+    // retained in the net — i.e. can a future request for this unit be
+    // restored from it? A frontier F is covered by an entry with the same
+    // ledger prefix and identity at its execution frontier (a non-rewound
+    // follow-up extends it) or its checkpoint frontier (a rewound follow-up
+    // lands there); the session key covers the thinking-mode fallback (find()
+    // matches by session identity when the prefix diverges). Mirrors
+    // prefix_matches(): the ledger tokens AND the identity must agree — the
+    // identity alone (token types/positions) cannot distinguish units with
+    // the same shape and different content. Used to decide whether the store
+    // images of a unit being released are its LAST restorable copies.
+    [[nodiscard]] bool retains(const std::span<const TokenId>& unit_tokens,
+                               const ResidentPrefixIdentity& identity,
+                               const std::optional<qwen3_6::PreparedSessionKey>& session_key,
+                               std::uint32_t execution_frontier,
+                               std::uint32_t checkpoint_frontier) const noexcept {
+        const auto covers = [&](const HostKVSafetyNetEntry& entry, std::uint32_t frontier) {
+            if (frontier == 0 || entry.ledger.size() < frontier ||
+                unit_tokens.size() < frontier) {
+                return false;
+            }
+            if (!std::equal(unit_tokens.data(), unit_tokens.data() + static_cast<std::ptrdiff_t>(frontier),
+                            entry.ledger.begin())) {
+                return false;
+            }
+            return identity.prefix_equals(entry.prefix_identity, frontier);
+        };
+        for (const auto& entry : entries_) {
+            if (session_key && entry.session_key && *session_key == *entry.session_key) {
+                return true;
+            }
+            // find() matches an entry only at its OWN frontiers — a longer
+            // entry's ledger prefix does not cover a shorter frontier (the
+            // state image rides at the entry's frontier, not at every prefix).
+            if (entry.execution_frontier == execution_frontier &&
+                covers(entry, execution_frontier)) {
+                return true;
+            }
+            if (entry.checkpoint_valid && entry.checkpoint_frontier == checkpoint_frontier &&
+                covers(entry, checkpoint_frontier)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     void add(HostKVSafetyNetEntry entry) {
 
         // Atomicity first: KV and state are one unit, so a half unit is never stored.

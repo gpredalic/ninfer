@@ -7911,11 +7911,44 @@ std::optional<std::uint32_t> ProgramImplCore::allocate_continuation_slot() noexc
     return std::nullopt;
 }
 
+void ProgramImplCore::retain_unit_before_state_loss(std::uint32_t index) noexcept {
+    if (index >= continuation_capacity) { return; }
+    const SequenceState& sequence = continuation_states[index];
+    // A live unit: KV retained, an identity, and a frontier. A slot mid-
+    // materialization (reserved destination, nothing committed yet) has
+    // text_kv_valid == 0 and holds no unit content — nothing to retain.
+    if (!sequence.kv || sequence.text_kv_valid == 0 || sequence.prefix_identity.size() == 0 ||
+        sequence.execution_frontier == 0) {
+        return;
+    }
+    const std::uint32_t checkpoint_frontier =
+        sequence.rewrite_checkpoint.valid ? sequence.rewrite_checkpoint.frontier : 0;
+    // The net already retains the unit (a prior spill this turn, or a
+    // victim-path spill) — the store images are redundant copies; the release
+    // proceeds and the unit stays restorable from the net.
+    if (host_kv_safety_net.retains(std::span<const TokenId>(sequence.ledger),
+                                   sequence.prefix_identity, sequence.session_key,
+                                   sequence.execution_frontier, checkpoint_frontier)) {
+        return;
+    }
+    std::fprintf(stderr,
+                 "[spill-before-loss] index=%u frontier=%u ckpt=%u — unit not in net and its "
+                 "state is about to lose its last copy; spilling the complete unit\n",
+                 index, sequence.execution_frontier, checkpoint_frontier);
+    spill_victim_to_host_kv_safety_net(index);
+}
+
 void ProgramImplCore::release_continuation_slot(std::uint32_t index) noexcept {
     if (index >= continuation_capacity ||
         continuation_slots[index].role == ContinuationSlotRole::Free) {
         return;
     }
+    // P2.4 Increment 1: spill-before-loss backstop. The victim paths spill
+    // before releasing their victims; this covers every other caller (cancel/
+    // abort teardown, capacity pressure, transaction failure) and the case
+    // where a prior spill was refused by the net's host budget. If the net
+    // retains the unit this is a cheap no-op.
+    retain_unit_before_state_loss(index);
     SequenceState& sequence = continuation_states[index];
     release_active_shared_references(sequence);
     release_sequence_kv(sequence);

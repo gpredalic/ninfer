@@ -16,6 +16,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <span>
+#include <utility>
 #include <vector>
 
 using namespace ninfer::targets::qwen3_6::detail;
@@ -305,6 +307,90 @@ void test_session_protection() {
     }
 }
 
+// A ResidentPrefixIdentity over `tokens` distinct token IDs (identity
+// metadata as assign() requires: token types + 3 position axes).
+ResidentPrefixIdentity make_identity(std::size_t tokens, std::uint32_t token_base) {
+    ninfer::targets::qwen3_6::PreparedPromptData prompt;
+    prompt.token_ids.resize(tokens);
+    prompt.token_types.resize(tokens);
+    prompt.positions.resize(3 * tokens);
+    for (std::size_t i = 0; i < tokens; ++i) {
+        prompt.token_ids[i]   = static_cast<TokenId>(token_base + i);
+        prompt.token_types[i] = 0;
+        prompt.positions[i]           = static_cast<std::int32_t>(i);
+        prompt.positions[tokens + i]   = static_cast<std::int32_t>(i);
+        prompt.positions[2 * tokens + i] = static_cast<std::int32_t>(i);
+    }
+    ResidentPrefixIdentity identity;
+    identity.assign(prompt);
+    return identity;
+}
+
+void test_retains() {
+    HostKVSafetyNet net;
+    const auto unit_a = make_identity(1000, 0);
+    std::vector<TokenId> tokens_a(1000);
+    for (std::size_t i = 0; i < tokens_a.size(); ++i) { tokens_a[i] = static_cast<TokenId>(i); }
+    const std::span<const TokenId> unit_a_tokens(tokens_a);
+    auto entry        = lineage_entry(1000, 1024);
+    entry.prefix_identity    = unit_a;
+    entry.checkpoint_valid   = true;
+    entry.checkpoint_frontier = 800;
+    net.add(std::move(entry));
+
+    check(net.retains(unit_a_tokens, unit_a, {}, 1000, 800),
+          "unit retained at its execution frontier");
+    check(net.retains(unit_a_tokens, unit_a, {}, 0, 800),
+          "unit retained at its checkpoint frontier");
+    check(!net.retains(unit_a_tokens, unit_a, {}, 1200, 0), "no entry at a longer frontier");
+    check(!net.retains(unit_a_tokens, unit_a, {}, 0, 500),
+          "no entry at a shorter checkpoint frontier");
+    // Same identity shape (token types/positions), different token values:
+    // the ledger comparison must distinguish the units.
+    std::vector<TokenId> tokens_b(1000);
+    for (std::size_t i = 0; i < tokens_b.size(); ++i) {
+        tokens_b[i] = static_cast<TokenId>(1000000 + i);
+    }
+    const std::span<const TokenId> unit_b_tokens(tokens_b);
+    check(!net.retains(unit_b_tokens, make_identity(1000, 1000000), {}, 1000, 800),
+          "a different unit's tokens are not retained");
+
+    // Session key covers the thinking-mode fallback path (prefix matching
+    // fails there; find() matches by session identity instead). A distinct
+    // conversation with the key set: retains() must match on the key alone.
+    PreparedSessionKey key;
+    key.size = 4;
+    key.bytes[0] = 'a';
+    key.bytes[1] = 'b';
+    key.bytes[2] = 'c';
+    key.bytes[3] = 'd';
+    auto keyed = make_entry(5000, /*token_base=*/2000000, 1024);
+    keyed.prefix_identity = make_identity(5000, 2000000);
+    keyed.session_key     = key;
+    net.add(std::move(keyed));
+    check(net.retains(unit_a_tokens, make_identity(1200, 0), key, 1200, 0),
+          "session key retains the unit even at a frontier with no entry");
+    check(!net.retains(unit_a_tokens, make_identity(1200, 0), {}, 1200, 0),
+          "without the session key the same frontier is not retained");
+
+    // Supersede: a longer entry of the same lineage replaces the shorter one —
+    // the shorter frontier is no longer covered (a future request for this
+    // unit extends the NEW frontier, or rewinds to the new checkpoint).
+    std::vector<TokenId> tokens_long(2000);
+    for (std::size_t i = 0; i < tokens_long.size(); ++i) {
+        tokens_long[i] = static_cast<TokenId>(i);
+    }
+    const std::span<const TokenId> unit_long_tokens(tokens_long);
+    auto longer = lineage_entry(2000, 1024);
+    longer.prefix_identity = make_identity(2000, 0);
+    net.add(std::move(longer));
+    check(net.size() == 2, "longer entry superseded the shorter (keyed entry untouched)");
+    check(!net.retains(unit_a_tokens, unit_a, {}, 1000, 800),
+          "superseded frontier is no longer covered by the net");
+    check(net.retains(unit_long_tokens, make_identity(2000, 0), {}, 2000, 0),
+          "the new frontier is covered");
+}
+
 }  // namespace
 
 int main() {
@@ -312,6 +398,7 @@ int main() {
     test_liveness_eviction();
     test_select_victim_directly();
     test_session_protection();
+    test_retains();
     if (failures == 0) {
         std::fprintf(stderr, "PASS: host_kv_safety_net lifecycle\n");
         return 0;

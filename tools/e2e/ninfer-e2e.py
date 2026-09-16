@@ -447,6 +447,7 @@ def parse_serve_log(path, skip_lines=0):
         "state_replan",
         "entitlement_mismatch",
         "no_resident_state",
+        "spill_before_loss",
     ]}
     d["evict_pages"] = []
     d["checkpoint_frontiers"] = []
@@ -569,6 +570,11 @@ def parse_serve_log(path, skip_lines=0):
                 # not a hard FAIL (the unit invariant is enforced upstream).
                 if "no resident state" in line:
                     d["no_resident_state"] += 1
+                # P2.4 Increment 1: the slot release found the unit missing
+                # from the net and spilled the complete unit before its state
+                # could lose its last copy (the unit-invariant backstop).
+                if "[spill-before-loss]" in line:
+                    d["spill_before_loss"] += 1
                 # The adopt-path error that followed the leak in prod: the
                 # root-prefill fallback publishes no source, but the admission
                 # claim still expects one.
@@ -1503,6 +1509,8 @@ def phase_13(args):
         all_verdicts.append(("state-saturation", f"PASS: {log13['state_replan']} entitlement re-plans (plan re-baselined after relief; no 500)"))
     if log13["entitlement_mismatch"] > 0:
         all_verdicts.append(("state-saturation", f"FAIL: {log13['entitlement_mismatch']} core-incomplete entitlement mismatches (strict check fired)"))
+    if log13["spill_before_loss"] > 0:
+        all_verdicts.append(("state-saturation", f"PASS: {log13['spill_before_loss']} spill-before-loss backstops fired (unit retained in net before its state lost its last copy)"))
     return all_verdicts
 
 
