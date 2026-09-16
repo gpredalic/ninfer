@@ -574,6 +574,7 @@ public:
         return 0;
     }
     [[nodiscard]] std::uint64_t materialize_kv_defers() const noexcept { return 0; }
+    [[nodiscard]] std::uint64_t materialize_state_replans() const noexcept { return 0; }
     [[nodiscard]] std::uint32_t checkpoint_device_count() const noexcept { return 0; }
     [[nodiscard]] std::uint32_t checkpoint_host_only_count() const noexcept { return 0; }
     [[nodiscard]] std::uint32_t checkpoint_device_state_slots() const noexcept { return 0; }

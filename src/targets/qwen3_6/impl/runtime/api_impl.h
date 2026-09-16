@@ -301,6 +301,10 @@ template <>
 std::uint64_t Program<Variant>::materialize_kv_defers() const noexcept {
     return impl_ ? impl_->materialize_kv_defers() : 0;
 }
+template <>
+std::uint64_t Program<Variant>::materialize_state_replans() const noexcept {
+    return impl_ ? impl_->materialize_state_replans() : 0;
+}
 
 template <>
 std::uint32_t Program<Variant>::checkpoint_device_count() const noexcept {

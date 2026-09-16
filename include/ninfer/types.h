@@ -892,6 +892,10 @@ struct RuntimeStats {
     // occupancy and were deferred to a later engine tick instead of throwing bad_alloc
     // into the worker OOM handler (monotonic).
     std::uint64_t materialize_kv_defers = 0;
+    // P2.4 Increment 1: materializations whose plan was re-baselined to the
+    // materialized unit after relief left a plan-optional state image
+    // unrealized (monotonic).
+    std::uint64_t materialize_state_replans = 0;
     // Checkpoint residency (gauge): live checkpoint state images and the
     // device slots they pin.
     std::uint32_t checkpoint_device_count       = 0;

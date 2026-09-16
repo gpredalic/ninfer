@@ -754,6 +754,30 @@ shared meter.
         Increment 1 (spill-before-loss) must prevent. Low frequency (a few/hr
         under heavy concurrent load), always self-retried (the retry
         re-admits against current residency and succeeds).
+        **Re-plan shipped (2026-09-16, building):** the 8509 check now
+        re-plans instead of throwing for the relief-induced shortfall class.
+        On `actual != expected`, the plan is re-baselined to the materialized
+        unit when (a) all KV dimensions are exact, (b) lanes match, (c)
+        device.state is at or below plan and host.state exceeds plan only by
+        the device shortfall (a device→host migration of an optional image —
+        restorable, not a loss), and (d) the unit CORE is complete: the
+        active state binding is device-resident. Condition (d) is the
+        per-image check the reverted per-sum relaxation lacked — a true
+        last-replica loss of the core image fails it and still throws.
+        Acceptance logs `[replan] state entitlement re-baselined ...`; every
+        other mismatch keeps the strict throw, now preceded by an image census
+        (`[entitlement] DIAG` per store image + store histogram) that pins the
+        class for any remaining episodes. A monotonic
+        `materialize_state_replans` counter ships in /stats (full chain:
+        types.h → resource_manager.h → runtime.h → api_impl.h →
+        stats_json.cpp). `active_resources` bookkeeping now stores the
+        re-planned (actual) entitlement, so the pressure planner attributes
+        the lane what it actually holds. This converts the observed
+        `3→2 host 0→0` 500 class into a clean (slower) success; the
+        spill-before-loss work above remains the fix for the case where the
+        CORE image loses its last replica (the core check throws there by
+        design). e2e: the parser tracks `[replan]` and `[entitlement]
+        MISMATCH`; phase 13 gains PASS/FAIL lines for both.
       - **Increment 2 — net as the unit's host home (census + move-not-copy).**
         The net's `state_host` buffers are untracked host replicas (invisible
         to the store census, state_image_store.h:166–205) and net restore

@@ -724,6 +724,10 @@ public:
     // Materializations deferred to a later engine tick because their device-KV reservation
     // demand did not fit the current pool occupancy (monotonic).
     [[nodiscard]] std::uint64_t materialize_kv_defers() const noexcept;
+    // P2.4 Increment 1: materializations whose plan was re-baselined to the
+    // materialized unit after relief left a plan-optional state image
+    // unrealized (monotonic; for /stats).
+    [[nodiscard]] std::uint64_t materialize_state_replans() const noexcept;
     // Live checkpoint residency (gauge): how many device state slots checkpoints pin.
     [[nodiscard]] std::uint32_t checkpoint_device_count() const noexcept;
     [[nodiscard]] std::uint32_t checkpoint_host_only_count() const noexcept;

@@ -1139,6 +1139,7 @@ public:
         out.materialize_kv_page_alloc_failures_main    = program.materialize_kv_page_alloc_failures_main();
         out.materialize_kv_page_alloc_failures_backend = program.materialize_kv_page_alloc_failures_backend();
         out.materialize_kv_defers                      = program.materialize_kv_defers();
+        out.materialize_state_replans                   = program.materialize_state_replans();
         out.checkpoint_device_count               = program.checkpoint_device_count();
         out.checkpoint_host_only_count            = program.checkpoint_host_only_count();
         out.checkpoint_device_state_slots         = program.checkpoint_device_state_slots();

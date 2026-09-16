@@ -444,6 +444,8 @@ def parse_serve_log(path, skip_lines=0):
         "relief_demote",
         "relief_dual_drop",
         "pressure_expansion_fail",
+        "state_replan",
+        "entitlement_mismatch",
     ]}
     d["evict_pages"] = []
     d["checkpoint_frontiers"] = []
@@ -552,6 +554,14 @@ def parse_serve_log(path, skip_lines=0):
                 # saturated-restore failure.
                 if "prepared pressure expansion exceeds the target arena" in line:
                     d["pressure_expansion_fail"] += 1
+                # P2.4 Increment 1: the plan was re-baselined to the
+                # materialized unit after relief left a plan-optional state
+                # image unrealized — the request succeeded (no 500).
+                if "[replan] state entitlement re-baselined" in line:
+                    d["state_replan"] += 1
+                # The strict check still rejects a core-incomplete mismatch.
+                if "[entitlement] MISMATCH" in line:
+                    d["entitlement_mismatch"] += 1
                 # The adopt-path error that followed the leak in prod: the
                 # root-prefill fallback publishes no source, but the admission
                 # claim still expects one.
@@ -1480,6 +1490,10 @@ def phase_13(args):
         all_verdicts.append(("state-saturation", f"PASS: relief freed device state slots {log13['relief_demote']}x (dual drops: {log13['relief_dual_drop']})"))
     else:
         all_verdicts.append(("state-saturation", "WARN: relief never fired — pool may not have saturated (non-deterministic; the no-OOM gate still holds)"))
+    if log13["state_replan"] > 0:
+        all_verdicts.append(("state-saturation", f"PASS: {log13['state_replan']} entitlement re-plans (plan re-baselined after relief; no 500)"))
+    if log13["entitlement_mismatch"] > 0:
+        all_verdicts.append(("state-saturation", f"FAIL: {log13['entitlement_mismatch']} core-incomplete entitlement mismatches (strict check fired)"))
     return all_verdicts
 
 

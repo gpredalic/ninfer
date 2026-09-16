@@ -594,6 +594,10 @@ public:
     // Materializations deferred to a later engine tick because their device-KV reservation
     // demand did not fit the current pool occupancy (monotonic; for /stats).
     [[nodiscard]] std::uint64_t materialize_kv_defers() const noexcept;
+    // P2.4 Increment 1: materializations whose post-admission relief left a
+    // plan-optional state image unrealized; the plan was re-baselined to the
+    // materialized unit instead of 500ing (monotonic; for /stats).
+    [[nodiscard]] std::uint64_t materialize_state_replans() const noexcept;
     [[nodiscard]] StateImageStore::CheckpointResidency checkpoint_residency() const noexcept;
     // Full state-slot residency census (for /stats): explains host-pool occupancy
     // including the classes checkpoint_residency() cannot see.
@@ -758,6 +762,10 @@ public:
     // occupancy and were deferred to a later engine tick instead of throwing bad_alloc
     // (monotonic; read by /stats from the serve thread).
     std::atomic<std::uint64_t> materialize_kv_defers_{0};
+    // P2.4 Increment 1: entitlement re-plans (plan re-baselined to the
+    // materialized unit after relief left a plan-optional state image
+    // unrealized; read by /stats from the serve thread).
+    std::atomic<std::uint64_t> materialize_state_replans_{0};
 
     // Checkpoint state is retained only inside a complete {attention KV + GDN state}
     // unit held by the safety net; there is no state-only capture. The old

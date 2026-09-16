@@ -6861,6 +6861,9 @@ std::uint64_t ProgramImplCore::materialize_kv_page_alloc_failures_backend() cons
 std::uint64_t ProgramImplCore::materialize_kv_defers() const noexcept {
     return materialize_kv_defers_.load(std::memory_order_relaxed);
 }
+std::uint64_t ProgramImplCore::materialize_state_replans() const noexcept {
+    return materialize_state_replans_.load(std::memory_order_relaxed);
+}
 
 StateImageStore::CheckpointResidency ProgramImplCore::checkpoint_residency() const noexcept {
     return state_store ? state_store->checkpoint_residency() : StateImageStore::CheckpointResidency{};
@@ -8505,24 +8508,94 @@ StartResult ProgramImplCore::start_request(MaterializationTransaction& transacti
         // add the adopted pages back so the check compares like with like.
         actual.device.main_kv_pages += transaction.restore_adopted_main_pages;
         actual.device.backend_kv_pages += transaction.restore_adopted_backend_pages;
-        const detail::PhysicalResources expected = active;
+        detail::PhysicalResources expected = active;
         if (actual != expected) {
-            // P2.4 step 0 (2026-09-16): diagnostic only — the check stays
-            // strict. The observed class is a post-admission demotion shifting
-            // a state image device→host (or a true last-replica loss) between
-            // admission and materialization; the six-dimension delta tells us
-            // which (a migration keeps the state-slot total, a loss does not).
-            std::fprintf(stderr,
-                         "[entitlement] MISMATCH device.state %u→%u host.state %u→%u "
-                         "device.main_kv %u→%u device.backend_kv %u→%u host.kv_bytes %zu→%zu "
-                         "lanes %u→%u\n",
-                         expected.device.state_slots, actual.device.state_slots,
-                         expected.host.state_slots, actual.host.state_slots,
-                         expected.device.main_kv_pages, actual.device.main_kv_pages,
-                         expected.device.backend_kv_pages, actual.device.backend_kv_pages,
-                         expected.host.kv_bytes, actual.host.kv_bytes,
-                         expected.device.active_lanes, actual.device.active_lanes);
-            throw std::logic_error("materialized sequence does not match its active entitlement");
+            // P2.4 Increment 1 (2026-09-16): re-plan after relief. The plan is
+            // frozen at admission, but between admission and materialization
+            // relief (DeviceOnly demotion, dual device-replica drop) and the
+            // admission-time spill run — a plan-OPTIONAL state image
+            // (replacement rewrite checkpoint, retained rewrite, long anchor)
+            // can be left unrealized, and the materialization clears it
+            // instead of failing the unit ("[rewrite-restore] slot budget: no
+            // room ... cleared"). The unit is then complete at its REALIZED
+            // frontier: its KV entitlements are exact and its active state
+            // binding is device-resident. The old behavior 500'd the request
+            // on the stale plan. Re-baseline the plan to the materialized
+            // unit. The acceptance is per-image, not per-sum: the core
+            // (active state binding) must be device-resident, so a true
+            // last-replica loss of the core image still throws below; a
+            // device→host migration of an optional shows host ABOVE plan by
+            // exactly the device shortfall (accepted — the image is
+            // restorable); a KV-dimension drift or an over-materialization
+            // (device above plan) is a genuine accounting bug and throws.
+            const auto census = [&]() {
+                const auto hist = state_store ? state_store->residency_histogram()
+                                              : StateImageStore::ResidencyHistogram{};
+                std::fprintf(stderr,
+                             "[entitlement] DIAG store(device=%u host=%u pend_d=%u pend_h=%u "
+                             "dual=%u hostonly=%u)\n",
+                             hist.device_slots, hist.host_slots, hist.pending_device_slots,
+                             hist.pending_host_slots, hist.dual_resident, hist.host_only);
+                const auto img = [&](const char* name, StateImageHandle h) {
+                    if (!state_store || !state_store->valid(h)) {
+                        std::fprintf(stderr, "[entitlement] DIAG   %s: invalid\n", name);
+                        return;
+                    }
+                    std::fprintf(stderr,
+                                 "[entitlement] DIAG   %s: residency=%d refs=%u role=%d\n",
+                                 name, static_cast<int>(state_store->residency(h)),
+                                 state_store->checkpoint_references(h),
+                                 static_cast<int>(state_store->role(h)));
+                };
+                img("state.read", sequence.state.read);
+                img("state.write", sequence.state.write);
+                if (sequence.rewrite_state) { img("rewrite", *sequence.rewrite_state); }
+                if (sequence.reserved_state) { img("reserved", *sequence.reserved_state); }
+                for (std::size_t a = 0; a < sequence.long_anchors.size(); ++a) {
+                    img("anchor", sequence.long_anchors[a].state);
+                }
+            };
+            const bool kv_exact =
+                actual.device.main_kv_pages == expected.device.main_kv_pages &&
+                actual.device.backend_kv_pages == expected.device.backend_kv_pages &&
+                actual.host.kv_bytes == expected.host.kv_bytes;
+            const bool lanes_exact = actual.device.active_lanes == expected.device.active_lanes;
+            const bool device_down = actual.device.state_slots <= expected.device.state_slots;
+            // Host may exceed plan only by the device shortfall (a device→host
+            // migration of an optional image); anything more is an
+            // over-materialization.
+            const bool host_bounded =
+                actual.host.state_slots <=
+                expected.host.state_slots +
+                    (expected.device.state_slots - actual.device.state_slots);
+            const bool core_complete =
+                state_store != nullptr && state_store->valid(sequence.state.write) &&
+                state_store->residency(sequence.state.write) != StateReplicaResidency::HostOnly &&
+                state_store->residency(sequence.state.write) != StateReplicaResidency::None;
+            if (kv_exact && lanes_exact && device_down && host_bounded && core_complete) {
+                census();
+                std::fprintf(stderr,
+                             "[replan] state entitlement re-baselined device.state %u→%u "
+                             "host.state %u→%u (relief left a plan-optional state image "
+                             "unrealized; unit complete at realized frontier)\n",
+                             expected.device.state_slots, actual.device.state_slots,
+                             expected.host.state_slots, actual.host.state_slots);
+                expected = actual;
+                materialize_state_replans_.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                census();
+                std::fprintf(stderr,
+                             "[entitlement] MISMATCH device.state %u→%u host.state %u→%u "
+                             "device.main_kv %u→%u device.backend_kv %u→%u host.kv_bytes %zu→%zu "
+                             "lanes %u→%u\n",
+                             expected.device.state_slots, actual.device.state_slots,
+                             expected.host.state_slots, actual.host.state_slots,
+                             expected.device.main_kv_pages, actual.device.main_kv_pages,
+                             expected.device.backend_kv_pages, actual.device.backend_kv_pages,
+                             expected.host.kv_bytes, actual.host.kv_bytes,
+                             expected.device.active_lanes, actual.device.active_lanes);
+                throw std::logic_error("materialized sequence does not match its active entitlement");
+            }
         }
         if (details.reuse != ReusePath::Root) {
             if (transaction.state_restored) {
@@ -8535,7 +8608,7 @@ StartResult ProgramImplCore::start_request(MaterializationTransaction& transacti
                 ++transaction.operations.state_moves;
             }
         }
-        requests[lane].active_resources   = active;
+        requests[lane].active_resources   = expected;
         requests[lane].optional_resources = details.active_optional_resources;
         invalidate_lane(lane);
         const SequenceHandle handle =
