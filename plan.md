@@ -340,6 +340,30 @@ development. Each is verified with the P0 e2e gate + the live journal.
       **shipped for the admission-wedge class by `20213d4b` (re-arm + bounded
       fail-all); verify in a live window**; (c) 0 sentinel firings over a
       full day of live use.
+- [ ] **P1.8 — client abandons queued requests (serve-layer, new 2026-09-16).**
+      The user's session showed `finish=cancelled` at queue=29.37s (0 tokens)
+      with the client re-sending the same turn 0.5s later (that copy
+      succeeded) — and once at 51.3s (post-compaction cold prefill) with no
+      retry, surfacing as "Claude Code stopped for my input". The user did
+      NOT press ESC. Byte-arrival probe (4 cold streaming requests, 1s apart,
+      150k filler tokens): response headers at t+0.04s and `: keep-alive`
+      comment heartbeats every 5s during the admission-queue wait — the
+      server was sending bytes the whole time (20-worker pool, no starvation;
+      the wait loop wakes every 10ms and polls the transport). Conclusion:
+      the client's timer is a FIRST-EVENT timer — SSE comments are invisible
+      to it. **Fix shipped `09425996`, deployed 14:13:** the anthropic
+      handler's heartbeat now carries the Anthropic-spec `event: ping`
+      (a real stream event client parsers recognize and ignore) in addition
+      to the comment (TCP_USER_TIMEOUT probe); OpenAI endpoints keep
+      comment-only (their parsers are not ping-aware). Verified by probe:
+      `event: ping` + `data: {"type": "ping"}` on every 5s heartbeat through
+      a 20s+ queue wait. *Residual:* if the client's timer is a hard
+      send-relative timeout (not reset by any event), no server-side change
+      helps — the next stage would be emitting `message_start` early (before
+      prefill), which is protocol-legal but touches the encoder state
+      machine; only if the class recurs. The 0.5s double-submission is
+      client retry logic — not server-addressable. *Exit:* 0
+      `finish=cancelled` on queued requests over a live day.
 - [ ] **P1.7 — planner H2D demand + identity-based restore (Slice 0 of #7).**
       Two standalone fixes that ship before the unit refactor and address
       today's live pain: (a) model the restore's new device state slot when the
