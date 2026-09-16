@@ -449,6 +449,8 @@ public:
     [[nodiscard]] std::optional<PressureTargetHandle>
     guided_closure_target(const AdmissionCandidate<Variant>& candidate,
                           std::span<const std::uint32_t> preferred_owner_ordinals);
+    [[nodiscard]] std::optional<PressureTargetHandle>
+    greedy_cover_target(const AdmissionCandidate<Variant>& candidate);
     [[nodiscard]] runtime::PressureTargetGuidance guidance(PressureTargetHandle target);
     [[nodiscard]] runtime::PressureTargetAssessment assess(PressureTargetHandle target);
     void retain_assessment(PressureTargetHandle target);

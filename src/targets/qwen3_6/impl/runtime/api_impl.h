@@ -163,6 +163,13 @@ std::optional<PressureTargetHandle> PressurePlanningSession<Variant>::guided_clo
 }
 
 template <>
+std::optional<PressureTargetHandle> PressurePlanningSession<Variant>::greedy_cover_target(
+    const AdmissionCandidate<Variant>& candidate) {
+    if (impl_ == nullptr) { throw std::logic_error("pressure planning session is empty"); }
+    return impl_->greedy_cover_target(candidate);
+}
+
+template <>
 runtime::PressureTargetGuidance
 PressurePlanningSession<Variant>::guidance(PressureTargetHandle target) {
     if (impl_ == nullptr) { throw std::logic_error("pressure planning session is empty"); }

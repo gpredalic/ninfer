@@ -1485,6 +1485,8 @@ struct PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT> {
     [[nodiscard]] std::optional<qwen3_6::PressureTargetHandle>
     guided_closure_target(const AdmissionCandidate& candidate,
                           std::span<const std::uint32_t> preferred_owner_ordinals);
+    [[nodiscard]] std::optional<qwen3_6::PressureTargetHandle>
+    greedy_cover_target(const AdmissionCandidate& candidate);
     [[nodiscard]] runtime::PressureTargetGuidance guidance(qwen3_6::PressureTargetHandle target);
     [[nodiscard]] runtime::PressureTargetAssessment assess(qwen3_6::PressureTargetHandle target);
     void retain_assessment(qwen3_6::PressureTargetHandle target);

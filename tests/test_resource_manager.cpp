@@ -489,6 +489,8 @@ public:
     [[nodiscard]] std::optional<FakePressureTargetHandle>
     guided_closure_target(const FakeAdmissionCandidate& candidate,
                           std::span<const std::uint32_t> preferred_owner_ordinals);
+    [[nodiscard]] std::optional<FakePressureTargetHandle>
+    greedy_cover_target(const FakeAdmissionCandidate& candidate);
     [[nodiscard]] ninfer::runtime::PressureTargetGuidance guidance(FakePressureTargetHandle target);
     [[nodiscard]] ninfer::runtime::PressureTargetAssessment assess(FakePressureTargetHandle target);
     void retain_assessment(FakePressureTargetHandle target);
@@ -1295,6 +1297,56 @@ std::optional<FakePressureTargetHandle> FakePressurePlanningSession::guided_clos
     return std::nullopt;
 }
 
+std::optional<FakePressureTargetHandle> FakePressurePlanningSession::greedy_cover_target(
+    const FakeAdmissionCandidate& candidate) {
+    require(!scratch_live_, "fake greedy cover conflicts with expansion scratch");
+    const std::uint32_t selected_candidate = candidate_index(candidate);
+    populate_options(selected_candidate);
+    Target target{
+        .candidate_index = selected_candidate,
+        .choices         = std::vector<std::uint16_t>(owners_.size(), 0),
+    };
+    const auto selected_decisions = [&] {
+        std::vector<FakeTargetDecision> decisions;
+        for (std::size_t index = 0; index < owners_.size(); ++index) {
+            const std::uint16_t choice = target.choices[index];
+            if (choice != 0) {
+                decisions.push_back(options_[selected_candidate][index][choice - 1U]);
+            }
+        }
+        return decisions;
+    };
+    // Evict owners in ordinal order (the fake has no per-owner freed resources
+    // to rank by) until the deficit is covered — the same minimal-cover
+    // semantics as the real session's efficiency-ordered greedy.  No identity
+    // short-circuit: the seed is only reached when the identity has no logical
+    // goal, so at least one eviction is required even when the physical
+    // deficit is already zero.
+    for (std::size_t index = 0; index < owners_.size(); ++index) {
+        const auto& alternatives = options_[selected_candidate][index];
+        if (alternatives.empty()) { continue; }
+        target.choices[index] = static_cast<std::uint16_t>(alternatives.size());
+        if (program_->target_feasible(selected_decisions())) {
+            auto existing = std::find_if(targets_.begin(), targets_.end(),
+                                         [&](const Target& prior) {
+                                             return same_target(prior, target);
+                                         });
+            std::uint32_t target_index = 0;
+            if (existing != targets_.end()) {
+                target_index = static_cast<std::uint32_t>(existing - targets_.begin());
+            } else {
+                target.stable_ordinal = static_cast<std::uint32_t>(targets_.size());
+                targets_.push_back(std::move(target));
+                target_index = static_cast<std::uint32_t>(targets_.size() - 1U);
+                program_->pressure_target_count_peak =
+                    std::max(program_->pressure_target_count_peak, targets_.size());
+            }
+            return FakePressureTargetHandle{.generation = generation_, .index = target_index};
+        }
+    }
+    return std::nullopt;
+}
+
 ninfer::runtime::PressureTargetGuidance
 FakePressurePlanningSession::guidance(FakePressureTargetHandle handle) {
     require(valid(handle) && !scratch_live_, "fake pressure guidance is stale");
@@ -1413,6 +1465,12 @@ FakePressurePlanningSession::assess(FakePressureTargetHandle handle) {
         }
         if (!decision.evicts_continuation) { expandable = true; }
     }
+    const bool feasible = program_->target_feasible(selected);
+    // Mirror the real session: a target that already covers the deficit is a
+    // locally complete solution — further decisions only add cost.  An
+    // identity target keeps the computed value (pressure may still remove a
+    // copy the identity requires).
+    if (!selected.empty() && feasible) { expandable = false; }
 
     ninfer::runtime::MaterializationMachineSummary machine = candidate.identity.machine;
     const bool combined_copy_cancelled =
@@ -1444,7 +1502,7 @@ FakePressurePlanningSession::assess(FakePressureTargetHandle handle) {
         digest ^= target.candidate_index;
     }
     return ninfer::runtime::PressureTargetAssessment{
-        .physical_status       = program_->target_feasible(selected)
+        .physical_status       = feasible
                                      ? ninfer::runtime::MaterializationPhysicalStatus::Feasible
                                      : ninfer::runtime::MaterializationPhysicalStatus::Infeasible,
         .source_disposition    = candidate.disposition,
@@ -2502,6 +2560,69 @@ void test_combined_target_reprices_cancelled_pressure_copy() {
             "planner accumulated parent transfer cost instead of repricing the complete target");
 }
 
+void test_covered_pressure_target_is_not_expanded() {
+    // Four parked owners, one required pressure unit: every single-decision
+    // target already covers the deficit.  Without the covered-target stop the
+    // search enumerates the whole 2^4 choice space; with it, only the root's
+    // direct children are ever assessed.
+    constexpr std::size_t owner_count = 4;
+    FakeManager manager = make_manager(1, owner_count + 1U);
+    FakeProgram program;
+    for (std::size_t index = 0; index < owner_count; ++index) {
+        const std::uint32_t content = static_cast<std::uint32_t>(80U + index);
+        const ActiveRequest active =
+            start_active(manager, program, content, make_base(content), index + 1U);
+        (void)finish_active(manager, program, active);
+    }
+    program.required_pressure_actions = 1;
+    auto inspection = manager.inspect(program, FakePreparedPrompt{84}, make_base(84), 2);
+    require(inspection.choice.has_value(), "covered pressure target was unreachable");
+    require(program.pressure_target_assessments <= 12,
+            "covered target was expanded into the full choice space");
+    program.abort_start = true;
+    (void)manager.reserve_materialization(program, std::move(*inspection.choice),
+                                          FakePreparedPrompt{84}, {});
+    require(program.started_action_ids.size() == 1,
+            "covered target cost more than one pressure action");
+    require(std::none_of(program.started_action_ids.begin(), program.started_action_ids.end(),
+                         [](std::uint64_t id) { return id >= 2000U; }),
+            "covered target evicted an owner");
+}
+
+void test_greedy_seed_covers_pressure_with_minimal_eviction() {
+    // Two parked owners; the deficit needs two pressure units and only an
+    // eviction (two units) can supply them — the required action id forces
+    // the eviction cover.  The seed must evict exactly one owner, not both.
+    FakeManager manager = make_manager(1, 3);
+    FakeProgram program;
+    const std::uint32_t first_content  = 85;
+    const std::uint32_t second_content = 86;
+    const ActiveRequest first =
+        start_active(manager, program, first_content, make_base(first_content), 1);
+    (void)finish_active(manager, program, first);
+    const ActiveRequest second =
+        start_active(manager, program, second_content, make_base(second_content), 2);
+    (void)finish_active(manager, program, second);
+
+    program.required_pressure_actions      = 2;
+    program.eviction_pressure_action_units = 2;
+    program.required_action_id              = 2000U + first.sequence.id;
+    auto inspection = manager.inspect(program, FakePreparedPrompt{87}, make_base(87), 3);
+    require(inspection.choice.has_value(), "eviction cover was unreachable");
+
+    program.abort_start = true;
+    (void)manager.reserve_materialization(program, std::move(*inspection.choice),
+                                          FakePreparedPrompt{87}, {});
+    const std::vector<std::uint64_t> evictions{
+        2000U + first.sequence.id, 2000U + second.sequence.id};
+    const auto eviction_count = std::count_if(
+        program.started_action_ids.begin(), program.started_action_ids.end(),
+        [&](std::uint64_t id) {
+            return std::find(evictions.begin(), evictions.end(), id) != evictions.end();
+        });
+    require(eviction_count == 1, "seed evicted more owners than the cover requires");
+}
+
 void test_in_progress_adoption_and_private_capture() {
     FakeManager manager = make_manager(1, 2);
     FakeProgram program;
@@ -2857,6 +2978,10 @@ int main() {
              test_guided_pressure_reaches_deep_retention_before_maximal_fallback);
     run_test("combined target exact repricing",
              test_combined_target_reprices_cancelled_pressure_copy);
+    run_test("covered target is not expanded",
+             test_covered_pressure_target_is_not_expanded);
+    run_test("greedy seed minimal eviction cover",
+             test_greedy_seed_covers_pressure_with_minimal_eviction);
     run_test("in-progress and capture", test_in_progress_adoption_and_private_capture);
     run_test("projected shared marginal value",
              test_projected_nested_shared_candidates_use_marginal_value);

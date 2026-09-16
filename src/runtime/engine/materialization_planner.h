@@ -192,6 +192,7 @@ public:
 
         Incumbent incumbent;
         std::uint32_t targets_evaluated = static_cast<std::uint32_t>(candidates.size());
+        MaterializationSeedType seed_type = MaterializationSeedType::Identity;
         if (identity_best) {
             incumbent = *identity_best;
             incumbent.target =
@@ -221,24 +222,33 @@ public:
                     assessed_.push_back(*early_closure);
                     discovered_.push_back(*early_closure);
                     have_incumbent = true;
+                    seed_type = MaterializationSeedType::GuidedClosure;
                 }
             }
             if (!have_incumbent) {
-                // Guided closure failed. If there are active sessions, defer
-                // instead of evicting — the pressure situation may improve
-                // when they complete. Only use root_maximal (eviction) as
-                // last resort when idle (no active sessions to wait on).
+                // Guided closure failed. If there are no catalogued units at
+                // all, defer — the matching continuation may not be
+                // catalogued yet (streaming race); it will be when the
+                // active session completes.
                 if (pressure.private_owners.empty() && pressure.shared_owners.empty()) {
-                    // No catalogued continuations to pressure. The matching
-                    // continuation may not be catalogued yet (streaming race).
-                    // Defer — it will be catalogued when the active session completes.
                     return std::nullopt;
                 }
-                PressureTargetHandle root_maximal =
-                    session.root_maximal_target(*candidates[root_candidate_index].candidate);
-                PressureTargetAssessment assessment = session.assess(root_maximal);
+                // Greedy eviction cover: evict (in efficiency order) until
+                // the deficit is covered.  This is a far better incumbent
+                // than root_maximal (evict every owner): with the maximal
+                // seed the ModelOptimal / ValueOfNextExpansion stops can
+                // never fire, so the search enumerated to the target budget
+                // (thousands of ~1ms assessments).  With a near-optimal
+                // seed the search converges in a few steps.  If even
+                // evicting every owner cannot cover, no feasible plan
+                // exists (root_maximal would have failed identically) —
+                // defer.
+                const std::optional<PressureTargetHandle> greedy =
+                    session.greedy_cover_target(*candidates[root_candidate_index].candidate);
+                if (!greedy) { return std::nullopt; }
+                PressureTargetAssessment assessment = session.assess(*greedy);
                 if (assessment.candidate_ordinal != root_candidate_index) {
-                    throw std::logic_error("maximal pressure target changed admission candidate");
+                    throw std::logic_error("greedy pressure target changed admission candidate");
                 }
                 ++targets_evaluated;
                 planning_saturating_add(projection_work, assessment.projection_work);
@@ -251,10 +261,11 @@ public:
                 const FoldedCost cost =
                     fold_assessment(candidates[root_candidate_index], assessment, pressure.owner_policy,
                                     pressure.checkpoint_policy);
-                incumbent = make_incumbent(root_maximal, assessment, cost, *goal);
-                session.retain_assessment(root_maximal);
-                assessed_.push_back(root_maximal);
-                discovered_.push_back(root_maximal);
+                incumbent = make_incumbent(*greedy, assessment, cost, *goal);
+                session.retain_assessment(*greedy);
+                assessed_.push_back(*greedy);
+                discovered_.push_back(*greedy);
+                seed_type = MaterializationSeedType::GreedyCover;
             }
         }
 
@@ -598,7 +609,10 @@ public:
         MaterializationDiagnostics diagnostics =
             make_diagnostics(incumbent.cost, targets_evaluated, projection_work, planning_started,
                              search_elapsed_ns, stop_reason, model_optimal, budget_exhausted,
-                             best_remaining, incumbent.degradation_units, incumbent.root_maximal);
+                             best_remaining, incumbent.degradation_units, incumbent.root_maximal,
+                             seed_type,
+                             static_cast<std::uint32_t>(
+                                 pressure.private_owners.size() + pressure.shared_owners.size()));
 
         Result result;
         result.plan               = std::move(*sealed);
@@ -1155,7 +1169,8 @@ private:
                          std::uint64_t projection_work, Clock::time_point planning_started,
                          MaterializationStopReason reason, bool maximal_fallback) noexcept {
         return make_diagnostics(cost, targets_evaluated, projection_work, planning_started, 0,
-                                reason, true, false, cost.total_ns, 0, maximal_fallback);
+                                reason, true, false, cost.total_ns, 0, maximal_fallback,
+                                MaterializationSeedType::Identity, 0);
     }
 
     [[nodiscard]] static MaterializationDiagnostics
@@ -1164,7 +1179,8 @@ private:
                      std::uint64_t search_elapsed_ns, MaterializationStopReason reason,
                      bool model_optimal, bool budget_exhausted,
                      std::uint64_t best_remaining_lower_bound_ns, std::uint32_t degradation_units,
-                     bool maximal_fallback) noexcept {
+                     bool maximal_fallback, MaterializationSeedType seed_type,
+                     std::uint32_t owner_count) noexcept {
         const std::uint64_t gap = model_optimal || best_remaining_lower_bound_ns >= cost.total_ns
                                       ? 0
                                       : cost.total_ns - best_remaining_lower_bound_ns;
@@ -1186,6 +1202,8 @@ private:
                                    : static_cast<double>(gap) / static_cast<double>(cost.total_ns),
             .selected_degradation_units = degradation_units,
             .selected_maximal_fallback  = maximal_fallback,
+            .seed_type                  = seed_type,
+            .owner_count                = owner_count,
         };
     }
 

@@ -259,6 +259,52 @@ inline PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::PressurePlanningSessi
         }
     }
 
+    // Drop pressure owners that cannot free anything in any dimension any
+    // candidate is short on: they can never contribute to feasibility, and
+    // every one kept multiplies the search space (a choice and a successor
+    // set per owner).  Eviction effects count only the owner's unique
+    // resources (shared pages are excluded), so a zero here is exact: if
+    // eviction frees nothing relevant, no weaker decision can either.
+    {
+        detail::PhysicalResources constrained;
+        for (const AdmissionCandidate* candidate : candidates) {
+            constrained = NINFER_QWEN36_RUNTIME_NS::planning_resource_sum(
+                constrained, candidate->impl_->identity_pressure_deficit);
+            if (candidate->impl_->blocked_host_allocation_bytes > 0) {
+                constrained.host.kv_bytes =
+                    std::max<std::size_t>(1, constrained.host.kv_bytes);
+            }
+        }
+        const auto frees_constrained = [&constrained](const detail::PhysicalResources& freed) {
+            return (freed.device.active_lanes > 0 && constrained.device.active_lanes > 0) ||
+                   (freed.device.state_slots > 0 && constrained.device.state_slots > 0) ||
+                   (freed.device.main_kv_pages > 0 && constrained.device.main_kv_pages > 0) ||
+                   (freed.device.backend_kv_pages > 0 &&
+                    constrained.device.backend_kv_pages > 0) ||
+                   (freed.host.state_slots > 0 && constrained.host.state_slots > 0) ||
+                   (freed.host.kv_bytes > 0 && constrained.host.kv_bytes > 0);
+        };
+        using PlanningContractAccess = qwen3_6::detail::RuntimeContractAccess<NINFER_QWEN36_VARIANT>;
+        auto kept = owners.begin();
+        for (auto owner = owners.begin(); owner != owners.end(); ++owner) {
+            PressureDecision eviction;
+            if (owner->shared) {
+                eviction = program->inspect_shared_eviction_option(
+                    program->shared_prefix_states[PlanningContractAccess::index(
+                        *owner->shared_handle)]);
+            } else {
+                eviction = program->inspect_eviction_option(
+                    program->continuation_states[PlanningContractAccess::index(
+                        *owner->private_handle)]);
+            }
+            if (eviction.evicts_continuation && !frees_constrained(eviction.effect.removed)) {
+                continue;
+            }
+            *kept++ = *owner;
+        }
+        owners.erase(kept, owners.end());
+    }
+
     candidate_options.resize(candidates.size());
     const std::size_t maximum_targets =
         candidates.size() + 1U + planning_detail::kOptionalTargetCapacity;
@@ -525,6 +571,143 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::root_maximal_target(
     } else {
         maximal.stable_ordinal = static_cast<std::uint32_t>(targets.size());
         targets.push_back(std::move(maximal));
+        target_index = static_cast<std::uint32_t>(targets.size() - 1U);
+        index_target(target_index);
+    }
+    qwen3_6::PressureTargetHandle handle;
+    handle.session_    = this;
+    handle.generation_ = generation;
+    handle.index_      = target_index;
+    return handle;
+}
+
+// Greedy eviction cover (search seed).  Evict owners in cost-per-freed
+// resource order until the candidate's deficit is covered.  Eviction
+// effects are exact (only the owner's unique resources; shared pages are
+// excluded) and add nothing, so the incremental residual below is exact:
+// a cover found here is Feasible, and if no owner order covers, no plan
+// does (the evict-all target is the same set of decisions).  This is a
+// far better incumbent than the evict-all target, so the ModelOptimal /
+// ValueOfNextExpansion stops fire and the search converges instead of
+// enumerating to the target budget.
+inline std::optional<qwen3_6::PressureTargetHandle>
+PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::greedy_cover_target(
+    const AdmissionCandidate& admission) {
+    if (scratch_live) {
+        throw std::logic_error("greedy pressure cover conflicts with expansion scratch");
+    }
+    const std::uint32_t selected_candidate = candidate_index(admission);
+    populate_options(selected_candidate);
+    const CandidateOptions& options = candidate_options[selected_candidate];
+    const AdmissionCandidate& candidate = *candidates[selected_candidate];
+    const detail::PhysicalResources capacity = program->admission_capacity();
+
+    struct Efficiency {
+        std::size_t owner_index = 0;
+        std::uint64_t cost_per_freed = 0;
+        std::uint32_t degradation = 0;
+        std::uint32_t ordinal = 0;
+        bool shared = false;
+    };
+    std::vector<Efficiency> efficiency;
+    detail::PhysicalDelta applied{};
+    for (std::size_t index = 0; index < owners.size(); ++index) {
+        const CandidateOwnerOptions& owner_options = options.owners[index];
+        if (owner_options.participation != OwnerParticipation::PressureEligible) { continue; }
+        if (owner_options.eviction_choice == 0) { continue; }
+        const PressureDecision& eviction =
+            owner_options.decisions[owner_options.eviction_choice - 1U];
+        // Normalized freed across all dimensions: a victim that frees more
+        // (in any scarce dimension) goes first so the cover takes the
+        // fewest evictions.
+        const auto normalize = [](std::uint64_t value, std::uint64_t limit) {
+            constexpr std::uint64_t kResidualOne = 1ULL << 20U;
+            if (value == 0) { return std::uint64_t{0}; }
+            if (limit == 0 || value >= limit) { return kResidualOne; }
+            if (value > std::numeric_limits<std::uint64_t>::max() / kResidualOne) {
+                return kResidualOne;
+            }
+            const std::uint64_t scaled = value * kResidualOne;
+            return std::max<std::uint64_t>(1, scaled / limit + (scaled % limit != 0 ? 1U : 0U));
+        };
+        std::uint64_t freed = 0;
+        freed += normalize(eviction.effect.removed.device.active_lanes,
+                           capacity.device.active_lanes);
+        freed += normalize(eviction.effect.removed.device.state_slots,
+                           capacity.device.state_slots);
+        freed += normalize(eviction.effect.removed.device.main_kv_pages,
+                           capacity.device.main_kv_pages);
+        freed += normalize(eviction.effect.removed.device.backend_kv_pages,
+                           capacity.device.backend_kv_pages);
+        freed += normalize(eviction.effect.removed.host.state_slots, capacity.host.state_slots);
+        freed += normalize(eviction.effect.removed.host.kv_bytes, capacity.host.kv_bytes);
+        const std::uint32_t units = NINFER_QWEN36_RUNTIME_NS::degradation_units(eviction);
+        const std::uint64_t cost_per_freed =
+            freed == 0 ? std::numeric_limits<std::uint64_t>::max()
+                       : ((std::uint64_t{units} << 20U) + freed - 1U) / freed;
+        efficiency.push_back(Efficiency{
+            .owner_index  = index,
+            .cost_per_freed = cost_per_freed,
+            .degradation  = units,
+            .ordinal      = owners[index].ordinal,
+            .shared       = owners[index].shared,
+        });
+    }
+    std::sort(efficiency.begin(), efficiency.end(),
+              [](const Efficiency& left, const Efficiency& right) {
+                  return std::tuple{left.cost_per_freed, left.shared ? 0U : 1U,
+                                    left.degradation, left.ordinal} <
+                         std::tuple{right.cost_per_freed, right.shared ? 0U : 1U,
+                                    right.degradation, right.ordinal};
+              });
+
+    const auto residual = [&]() {
+        detail::PhysicalResources left =
+            program->guided_materialization_deficit(*candidate.impl_, applied);
+        left.host.kv_bytes = std::max(left.host.kv_bytes,
+                                      candidate.impl_->blocked_host_allocation_bytes);
+        return left;
+    };
+
+    // No identity short-circuit: this seed is only reached when the identity
+    // target has no logical goal (e.g. no vacant catalog slot), so the cover
+    // must contain at least one eviction even when the physical deficit is
+    // already zero — the eviction is what frees the slot the goal needs.
+    TargetNode target{
+        .candidate_index = selected_candidate,
+        .owner_choices   = std::vector<std::uint16_t>(owners.size(), 0),
+    };
+    for (const Efficiency& entry : efficiency) {
+        const CandidateOwnerOptions& owner_options = options.owners[entry.owner_index];
+        const PressureDecision& eviction =
+            owner_options.decisions[owner_options.eviction_choice - 1U];
+        target.owner_choices[entry.owner_index] = owner_options.eviction_choice;
+        applied.removed = NINFER_QWEN36_RUNTIME_NS::planning_resource_sum(
+            applied.removed, eviction.effect.removed);
+        applied.added = NINFER_QWEN36_RUNTIME_NS::planning_resource_sum(
+            applied.added, eviction.effect.added);
+        if (residual() == detail::PhysicalResources{}) { break; }
+    }
+    const bool any_decision = std::any_of(target.owner_choices.begin(),
+                                          target.owner_choices.end(),
+                                          [](std::uint16_t choice) { return choice != 0; });
+    if (!any_decision || residual() != detail::PhysicalResources{}) {
+        // No eligible owner, or even evicting every owner does not cover —
+        // no feasible plan exists (the evict-all target is the same
+        // decisions), so defer.
+        return std::nullopt;
+    }
+
+    TargetNode* existing = find_target(target);
+    std::uint32_t target_index = 0;
+    if (existing != nullptr) {
+        target_index = static_cast<std::uint32_t>(existing - targets.data());
+    } else {
+        const std::size_t maximum =
+            candidates.size() + 1U + planning_detail::kOptionalTargetCapacity;
+        if (targets.size() >= maximum) { return std::nullopt; }
+        target.stable_ordinal = static_cast<std::uint32_t>(targets.size());
+        targets.push_back(std::move(target));
         target_index = static_cast<std::uint32_t>(targets.size() - 1U);
         index_target(target_index);
     }
@@ -1010,16 +1193,24 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::assess(qwen3_6::PressureTarg
 
     bool expandable = identity_target || (recovery_projection_valid && composed.has_value());
     if (expandable) {
-        expandable = false;
-        for (std::size_t index = 0; index < owners.size(); ++index) {
-            const CandidateOwnerOptions& owner_options = options.owners[index];
-            if (owner_options.participation != OwnerParticipation::PressureEligible) { continue; }
-            const std::uint16_t choice = node.owner_choices[index];
-            if ((choice == 0 && !owner_options.decisions.empty()) ||
-                (choice != 0 && choice <= owner_options.decisions.size() &&
-                 !owner_options.decisions[choice - 1U].evicts_continuation)) {
-                expandable = true;
-                break;
+        // A target that already covers the deficit is a locally complete
+        // solution: every further decision only adds cost (degradation,
+        // transfer, future loss) and cannot improve feasibility.  Not
+        // expanding it is what lets the search stop as soon as any feasible
+        // cover is found, instead of enumerating the rest of the space
+        // looking for a cheaper plan.
+        if (status != runtime::MaterializationPhysicalStatus::Feasible) {
+            expandable = false;
+            for (std::size_t index = 0; index < owners.size(); ++index) {
+                const CandidateOwnerOptions& owner_options = options.owners[index];
+                if (owner_options.participation != OwnerParticipation::PressureEligible) { continue; }
+                const std::uint16_t choice = node.owner_choices[index];
+                if ((choice == 0 && !owner_options.decisions.empty()) ||
+                    (choice != 0 && choice <= owner_options.decisions.size() &&
+                     !owner_options.decisions[choice - 1U].evicts_continuation)) {
+                    expandable = true;
+                    break;
+                }
             }
         }
     }
@@ -1156,32 +1347,85 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::prepare_expansion(
         return choice;
     };
 
-    for (std::size_t owner_index = 0; owner_index < owners.size(); ++owner_index) {
-        CandidateOwnerOptions& owner_options = options.owners[owner_index];
+    // If even evicting every remaining owner cannot cover the residual in
+    // some constrained dimension, no completion of this branch is Feasible
+    // — produce no children (each would be pruned one level down, after
+    // paying the expansion cost).  Eviction removes exactly the owner's
+    // unique resources and adds nothing, so its net effect is the maximum
+    // any decision can achieve in every dimension; switching an owner to
+    // eviction also reclaims what a demotion added, so the per-owner net
+    // improvement below is the exact maximum.
+    const auto dimension = [](const detail::PhysicalResources& r) {
+        return std::array<std::uint64_t, 6>{
+            r.device.active_lanes, r.device.state_slots, r.device.main_kv_pages,
+            r.device.backend_kv_pages, r.host.state_slots, r.host.kv_bytes};
+    };
+    const auto residual_dims = dimension(residual);
+    std::array<std::uint64_t, 6> remaining_max{};
+    for (std::size_t index = 0; index < owners.size(); ++index) {
+        CandidateOwnerOptions& owner_options = options.owners[index];
         if (owner_options.participation != OwnerParticipation::PressureEligible) { continue; }
-        const std::uint16_t current_choice       = node.owner_choices[owner_index];
-        std::vector<PressureDecision>& decisions = owner_options.decisions;
-        if (current_choice > decisions.size() ||
-            (current_choice != 0 && decisions[current_choice - 1U].evicts_continuation)) {
-            continue;
-        }
-        const PressureDecision* current =
-            current_choice == 0 ? nullptr : &decisions[current_choice - 1U];
-        std::vector<PressureDecision> successors =
-            pressure_successors(owner_options, owner_index, residual, *protection, current);
-        for (PressureDecision& successor : successors) {
-            const std::uint16_t choice =
-                intern_prepared_decision(owner_index, std::move(successor));
-            if (choice == current_choice) { continue; }
-            TargetNode child{
-                .candidate_index = node.candidate_index,
-                .owner_choices   = node.owner_choices,
-            };
-            child.owner_choices[owner_index] = choice;
-            child.root_maximal               = false;
-            append(std::move(child));
+        if (owner_options.eviction_choice == 0) { continue; }
+        const std::uint16_t current_choice = node.owner_choices[index];
+        if (current_choice == owner_options.eviction_choice) { continue; }
+        const auto eviction_dims =
+            dimension(owner_options.decisions[owner_options.eviction_choice - 1U].effect.removed);
+        const auto eviction_added_dims =
+            dimension(owner_options.decisions[owner_options.eviction_choice - 1U].effect.added);
+        const auto current_dims = current_choice == 0
+                                       ? std::array<std::uint64_t, 6>{}
+                                       : dimension(owner_options.decisions[current_choice - 1U]
+                                                       .effect.removed);
+        const auto current_added_dims = current_choice == 0
+                                            ? std::array<std::uint64_t, 6>{}
+                                            : dimension(owner_options.decisions[current_choice - 1U]
+                                                            .effect.added);
+        for (std::size_t dim = 0; dim < 6; ++dim) {
+            const std::int64_t improvement =
+                static_cast<std::int64_t>(eviction_dims[dim]) -
+                static_cast<std::int64_t>(eviction_added_dims[dim]) -
+                static_cast<std::int64_t>(current_dims[dim]) +
+                static_cast<std::int64_t>(current_added_dims[dim]);
+            if (improvement > 0) {
+                NINFER_QWEN36_RUNTIME_NS::planning_saturating_add(
+                    remaining_max[dim], static_cast<std::uint64_t>(improvement));
+            }
         }
     }
+    bool branch_feasible = true;
+    for (std::size_t dim = 0; dim < 6 && branch_feasible; ++dim) {
+        branch_feasible = residual_dims[dim] == 0 || remaining_max[dim] >= residual_dims[dim];
+    }
+
+    const auto expand_children = [&]() {
+        for (std::size_t owner_index = 0; owner_index < owners.size(); ++owner_index) {
+            CandidateOwnerOptions& owner_options = options.owners[owner_index];
+            if (owner_options.participation != OwnerParticipation::PressureEligible) { continue; }
+            const std::uint16_t current_choice       = node.owner_choices[owner_index];
+            std::vector<PressureDecision>& decisions = owner_options.decisions;
+            if (current_choice > decisions.size() ||
+                (current_choice != 0 && decisions[current_choice - 1U].evicts_continuation)) {
+                continue;
+            }
+            const PressureDecision* current =
+                current_choice == 0 ? nullptr : &decisions[current_choice - 1U];
+            std::vector<PressureDecision> successors =
+                pressure_successors(owner_options, owner_index, residual, *protection, current);
+            for (PressureDecision& successor : successors) {
+                const std::uint16_t choice =
+                    intern_prepared_decision(owner_index, std::move(successor));
+                if (choice == current_choice) { continue; }
+                TargetNode child{
+                    .candidate_index = node.candidate_index,
+                    .owner_choices   = node.owner_choices,
+                };
+                child.owner_choices[owner_index] = choice;
+                child.root_maximal               = false;
+                append(std::move(child));
+            }
+        }
+    };
+    if (branch_feasible) { expand_children(); }
 
     if (++scratch_generation == 0) { ++scratch_generation; }
     scratch_live = true;

@@ -633,6 +633,26 @@ enum class PrefixReusePath : std::uint8_t {
     SharedStablePrefix,
 };
 
+// Which seed started the pressure search for one materialization plan.
+enum class MaterializationSeedType : std::uint8_t {
+    Identity,      // the candidate fit without pressure
+    GuidedClosure, // the demote-first greedy closure covered the deficit
+    GreedyCover,   // the eviction cover (cheapest victims first) covered the deficit
+};
+
+[[nodiscard]] inline constexpr const char*
+materialization_seed_type_name(MaterializationSeedType seed) noexcept {
+    switch (seed) {
+    case MaterializationSeedType::Identity:
+        return "identity";
+    case MaterializationSeedType::GuidedClosure:
+        return "guided_closure";
+    case MaterializationSeedType::GreedyCover:
+        return "greedy_cover";
+    }
+    return "identity";
+}
+
 // Why pressure planning stopped for the materialization decision committed to one request.
 // "ModelOptimal" is relative to the configured target graph, canonical transaction order, and
 // numerical cost model; it is not a claim about globally optimal observed TTFT.
@@ -683,6 +703,8 @@ struct MaterializationDiagnostics {
     double relative_bound_gap                   = 0.0;
     std::uint32_t selected_degradation_units    = 0;
     bool selected_maximal_fallback              = false;
+    MaterializationSeedType seed_type           = MaterializationSeedType::Identity;
+    std::uint32_t owner_count                    = 0;
 
     [[nodiscard]] friend constexpr bool
     operator==(const MaterializationDiagnostics&,
