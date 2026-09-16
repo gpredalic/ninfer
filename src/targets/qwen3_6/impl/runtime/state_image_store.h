@@ -409,6 +409,27 @@ public:
         return true;
     }
 
+    // P2.4 Increment 2 (net as the unit's host home): hand the object's host
+    // replica to the caller WITHOUT freeing it — the net entry adopts the
+    // slot, so the bytes are not copied (move-not-copy) and the pool
+    // occupancy is unchanged (the slot just changes owner). The caller must
+    // have verified the image is exclusive to the unit being parked (no
+    // other sequence references it) and that the unit is being released —
+    // the store-side invariants checked here are the same as drop_host_replica
+    // minus the device-replica requirement (a HostOnly image has none).
+    [[nodiscard]] std::optional<qwen3_6::HostStateSlotHandle> detach_host_replica(
+        StateImageHandle handle) noexcept {
+        if (!valid(handle)) { return std::nullopt; }
+        Object& object = objects_[handle.index_];
+        if (!object.host_slot || object.source_pins != 0 || object.destination_pinned ||
+            has_pending_replica(object)) {
+            return std::nullopt;
+        }
+        auto slot = *object.host_slot;
+        object.host_slot.reset();
+        return slot;
+    }
+
     // Why release() would refuse this handle (bitmask) — diagnostic for the
     // orphan path: a swallowed release() failure leaves the object (and its
     // device/host slots) unreachable. Bit 0: checkpoint references, bit 1:

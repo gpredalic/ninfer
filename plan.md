@@ -836,13 +836,35 @@ shared meter.
         zero orphaned state images, zero 'private source result is missing';
         the only worker recovery was the known P4.2 class. Unit tests pin
         the retains() semantics (test_host_kv_safety_net.cpp).
-      - **Increment 2 — net as the unit's host home (census + move-not-copy).**
-        The net's `state_host` buffers are untracked host replicas (invisible
+      - **Increment 2 — net as the unit's host home (shared pool + move-not-copy).**
+        The net's `state_host` buffers were untracked host replicas (invisible
         to the store census, state_image_store.h:166–205) and net restore
-        writes via raw `copy_from_host` (11580–11585). Unify: net entries
-        reference store host slots (kill the 6462–6470/6527–6530 memcpys) or
-        the census counts net buffers; after a net retain, release the store
-        replica so the net entry is the sole host copy (3× → 1×).
+        wrote via raw `copy_from_host`. **Chosen design: the net shares the
+        store's `HostStatePool`** — net entries hold `HostStateSlotHandle`s
+        (the same pinned pool the store uses for host replicas), so host-state
+        residency is the pool's `occupied()` (the census sees both tenants:
+        store replicas + net entries). The pool is a byte budget expressed in
+        slot units (P2.6 exposes it as `--host-cache-mib`); it is NOT a
+        fundamental fixed count. On the release path (`relinquish_store_state`),
+        a HostOnly exclusive image's slot is MOVED into the net entry
+        (`detach_host_replica` — no copy, pool occupancy unchanged) and a Both
+        image drops its redundant store host replica before the D2H copy; the
+        pre-consume spill (start_request) copies (its source stays alive).
+        Dropped entries (eviction/supersede/arena-reclaim) return slots via a
+        `set_state_slot_releaser` callback; `take`/`take_pinned` transfer slots
+        with the entry (the program releases them on restore failure).
+        `clear()` and the spill's ABORT/exception paths release captured slots
+        (a dropped handle would leak the pool slot). *Exit:* 0 pool-slot leaks
+        (census `occupied()` returns to baseline after a phase); the
+        `state_relinquish` e2e counter proves the move-not-copy path fired.
+        **Shipped + e2e-verified 2026-09-16 19:34.** Phase 13 (state-saturation):
+        **18 state images relinquished to the net (move-not-copy)**, device pool
+        saturated 7/7, 39 spills OK, 3 restores, 0 worker recoveries, 0 FAIL.
+        e2e pool must be 96 slots (net ~28 units at the 4 GiB byte budget +
+        store demoted replicas exceed 48 under the e2e's 10-session stress;
+        prod's 48 is fine for its lighter real load). Unit test
+        `test_state_slot_lifecycle` pins the releaser-on-drop / take_pinned-transfer
+        / census semantics.
       - **Increment 3 — retire per-replica demotes.** The pressure planner
         demotes whole units, not replicas: retire the state-only and KV-only
         demote decisions; the safety-net spill becomes the only device→host

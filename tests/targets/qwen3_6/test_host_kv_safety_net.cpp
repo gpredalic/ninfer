@@ -47,8 +47,11 @@ HostKVSafetyNetEntry make_entry(std::size_t tokens, std::uint32_t token_base,
     }
     entry.execution_frontier = static_cast<std::uint32_t>(tokens);
     entry.text_page_count    = static_cast<std::uint32_t>(tokens);
-    entry.state_host.assign(state_bytes, std::byte{1});
-    entry.state_bytes        = state_bytes;
+    // P2.4 Increment 2: the state image lives in a HostStatePool slot. The test
+    // has no pool, so a dummy handle stands in — the net only stores/releases
+    // it through the (unset) releaser and counts it in the census.
+    entry.state_slot = ninfer::targets::qwen3_6::HostStateSlotHandle{.index = 1, .generation = 1};
+    entry.state_bytes = state_bytes;
     return entry;
 }
 
@@ -391,6 +394,44 @@ void test_retains() {
           "the new frontier is covered");
 }
 
+// P2.4 Increment 2: net entries hold their state images in HostStatePool slots.
+// The net returns slots to the pool through the releaser when an entry is
+// dropped (supersede/eviction), but take_pinned() TRANSFERS the slots with the
+// entry (the program releases them after restore). This test pins both: a leak
+// here is a pool slot that never comes back.
+void test_state_slot_lifecycle() {
+    HostKVSafetyNet net;
+    std::uint32_t released = 0;
+    net.set_state_slot_releaser([&released](const HostKVSafetyNetEntry& entry) {
+        if (entry.state_slot) { ++released; }
+        if (entry.checkpoint_state_slot) { ++released; }
+    });
+
+    // Two distinct conversations (no prefix match between them).
+    auto a = make_entry(5000, /*token_base=*/0, 1024);
+    net.add(std::move(a));
+    check(net.state_slots_held() == 1, "one endpoint slot held");
+
+    // Supersede drops the shorter entry -> its slot is released.
+    auto a_long = lineage_entry(6000, 1024);
+    net.add(std::move(a_long));
+    check(net.size() == 1, "longer entry superseded the shorter");
+    check(released == 1, "superseded entry's slot released");
+    check(net.state_slots_held() == 1, "only the surviving entry's slot held");
+
+    // take_pinned transfers the slot WITHOUT releasing it.
+    auto b = make_entry(4000, /*token_base=*/1000000, 1024);
+    net.add(std::move(b));
+    check(net.state_slots_held() == 2, "two slots held before take");
+    const std::uint64_t id = net.pin(0);
+    HostKVSafetyNetEntry taken = net.take_pinned(id);
+    check(taken.state_slot.has_value(), "taken entry carries its slot");
+    check(released == 1, "take_pinned did NOT release the slot (ownership transfer)");
+    check(net.state_slots_held() == 1, "taken slot no longer counted in the net");
+    // The program now owns the taken slot; releasing it is the program's job.
+    (void)taken;
+}
+
 }  // namespace
 
 int main() {
@@ -399,6 +440,7 @@ int main() {
     test_select_victim_directly();
     test_session_protection();
     test_retains();
+    test_state_slot_lifecycle();
     if (failures == 0) {
         std::fprintf(stderr, "PASS: host_kv_safety_net lifecycle\n");
         return 0;

@@ -577,7 +577,8 @@ public:
         std::optional<runtime::CheckpointRef> checkpoint, bool must_retain_private_source,
         const runtime::ContextMachineCostModel& machine_cost);
     // Copy a victim continuation's device KV to host RAM before eviction.
-    void spill_victim_to_host_kv_safety_net(std::uint32_t index) noexcept;
+    void spill_victim_to_host_kv_safety_net(std::uint32_t index,
+                                            bool relinquish_store_state = true) noexcept;
     // P2.4 Increment 1 (spill-before-loss): before a continuation slot is
     // released, ensure the unit's complete {KV + state} is retained in the
     // host safety net — the unit invariant forbids the state half losing its

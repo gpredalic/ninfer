@@ -936,6 +936,22 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         // footprint of the context cache.
         host_kv_safety_net.set_shared_arena(host_kv_arena.get());
         host_kv_safety_net.set_state_budget_bytes(plan.context_cache.host_kv_capacity_bytes);
+        // P2.4 Increment 2 (net as the unit's host home): net entries hold
+        // their state images in HostStatePool slots — the same pool the store
+        // uses for host replicas — so host-state residency is the pool's
+        // occupancy (the census sees both tenants). Dropped entries (eviction,
+        // supersede, arena reclaim) return their slots through this callback;
+        // take/take_pinned transfer ownership with the entry (the program
+        // returns those on restore failure).
+        if (host_state_images) {
+            host_kv_safety_net.set_state_slot_releaser(
+                [pool = host_state_images.get()](const HostKVSafetyNetEntry& entry) {
+                    if (entry.state_slot) { pool->release(*entry.state_slot); }
+                    if (entry.checkpoint_state_slot) {
+                        pool->release(*entry.checkpoint_state_slot);
+                    }
+                });
+        }
         // P2.5: per-session eviction guarantee — a unit whose session still has a
         // live continuation (Active or Catalogued) is evicted from the net only
         // after every dead and idle-session unit is gone.
@@ -6210,7 +6226,13 @@ void ProgramImplCore::abort_pressure_work(MaterializationTransaction::PressureWo
     } catch (...) { std::terminate(); }
 }
 
-void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index) noexcept {
+void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index,
+                                                         bool relinquish_store_state) noexcept {
+    // P2.4 Increment 2: captured state-image pool slots, hoisted above the try
+    // so the catch handlers can return them to the pool (a slot is a plain
+    // handle — dropping it without release() leaks the pool slot).
+    std::optional<qwen3_6::HostStateSlotHandle> state_slot;
+    std::optional<qwen3_6::HostStateSlotHandle> checkpoint_state_slot;
     try {
         const SequenceState& sequence = continuation_states[index];
         if (!sequence.kv || sequence.prefix_identity.size() == 0 ||
@@ -6541,30 +6563,72 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index) no
         }
         }  // end if (kv_copy_ok)
 
-        // Copy the continuation state image to a pinned host buffer.
+        // P2.4 Increment 2 (net as the unit's host home): capture the
+        // continuation state image into a HostStatePool slot — the same pool
+        // the store uses for host replicas — so the net's residency is pool
+        // occupancy (the host-state census) instead of untracked heap.
+        // relinquish_store_state (the release paths) hands the unit's host
+        // half to the net: a HostOnly exclusive image's slot is MOVED into
+        // the entry (no copy), a Both image drops its store host replica
+        // before the D2H copy (the net's fresh copy is the host copy). The
+        // pre-consume spill (start_request) copies, since its source stays
+        // alive and keeps its store replicas.
         std::size_t state_bytes = 0;
-        std::vector<std::byte> state_host;
         if (state_store && state_store->valid(sequence.state.read) && state_images) {
             state_bytes = state_images->host_layout().image_bytes;
             if (state_bytes > 0) {
+                const StateImageHandle endpoint = sequence.state.read;
                 const StateReplicaResidency endpoint_residency =
-                    state_store->residency(sequence.state.read);
-                if (endpoint_residency == StateReplicaResidency::HostOnly) {
-                    // Endpoint was demoted to host — copy host-to-host
-                    const auto host_view = state_store->host_replica_view(sequence.state.read);
-                    if (host_view && host_view->data != nullptr) {
-                        state_host.resize(state_bytes);
-                        std::memcpy(state_host.data(), host_view->data, state_bytes);
+                    state_store->residency(endpoint);
+                const bool exclusive = state_exclusive_to_sequence(sequence, endpoint);
+                if (relinquish_store_state &&
+                    endpoint_residency == StateReplicaResidency::HostOnly && exclusive) {
+                    // The store's host replica IS the unit's host half — move it
+                    // into the net entry. No copy, pool occupancy unchanged.
+                    state_slot = state_store->detach_host_replica(endpoint);
+                    if (state_slot) {
+                        std::fprintf(stderr,
+                                     "[safety-spill] state relinquished (move): index=%u — the "
+                                     "store's host replica is now the net entry's slot\n",
+                                     index);
                     } else {
-                        state_bytes = 0;  // skip entry if host view is invalid
+                        state_bytes = 0;
                     }
                 } else {
-                    state_host.resize(state_bytes);
-                    const std::int32_t slot = state_store->physical_slot(sequence.state.read);
-                    const HostStateImageView state_view{
-                        .data = state_host.data(),
-                        .layout = &state_images->host_layout()};
-                    state_images->copy_to_host(slot, state_view, device.transfer_stream);
+                    if (relinquish_store_state &&
+                        endpoint_residency == StateReplicaResidency::Both && exclusive) {
+                        // Free the redundant store host replica first: the net's
+                        // fresh D2H copy is the host copy, and freeing before the
+                        // allocate keeps the pool from needing to grow.
+                        (void)state_store->drop_host_replica(endpoint);
+                    }
+                    std::optional<qwen3_6::HostStateSlotHandle> new_slot =
+                        host_state_images ? host_state_images->allocate() : std::nullopt;
+                    if (!new_slot) {
+                        std::fprintf(stderr,
+                                     "[safety-spill] state slot unavailable: index=%u — host "
+                                     "state pool full, retaining nothing\n",
+                                     index);
+                        state_bytes = 0;
+                    } else if (endpoint_residency == StateReplicaResidency::HostOnly) {
+                        // Demoted to host — copy host-to-host into the new slot.
+                        const auto host_view = state_store->host_replica_view(endpoint);
+                        if (host_view && host_view->data != nullptr) {
+                            std::memcpy(host_state_images->writable_view(*new_slot).data,
+                                        host_view->data, state_bytes);
+                            state_slot = std::move(new_slot);
+                        } else {
+                            host_state_images->release(*new_slot);
+                            state_bytes = 0;  // host view invalid — skip
+                        }
+                    } else {
+                        const std::int32_t device_slot = state_store->physical_slot(endpoint);
+                        const HostStateImageView state_view{
+                            .data = host_state_images->writable_view(*new_slot).data,
+                            .layout = &state_images->host_layout()};
+                        state_images->copy_to_host(device_slot, state_view, device.transfer_stream);
+                        state_slot = std::move(new_slot);
+                    }
                 }
             }
         }
@@ -6576,7 +6640,6 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index) no
         // (endpoint) state. Only advertise the checkpoint when its state was
         // actually captured.
         std::size_t checkpoint_state_bytes = 0;
-        std::vector<std::byte> checkpoint_state_host;
         bool checkpoint_valid = false;
         std::uint32_t checkpoint_frontier = 0;
         // Capture the rewrite-checkpoint state image. Follow-up prompts
@@ -6585,33 +6648,66 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index) no
         // Device-resident replicas copy D2H; demoted (HostOnly) replicas copy
         // host-to-host from the pool view — physical_slot would throw for
         // those, aborting the spill after the KV D2H copies are enqueued.
+        // P2.4 Increment 2: same pool-slot capture as the endpoint image, with
+        // the same relinquish/move semantics.
         if (sequence.rewrite_checkpoint.valid && sequence.rewrite_checkpoint.frontier != 0 &&
             sequence.rewrite_state && state_store &&
             state_store->valid(*sequence.rewrite_state) && state_images) {
             checkpoint_state_bytes = state_images->host_layout().image_bytes;
             if (checkpoint_state_bytes > 0) {
+                const StateImageHandle rewrite = *sequence.rewrite_state;
                 const StateReplicaResidency rewrite_residency =
-                    state_store->residency(*sequence.rewrite_state);
-                if (rewrite_residency == StateReplicaResidency::DeviceOnly ||
-                    rewrite_residency == StateReplicaResidency::Both) {
-                    checkpoint_state_host.resize(checkpoint_state_bytes);
-                    const std::int32_t checkpoint_slot =
-                        state_store->physical_slot(*sequence.rewrite_state);
-                    const HostStateImageView checkpoint_view{
-                        .data = checkpoint_state_host.data(),
-                        .layout = &state_images->host_layout()};
-                    state_images->copy_to_host(checkpoint_slot, checkpoint_view,
-                                               device.transfer_stream);
-                    checkpoint_valid = true;
-                    checkpoint_frontier = sequence.rewrite_checkpoint.frontier;
-                } else if (const std::optional<qwen3_6::HostStateImageConstView> host_view =
-                               state_store->host_replica_view(*sequence.rewrite_state);
-                           host_view && host_view->data != nullptr) {
-                    checkpoint_state_host.resize(checkpoint_state_bytes);
-                    std::memcpy(checkpoint_state_host.data(), host_view->data,
-                                checkpoint_state_bytes);
-                    checkpoint_valid = true;
-                    checkpoint_frontier = sequence.rewrite_checkpoint.frontier;
+                    state_store->residency(rewrite);
+                const bool exclusive = state_exclusive_to_sequence(sequence, rewrite);
+                if (relinquish_store_state &&
+                    rewrite_residency == StateReplicaResidency::HostOnly && exclusive) {
+                    checkpoint_state_slot = state_store->detach_host_replica(rewrite);
+                    if (checkpoint_state_slot) {
+                        std::fprintf(stderr,
+                                     "[safety-spill] ckpt state relinquished (move): index=%u — "
+                                     "the store's host replica is now the net entry's slot\n",
+                                     index);
+                        checkpoint_valid = true;
+                        checkpoint_frontier = sequence.rewrite_checkpoint.frontier;
+                    } else {
+                        checkpoint_state_bytes = 0;
+                    }
+                } else {
+                    if (relinquish_store_state &&
+                        rewrite_residency == StateReplicaResidency::Both && exclusive) {
+                        (void)state_store->drop_host_replica(rewrite);
+                    }
+                    std::optional<qwen3_6::HostStateSlotHandle> new_slot =
+                        host_state_images ? host_state_images->allocate() : std::nullopt;
+                    if (!new_slot) {
+                        std::fprintf(stderr,
+                                     "[safety-spill] ckpt state slot unavailable: index=%u — "
+                                     "host state pool full, checkpoint not captured\n",
+                                     index);
+                        checkpoint_state_bytes = 0;
+                    } else if (rewrite_residency == StateReplicaResidency::DeviceOnly ||
+                               rewrite_residency == StateReplicaResidency::Both) {
+                        const std::int32_t checkpoint_slot = state_store->physical_slot(rewrite);
+                        const HostStateImageView checkpoint_view{
+                            .data = host_state_images->writable_view(*new_slot).data,
+                            .layout = &state_images->host_layout()};
+                        state_images->copy_to_host(checkpoint_slot, checkpoint_view,
+                                                   device.transfer_stream);
+                        checkpoint_state_slot = std::move(new_slot);
+                        checkpoint_valid = true;
+                        checkpoint_frontier = sequence.rewrite_checkpoint.frontier;
+                    } else if (const std::optional<qwen3_6::HostStateImageConstView> host_view =
+                                   state_store->host_replica_view(rewrite);
+                               host_view && host_view->data != nullptr) {
+                        std::memcpy(host_state_images->writable_view(*new_slot).data,
+                                    host_view->data, checkpoint_state_bytes);
+                        checkpoint_state_slot = std::move(new_slot);
+                        checkpoint_valid = true;
+                        checkpoint_frontier = sequence.rewrite_checkpoint.frontier;
+                    } else {
+                        host_state_images->release(*new_slot);
+                        checkpoint_state_bytes = 0;
+                    }
                 }
             }
         }
@@ -6680,6 +6776,13 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index) no
                          "[safety-spill] ABORT: index=%u frontier=%u — KV copy unavailable; "
                          "KV and state are one atomic unit, nothing retained\n",
                          index, sequence.execution_frontier);
+            // P2.4 Increment 2: the state images were captured into pool slots
+            // before the KV check — return them to the pool (a dropped handle
+            // would leak the slot).
+            if (state_slot && host_state_images) { host_state_images->release(*state_slot); }
+            if (checkpoint_state_slot && host_state_images) {
+                host_state_images->release(*checkpoint_state_slot);
+            }
             return;
         }
         entry.text_page_count = text_allocations.empty() ? 0 : text_pages;
@@ -6702,11 +6805,11 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index) no
                     backend_kv_addresses->logical_page(*kv.backend, p));
             }
         }
-        entry.state_host = std::move(state_host);
+        entry.state_slot = std::move(state_slot);
         entry.state_bytes = state_bytes;
         entry.checkpoint_valid = checkpoint_valid;
         entry.checkpoint_frontier = checkpoint_frontier;
-        entry.checkpoint_state_host = std::move(checkpoint_state_host);
+        entry.checkpoint_state_slot = std::move(checkpoint_state_slot);
         entry.checkpoint_state_bytes = checkpoint_state_bytes;
         // P2.5: retain the unit at its DEEPEST COMPLETE frontier. A unit is
         // {KV[0..F] + state@F}: the retained state image must correspond to
@@ -6726,7 +6829,7 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index) no
         //  (3) no state image anywhere → not a unit: retain nothing.
         const bool checkpoint_expected =
             sequence.rewrite_checkpoint.valid && sequence.rewrite_checkpoint.frontier != 0;
-        if (entry.state_bytes > 0 && !entry.state_host.empty()) {
+        if (entry.state_bytes > 0 && entry.state_slot) {
             if (!checkpoint_expected || checkpoint_valid) {
                 // Complete at the endpoint frontier. The identity is COPIED
                 // (not swapped): a demoted-not-evicted victim keeps living
@@ -6749,9 +6852,17 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index) no
                              "session's rewound follow-up; [checkpoint] unit-not-retained\n",
                              index, sequence.execution_frontier,
                              sequence.rewrite_checkpoint.frontier);
+                // P2.4 Increment 2: the captured state slot dies with the entry —
+                // return it to the pool.
+                if (entry.state_slot && host_state_images) {
+                    host_state_images->release(*entry.state_slot);
+                }
+                if (entry.checkpoint_state_slot && host_state_images) {
+                    host_state_images->release(*entry.checkpoint_state_slot);
+                }
             }
         } else if (checkpoint_valid && entry.checkpoint_state_bytes > 0 &&
-                   !entry.checkpoint_state_host.empty() && checkpoint_frontier > 0 &&
+                   entry.checkpoint_state_slot && checkpoint_frontier > 0 &&
                    checkpoint_frontier <= entry.execution_frontier) {
             // Retain the unit at the checkpoint frontier — the deepest
             // frontier with a state image.
@@ -6760,11 +6871,11 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index) no
                 (speculative_backend == SpeculativeBackend::Mtp && frontier > 0) ? frontier - 1U
                                                                                  : frontier;
             entry.state_bytes = entry.checkpoint_state_bytes;
-            entry.state_host  = std::move(entry.checkpoint_state_host);
+            entry.state_slot  = std::move(entry.checkpoint_state_slot);
             entry.checkpoint_valid       = false;
             entry.checkpoint_frontier    = 0;
             entry.checkpoint_state_bytes = 0;
-            entry.checkpoint_state_host.clear();
+            entry.checkpoint_state_slot.reset();
             entry.execution_frontier = frontier;
             entry.ledger.resize(frontier);
             entry.compact_prefix.resize(
@@ -6809,12 +6920,22 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index) no
         std::fprintf(stderr,
                      "[safety-spill] FAIL: index=%u frontier=%u what=%s\n",
                      index, continuation_states[index].execution_frontier, e.what());
+        // P2.4 Increment 2: return any captured state slots to the pool.
+        if (state_slot && host_state_images) { host_state_images->release(*state_slot); }
+        if (checkpoint_state_slot && host_state_images) {
+            host_state_images->release(*checkpoint_state_slot);
+        }
         try { cudaStreamSynchronize(device.transfer_stream); } catch (...) {}
     } catch (...) {
         // Same sync rationale as above.
         std::fprintf(stderr,
                      "[safety-spill] FAIL: index=%u frontier=%u what=unknown\n",
                      index, continuation_states[index].execution_frontier);
+        // P2.4 Increment 2: return any captured state slots to the pool.
+        if (state_slot && host_state_images) { host_state_images->release(*state_slot); }
+        if (checkpoint_state_slot && host_state_images) {
+            host_state_images->release(*checkpoint_state_slot);
+        }
         try { cudaStreamSynchronize(device.transfer_stream); } catch (...) {}
     }
 }
@@ -8513,8 +8634,11 @@ StartResult ProgramImplCore::start_request(MaterializationTransaction& transacti
             // valid copy. If start_sequence succeeds, the extra entry is
             // harmless: a later spill of the same prefix supersedes it on add,
             // and under host pressure the liveness-based eviction (dead-largest,
-            // then live-smallest) reclaims it like any stale entry.
-            spill_victim_to_host_kv_safety_net(*continuation_index);
+            // then live-smallest) reclaims it like any stale entry. Copy mode
+            // (relinquish=false): the source stays alive and keeps its store
+            // replicas — the net's copy is an additional copy, not a move.
+            spill_victim_to_host_kv_safety_net(*continuation_index,
+                                               /*relinquish_store_state=*/false);
             continuation_slots[*continuation_index].role = ContinuationSlotRole::Active;
         } else {
             continuation_index = transaction.root_continuation_index;
@@ -11591,6 +11715,11 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
             // space.
             std::uint32_t planned_text_entitlement     = 0;
             std::uint32_t planned_backend_entitlement  = 0;
+            // P2.4 Increment 2: the net entry's state-image pool slots, held
+            // across the restore so the catch can return them to the pool if
+            // the restore fails (the entry dies on unwind). Cleared on
+            // success — the re-added entry owns them.
+            std::array<std::optional<qwen3_6::HostStateSlotHandle>, 2> net_restore_state_slots{};
          try {
             std::fprintf(stderr, "[restore] frontier=%u entry=%s checkpoint=%d\n",
                          transaction.host_kv_restore_frontier,
@@ -11605,6 +11734,8 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
             } else {
             HostKVSafetyNetEntry entry = host_kv_safety_net.take_pinned(*transaction.host_kv_restore_entry_index);
             transaction.host_kv_restore_entry_index.reset();
+            net_restore_state_slots[0] = entry.state_slot;
+            net_restore_state_slots[1] = entry.checkpoint_state_slot;
             // Text KV restore: materialize pages for the cached prefix and copy H2D.
             // Entries hold one contiguous allocation per component (the spill
             // path compacts the arena instead of splitting across extents).
@@ -11798,22 +11929,24 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
             // endpoint image. Using the wrong one would continue prefill from
             // a state belonging to a different frontier.
             const bool checkpoint_level = transaction.host_kv_restore_checkpoint;
-            const std::vector<std::byte>& state_src =
-                checkpoint_level ? entry.checkpoint_state_host : entry.state_host;
             const std::size_t state_src_bytes =
                 checkpoint_level ? entry.checkpoint_state_bytes : entry.state_bytes;
+            // P2.4 Increment 2: the net's state images are HostStatePool slots —
+            // read the view from the pool (the census sees them) and copy H2D.
+            const qwen3_6::HostStateSlotHandle* state_src_slot =
+                checkpoint_level
+                    ? (entry.checkpoint_state_slot ? &*entry.checkpoint_state_slot : nullptr)
+                    : (entry.state_slot ? &*entry.state_slot : nullptr);
             // The slot was activated (zeroed) in the root branch above, on the
             // transfer stream. Only the H2D copy remains; a missing state
             // source just falls back to a plain root prefill (the slot is
             // already zeroed).
-            if (state_src_bytes > 0 && !state_src.empty() && state_store && state_images) {
+            if (state_src_bytes > 0 && state_src_slot && state_store && state_images &&
+                host_state_images) {
                 const std::int32_t slot_num = state_store->physical_slot(sequence.state.write);
-                const HostStateImageConstView state_view{
-                    .data = state_src.data(),
-                    .layout = &state_images->host_layout()};
+                const HostStateImageConstView state_view =
+                    host_state_images->view(*state_src_slot);
                 state_images->copy_from_host(state_view, slot_num, device.transfer_stream);
-                // The net entry's state image is a heap buffer, not a host-pool
-                // slot — observe it explicitly so state_h2d_bytes counts it.
                 auto observation = context_transfer_observation(
                     runtime::ContextResourceClass::State,
                     runtime::ContextTransferDirection::HostToDevice, TransferWork{}, 0, 1);
@@ -11868,12 +12001,20 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
             entry.pinned = false;
             entry.created = std::chrono::steady_clock::now();
             host_kv_safety_net.add(std::move(entry));
+            // The re-added entry owns its state slots again.
+            net_restore_state_slots = {};
             }
          } catch (...) {
             // Restore failed (OOM, CUDA error, etc.). Fall back to root
             // prefill — the slot is already activated/zeroed. Sync any
             // in-flight H2D copies before continuing.
             try { cudaStreamSynchronize(device.transfer_stream); } catch (...) {}
+            // P2.4 Increment 2: the taken entry's state slots died with the
+            // entry — return them to the pool.
+            for (const auto& s : net_restore_state_slots) {
+                if (s && host_state_images) { host_state_images->release(*s); }
+            }
+            net_restore_state_slots = {};
             // P1.7(b): if the restore failed after an adoption, the address
             // space holds shared frozen pages a root prefill cannot write —
             // return it to its empty activated state first.

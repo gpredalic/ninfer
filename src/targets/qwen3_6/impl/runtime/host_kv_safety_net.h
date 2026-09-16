@@ -14,6 +14,7 @@
 
 #include "targets/qwen3_6/impl/runtime/logical_kv_store.h"
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
+#include <ninfer/targets/qwen3_6/state_image.h>
 
 
 
@@ -85,7 +86,14 @@ struct HostKVSafetyNetEntry {
 
     // Raw pinned-host buffer for the continuation state image.
 
-    std::vector<std::byte> state_host;
+    // P2.4 Increment 2 (net as the unit's host home): the state image lives in
+    // a HostStatePool slot — the same pool the StateImageStore uses for host
+    // replicas — instead of an untracked heap vector. Pool occupancy is the
+    // census: host state residency is fully explained by pool slots (store
+    // replicas + net entries), and a net entry's slot is the unit's host home
+    // (after a relinquishing spill, the net entry is the sole host copy).
+    // The bytes fields are the budget accounting (slots x image_bytes).
+    std::optional<qwen3_6::HostStateSlotHandle> state_slot;
 
     std::size_t state_bytes = 0;
 
@@ -105,7 +113,7 @@ struct HostKVSafetyNetEntry {
 
     std::uint32_t checkpoint_frontier = 0;
 
-    std::vector<std::byte> checkpoint_state_host;
+    std::optional<qwen3_6::HostStateSlotHandle> checkpoint_state_slot;
 
     std::size_t checkpoint_state_bytes = 0;
 
@@ -550,6 +558,28 @@ public:
     }
     [[nodiscard]] std::chrono::seconds dead_ttl() const noexcept { return dead_ttl_; }
 
+    // P2.4 Increment 2: entries hold their state images in HostStatePool slots
+    // (the same pool the StateImageStore uses for host replicas). The pool is
+    // owned by the program, so the net returns slots through this callback
+    // when an entry is dropped (eviction, supersede, arena reclaim). take() /
+    // take_pinned() do NOT release — the entry's slots transfer with the entry
+    // and the program releases them after the restore consumes them.
+    void set_state_slot_releaser(std::function<void(const HostKVSafetyNetEntry&)> releaser) {
+        state_slot_releaser_ = std::move(releaser);
+    }
+
+    // Census: state-image slots currently held by net entries (endpoint +
+    // checkpoint). Together with the store's host replicas this fully explains
+    // the HostStatePool occupancy (the host state residency census).
+    [[nodiscard]] std::uint32_t state_slots_held() const noexcept {
+        std::uint32_t slots = 0;
+        for (const HostKVSafetyNetEntry& entry : entries_) {
+            if (entry.state_slot) { ++slots; }
+            if (entry.checkpoint_state_slot) { ++slots; }
+        }
+        return slots;
+    }
+
     // Pick the next eviction victim under the shared three-tier policy
     // (dead-largest, live-smallest, active-session-smallest). The spill loop
     // drives the pinned phase through allow_pinned. P2.5: one pass covers
@@ -768,7 +798,13 @@ public:
         return false;
     }
 
-    void add(HostKVSafetyNetEntry entry) {
+    // Add a new entry. The safety net is bounded by host KV arena bytes,
+    // not entry count — the spill function evicts smallest unpinned entries
+    // to free arena memory before calling add(). A re-added entry (after
+    // restore) already owns its arena allocation, so no eviction is needed.
+    // Returns false when the entry was rejected (the entry's state-image
+    // pool slots are returned to the pool via the releaser).
+    [[nodiscard]] bool add(HostKVSafetyNetEntry entry) {
 
         // Atomicity first: KV and state are one unit, so a half unit is never stored.
         if (!is_complete_unit(entry)) {
@@ -776,7 +812,8 @@ public:
                          "[safety-net] REJECT-PARTIAL state_bytes=%zu kv_pages=%u/%u - a cache unit "
                          "is {KV + state}\n",
                          entry_state_bytes(entry), entry.text_page_count, entry.backend_page_count);
-            return;
+            if (state_slot_releaser_) { state_slot_releaser_(entry); }
+            return false;
         }
 
         // Retention is bounded by the shared host memory budget. Completed continuations
@@ -787,7 +824,8 @@ public:
             std::fprintf(stderr,
                          "[host-state-pool] REJECT state_bytes=%zu retained=%zu budget=%zu\n",
                          incoming_state_bytes, state_retained_bytes_, state_budget_bytes_);
-            return;
+            if (state_slot_releaser_) { state_slot_releaser_(entry); }
+            return false;
         }
 
         // Supersede: an existing entry whose effective prefix is a strict token
@@ -831,7 +869,7 @@ public:
         entry.pinned = false;  // re-added entries are unpinned
 
         entries_.push_back(std::move(entry));
-
+        return true;
     }
 
 
@@ -875,7 +913,8 @@ public:
 
 
 
-    // Remove an entry (frees host KV allocations via their destructors).
+    // Remove an entry (frees host KV allocations via their destructors and
+    // returns its state-image pool slots through the releaser).
 
     void remove(std::size_t index) {
 
@@ -884,6 +923,7 @@ public:
         evictions_.fetch_add(1, std::memory_order_relaxed);
         state_retained_bytes_ -= (entries_[index].state_bytes +
                                          entries_[index].checkpoint_state_bytes);
+        if (state_slot_releaser_) { state_slot_releaser_(entries_[index]); }
         entries_.erase(entries_.begin() + static_cast<std::ptrdiff_t>(index));
 
     }
@@ -956,6 +996,9 @@ public:
 
 
     void clear() noexcept {
+        for (auto& entry : entries_) {
+            if (state_slot_releaser_) { state_slot_releaser_(entry); }
+        }
         entries_.clear();
         state_retained_bytes_ = 0;
     }
@@ -980,6 +1023,11 @@ private:
     // silence this long means the conversation is gone (compacted, abandoned).
     std::chrono::seconds dead_ttl_{15 * 60};
     std::function<bool(const std::optional<qwen3_6::PreparedSessionKey>&)> session_is_live_;
+    // P2.4 Increment 2: returns a dropped entry's state-image pool slots to the
+    // HostStatePool the program owns. Invoked by remove() only — take() /
+    // take_pinned() transfer the slots with the entry (the program releases
+    // them after the restore consumes them).
+    std::function<void(const HostKVSafetyNetEntry&)> state_slot_releaser_;
 
 };
 

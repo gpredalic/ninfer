@@ -448,6 +448,7 @@ def parse_serve_log(path, skip_lines=0):
         "entitlement_mismatch",
         "no_resident_state",
         "spill_before_loss",
+        "state_relinquish",
     ]}
     d["evict_pages"] = []
     d["checkpoint_frontiers"] = []
@@ -575,6 +576,11 @@ def parse_serve_log(path, skip_lines=0):
                 # could lose its last copy (the unit-invariant backstop).
                 if "[spill-before-loss]" in line:
                     d["spill_before_loss"] += 1
+                # P2.4 Increment 2: the release path handed the store's host
+                # replica to the net entry (move-not-copy) — the net is the
+                # unit's host home. Presence proves the relinquish path fired.
+                if "state relinquished (move)" in line:
+                    d["state_relinquish"] += 1
                 # The adopt-path error that followed the leak in prod: the
                 # root-prefill fallback publishes no source, but the admission
                 # claim still expects one.
@@ -1511,6 +1517,8 @@ def phase_13(args):
         all_verdicts.append(("state-saturation", f"FAIL: {log13['entitlement_mismatch']} core-incomplete entitlement mismatches (strict check fired)"))
     if log13["spill_before_loss"] > 0:
         all_verdicts.append(("state-saturation", f"PASS: {log13['spill_before_loss']} spill-before-loss backstops fired (unit retained in net before its state lost its last copy)"))
+    if log13["state_relinquish"] > 0:
+        all_verdicts.append(("state-saturation", f"PASS: {log13['state_relinquish']} state images relinquished to the net (move-not-copy; the net is the unit's host home)"))
     return all_verdicts
 
 
