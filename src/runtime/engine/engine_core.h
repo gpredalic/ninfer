@@ -522,6 +522,20 @@ private:
         {
             std::lock_guard lock(queue_mutex_);
             snapshot.waiting_requests = static_cast<std::uint32_t>(pending_.size());
+            // P1.5(d): visible queue — record the first kQueueReportCap waiting
+            // requests in FIFO order with their wait so far. `id`/`submitted`
+            // are immutable after construction, so reading them here is safe.
+            const Clock::time_point now = Clock::now();
+            std::uint32_t position = 0;
+            for (const auto& request : pending_) {
+                if (snapshot.queue_report_count >= RuntimeStats::kQueueReportCap) { break; }
+                ++position;
+                auto& entry = snapshot.queue_report[snapshot.queue_report_count++];
+                entry.request_id   = request->id;
+                entry.position     = position;
+                entry.wait_seconds =
+                    std::chrono::duration<double>(now - request->submitted).count();
+            }
         }
         snapshot.prefilling_requests = 0;
         if (const auto lane = scheduler_.prefill_lane();
@@ -1973,6 +1987,20 @@ private:
                     membership = scheduler_.build_round_membership(slots_, max_concurrency_);
                 }
 
+                // P1.5(d): keep the visible queue fresh — re-publish stats at
+                // most once per second while requests wait, so /stats reports
+                // an accurate wait_seconds even when nothing else is changing
+                // state (a pure queue wait has no state change to trigger a
+                // publish otherwise).
+                if (have_pending &&
+                    (last_queue_stats_publish_ == Clock::time_point{} ||
+                     Clock::now() - last_queue_stats_publish_ >= std::chrono::seconds(1))) {
+                    last_queue_stats_publish_ = Clock::now();
+                    try {
+                        publish_runtime_stats();
+                    } catch (...) {}
+                }
+
                 // Cancellation is sampled once for the execution unit. A request arriving while
                 // the GPU unit is in flight is observed at the next worker boundary; commit does
                 // not reinterpret an already-issued unit with a later atomic read.
@@ -2132,6 +2160,11 @@ private:
     std::size_t current_decode_lane_count_ = 0;
     RuntimeStats cumulative_stats_;
     RuntimeStats published_stats_;
+    // P1.5(d): last time the queue was published to /stats. The worker loop
+    // re-publishes at most once per second while the queue is non-empty so the
+    // visible wait_seconds stays fresh during a pure queue wait (no state
+    // change to otherwise trigger a publish). Worker-thread-only.
+    Clock::time_point last_queue_stats_publish_{};
     bool stopping_ = false;
     bool failed_   = false;
     static constexpr std::uint32_t kOomBackoffIterations = 4;

@@ -15,6 +15,15 @@ json arena(const ninfer::ArenaMemorySummary& a) {
 } // namespace
 
 std::string format_stats_json(const StatsSnapshot& s) {
+    // P1.5(d): visible queue — the first kQueueReportCap waiting requests, in
+    // FIFO order, with their wait so far.
+    json queue_entries = json::array();
+    for (std::uint32_t i = 0; i < s.scheduler.queue_report_count; ++i) {
+        const auto& e = s.scheduler.queue_report[i];
+        queue_entries.push_back(json{{"request_id", e.request_id},
+                                     {"position", e.position},
+                                     {"wait_seconds", e.wait_seconds}});
+    }
     const json out = json{
         {"schema", "ninfer_serve_stats"},
         {"schema_version", 1},
@@ -27,6 +36,9 @@ std::string format_stats_json(const StatsSnapshot& s) {
               {"materializing", s.scheduler.materializing_requests},
               {"capture_pending", s.scheduler.capture_pending_requests},
               {"terminal_pending", s.scheduler.terminal_pending_requests}}},
+        {"queue",
+         json{{"depth", s.scheduler.waiting_requests},
+              {"entries", queue_entries}}},
         {"counters",
          json{{"computed_prefill_tokens", s.scheduler.computed_prefill_tokens},
               {"committed_decode_tokens", s.scheduler.committed_decode_tokens},

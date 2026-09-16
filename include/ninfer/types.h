@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -791,6 +792,17 @@ struct RuntimeHostWorkStats {
 // Monotonic execution counters, boundary-consistent current gauges, and explicitly named last
 // decision observations. Consumers derive interval counters by subtracting two snapshots.
 struct RuntimeStats {
+    // P1.5(d): one waiting request's visible queue state. `position` is the
+    // 1-based FIFO order in the pending queue; `wait_seconds` is time since
+    // submission. Bounded to the first kQueueReportCap entries (the count is
+    // the number valid); a fixed aggregate so the snapshot stays heap-free.
+    struct QueueWaitEntry {
+        std::uint64_t request_id = 0;
+        std::uint32_t position   = 0;
+        double wait_seconds      = 0.0;
+    };
+    static constexpr std::size_t kQueueReportCap = 16;
+
     RuntimeHostWorkStats host_work;
     // Actual prompt tokens evaluated by prefill; reused checkpoint-prefix tokens are excluded.
     std::uint64_t computed_prefill_tokens = 0;
@@ -806,6 +818,10 @@ struct RuntimeStats {
     std::uint32_t materializing_requests    = 0;
     std::uint32_t capture_pending_requests  = 0;
     std::uint32_t terminal_pending_requests = 0;
+    // P1.5(d): visible queue — the first kQueueReportCap waiting requests, in
+    // FIFO order. `queue_report_count` is the number of valid entries.
+    std::array<QueueWaitEntry, kQueueReportCap> queue_report{};
+    std::uint32_t queue_report_count = 0;
     std::uint64_t active_captures_completed = 0;
     std::uint64_t active_captures_aborted   = 0;
 
