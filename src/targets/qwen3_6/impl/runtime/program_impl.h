@@ -8507,6 +8507,21 @@ StartResult ProgramImplCore::start_request(MaterializationTransaction& transacti
         actual.device.backend_kv_pages += transaction.restore_adopted_backend_pages;
         const detail::PhysicalResources expected = active;
         if (actual != expected) {
+            // P2.4 step 0 (2026-09-16): diagnostic only — the check stays
+            // strict. The observed class is a post-admission demotion shifting
+            // a state image device→host (or a true last-replica loss) between
+            // admission and materialization; the six-dimension delta tells us
+            // which (a migration keeps the state-slot total, a loss does not).
+            std::fprintf(stderr,
+                         "[entitlement] MISMATCH device.state %u→%u host.state %u→%u "
+                         "device.main_kv %u→%u device.backend_kv %u→%u host.kv_bytes %zu→%zu "
+                         "lanes %u→%u\n",
+                         expected.device.state_slots, actual.device.state_slots,
+                         expected.host.state_slots, actual.host.state_slots,
+                         expected.device.main_kv_pages, actual.device.main_kv_pages,
+                         expected.device.backend_kv_pages, actual.device.backend_kv_pages,
+                         expected.host.kv_bytes, actual.host.kv_bytes,
+                         expected.device.active_lanes, actual.device.active_lanes);
             throw std::logic_error("materialized sequence does not match its active entitlement");
         }
         if (details.reuse != ReusePath::Root) {

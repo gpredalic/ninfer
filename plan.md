@@ -718,6 +718,42 @@ shared meter.
         zero-residency state — the state-lease lines around a fallback show
         the refusals). *Exit:* 0 prod `no resident state` fallbacks where the
         unit's KV was still retained; e2e suite green.
+        **Step 0 finding (2026-09-16, unfiltered trace of the 10:34:52
+        episode, req 31/36):** the live `materialized sequence does not match
+        its active entitlement` class is NOT a unit loss. The supersede drop
+        (`supersede: dropping frontier=40945 (prefix of 40950)`) killed only
+        the net's RAW state copy — the store image survived (the fixed gate
+        passed: no `no resident state`, no `[rewrite-restore] FAILED`), so
+        the materialization ran and the post-materialization check
+        (program_impl.h:8509, `actual != expected` over
+        {device.state_slots, main_kv_pages, backend_kv_pages,
+        host.state_slots, host.kv_bytes}) rejected it. Mechanism: a
+        post-admission demotion (relief/pressure — relief events at 10:33/
+        10:46 bracket the episode) shifts a state image device→host (or KV
+        pages device→host extents) AFTER the planner computed the entitlement
+        at admission, so the residency-shifted actual no longer equals the
+        admission-time expected. This is the P1.7 residual "general
+        post-admission-demotion H2D gap" (the specific RetainExisting+HostOnly
+        case was fixed `e49d6f22`; the general case was deferred to the unit
+        work). The supersede line is temporally correlated, not causal for
+        the store image. *Fix home:* the 8509 check must accept the documented
+        residency downgrade (device→host shift with preserved total state
+        count; device under-consumption is the safe direction — the scarce
+        pool). **Attempted + REVERTED (2026-09-16):** a first relaxation
+        (accept device under-consumption + sum-preserving state shift) was
+        deployed 11:21 (e2e 44P/16W/0F) but review found a safety hole — a
+        lost DeviceOnly image and a demoted Dual produce identical dimension
+        deltas, so the sum check can mask a true loss when expected.host>0.
+        Reverted to the strict check + a six-dimension `[entitlement] MISMATCH`
+        diagnostic (expected→actual) at the throw site (source-only; ships
+        with the Increment 1 deploy — behavior-identical to pre-fix + the log). The canary is already
+        discriminating: 11:28:45 `device.state 3→2 host.state 0→0` (a true
+        loss — no host absorption) was correctly rejected. The benign
+        migration subcase (device.state 3→2 + host.state 0→1) is what the
+        relaxation would have accepted; the true-loss subcase is what
+        Increment 1 (spill-before-loss) must prevent. Low frequency (a few/hr
+        under heavy concurrent load), always self-retried (the retry
+        re-admits against current residency and succeeds).
       - **Increment 2 — net as the unit's host home (census + move-not-copy).**
         The net's `state_host` buffers are untracked host replicas (invisible
         to the store census, state_image_store.h:166–205) and net restore
