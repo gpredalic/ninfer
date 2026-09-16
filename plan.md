@@ -643,6 +643,68 @@ shared meter.
       good baseline (clean root-prefill fallback, 0 hard 500s); DIAG canary
       (a4629fac) stays. Re-land the gate fix ONLY after P1.5 makes the device
       state pool fit the working set AND the entitlement model is fixed.
+      **RE-LANDED + DEPLOYED 2026-09-16 09:26** (`e0b368f4` gate, `22be939d`
+      fork slot, `6f92bfdc` replace-clear; e2e 37P/10W/0F): the gate fix works —
+      0 `no resident state` fallbacks. **New regression it unmasked — device
+      state pool saturation:** with restores actually happening, the pool pins
+      at capacity (10/10 post-rehydration; images are Dual or pinned). The
+      emergency relief `demote_checkpoints_to_make_room` only demotes
+      DeviceOnly unpinned checkpoints (`coldest_demotable_checkpoint` skips
+      Dual — `reserve_device_to_host` rejects `host_slot`), so a saturated pool
+      frees nothing: the H2D restore's `take_device_slot` or the final
+      `reserve_destination` in `reserve_state_entitlement` (program_impl.h:12218)
+      fails → `std::bad_alloc` (4 clusters: 09:28/09:33 at pool=9, 09:37/09:45
+      at pool=10 — each 1-2 auto-retried requests, engine recovers) plus
+      secondary `materialized sequence does not match its active entitlement`
+      500s on the following turns. Pool bump 9→10 (`--device-state-slots 7`)
+      deployed 09:33 — whack-a-mole, not a fix. **Relief fix (in progress):**
+      (a) `host_replica_stale` flag on the store Object — set in `thaw` (the only
+      gateway that makes a host-holding image writable; the sole prod thaw site
+      drops the host replica first, so this is defense-in-depth), cleared on
+      D2H publish; guards `drop_device_replica`; (b) `coldest_dual_device_replica()`
+      + second relief tier in `demote_checkpoints_to_make_room`: drop the
+      redundant device replica of the coldest FRESH Dual checkpoint (host half
+      current → no copy, unit stays complete in the host pool); (c) the
+      rewrite-restore H2D branch demotes the FULL entitlement
+      (`state_slots - state_footprint`) instead of 1 — the final destination
+      reserve needs its slot too; (d) `reserve_state_entitlement` demotes and
+      retries once before throwing bad_alloc. Unit tests in
+      test_context_store.cpp (dual candidate/drop + stale exclusion); e2e
+      tracks `relief_dual_drop` and FAILs on bad_alloc in demotion/state-lease
+      phases; /stats counter `materialize_dual_device_replica_drops`.
+      **DEPLOYED 2026-09-16 10:00 (e2e 36P/10W/0F) + VERIFIED LIVE:** first
+      relief event 10:06:50 `[relief] freed 1 device state slot(s) (demoted 1
+      to host, dropped 0 dual) (needed 3)` — the exact class that 500ed
+      ~1/min pre-fix; 0 bad_alloc since deploy. **e2e coverage gap closed:**
+      phases 11/12 pressurize but never saturate the pool (relief=0), so
+      **phase 13 "state-saturation"** was added (6 tool-calling sessions —
+      the production shape, since tool-call turns are what capture rewrite
+      checkpoints — × 8 rounds): verified 8/8 pool saturation, 9 checkpoint
+      captures, 6 restores, 0 worker recoveries, 0 bad_alloc (3 targeted
+      runs to tune the load; plain thinking turns capture ~0 checkpoints and
+      leave the pool full of endpoints only, so the relief trigger never
+      fires). Residual low-frequency class (a few per hour under heavy load,
+      clustered in the first requests after a restart, always auto-retried):
+      `materialized sequence does not match its active entitlement` from the
+      supersede-vs-materialization race — a spill supersedes (drops the last
+      replica of) the checkpoint an in-flight materialization selected
+      (10:08:20: `supersede: dropping frontier=181969` mid-restore). This is
+      increment 1's spill-before-loss class; the two dominant classes (gate
+      false positive, bad_alloc) are fixed.
+      **Non-defects ruled out (2026-09-16 10:39–10:41):** `cancelled
+      generation cannot be serialized as an Anthropic message` and `invalid
+      Anthropic stream finish state` are the user pressing ESC in Claude Code
+      to cancel in-flight requests — expected, not a server bug.
+      **NEW class — SIGABRT on a CUDA event timer (2026-09-16 10:24, 10:26):**
+      two successive prod processes aborted (`code=dumped, status=6/ABRT`) at
+      `device.cu:185 cudaEventElapsedTime → cudaErrorInvalidResourceHandle`,
+      each ~2 min after startup, each right after a ~210k-token cold prefill
+      (75s TTFT) and on the first net-restore's transfer-timer read. The 3rd
+      process (10:28) has been stable 15+ min. GPU clean at inspection (54°C,
+      no Xid in dmesg). Orthogonal to the state-pool relief work (which touches
+      no CUDA events/timers); the 75s TTFT before each abort points at a WSL2
+      GPU context reset during a large DMA window. Tracked as P4.1 —
+      investigate separately, do NOT conflate with the unit refactor.
       Increments:
       - **Increment 1 — spill-before-loss (kill the unit split).** At the
         point a unit's state is about to lose its LAST replica (device-slot
@@ -733,7 +795,15 @@ shared meter.
       dead tier precedes protection, active unit survives idle evictions in
       the state-pool loop, exhaustion displaces it only when alone).
 - [ ] **P2.6 — config.** `--host-state-slots` derived from (or replaced by) the
-      shared budget; document the single `--host-cache-mib`.
+      shared budget; document the single `--host-cache-mib`. **In progress
+      (source-only, ships with the relief-fix deploy):** `host_cache_mib` +
+      explicitness flags in `ContextCacheOptions`; `--host-cache-mib` parse
+      branch + usage text in serve_options.cpp; derivation in
+      `build_sequence_candidate` (layouts_impl.h) — when the knob is set and a
+      component is not explicit, ~20% of the total becomes checkpoint state
+      slots (derived from the model's `StateImageHostLayout.image_bytes`),
+      ~80% host KV; an explicit component keeps its value and is subtracted
+      from the total. Parse tests in test_serve_options.cpp.
 
 *#7 exit criteria:* e2e full suite + 3-session long conversation: 0 full-root
 mid-conversation re-prefills, 0 ckpt-miss half-units, 0 "no resident state",
@@ -753,6 +823,26 @@ unit model; building the unit first makes this cheaper.
 
 ### P4 — long tail
 
+- [ ] **P4.1 — SIGABRT on CUDA event timer (new 2026-09-16).** Two successive
+      prod processes aborted at `device.cu:185 cudaEventElapsedTime →
+      cudaErrorInvalidResourceHandle`, each ~2 min after startup, each right
+      after a ~210k-token cold prefill (75s TTFT) and on the first
+      net-restore's transfer-timer read; the 3rd process stable 15+ min.
+      GPU clean at inspection (54°C, no Xid). Suspect a WSL2 GPU context
+      reset during a large DMA window (the 75s TTFT precedes each abort).
+      *Step 0:* confirm the 3rd process survives a full day (if it does, this
+      is a rare driver event, not a code regression — the relief fix touches
+      no CUDA events/timers). *If it recurs:* capture the pre-abort journal
+      (last 30s unfiltered) + `nvidia-smi` + `dmesg` at the moment; consider
+      making `CudaEventTimer::elapsed_ms` log-and-zero instead of aborting on
+      `InvalidResourceHandle` (a timing read must not take down the engine).
+      *Exit:* 0 SIGABRTs over a full day, or a hardening commit + e2e.
+- [ ] **P4.2 — `prepared pressure expansion exceeds the target arena`**
+      (triaged 2026-09-16 10:45). `pressure_planner.h:1203` (length_error) —
+      the pressure planner's prepared expansion does not fit the target arena.
+      2× in 24h (both post-10:28 deploy), self-recovering (worker recover +
+      client retry). Too rare to act on yet; if it grows past a handful/day,
+      trace the arena sizing at the throw site (P1.5's over-commit domain).
 - [ ] **#4d — planner pruning.** Prune long-idle/dead owners from the 4096-target
       search space (e2e symptom: `budget_exhausted=True`,
       `stop_reason=expansion_capacity`). Shrinks further after #7's unit
