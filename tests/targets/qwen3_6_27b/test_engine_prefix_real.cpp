@@ -395,7 +395,8 @@ int exercise_host_restore(const char* artifact) {
         after_pressure.state_d2h_count <= before_pressure.state_d2h_count ||
         after_pressure.main_kv_d2h_pages <= before_pressure.main_kv_d2h_pages ||
         after_pressure.backend_kv_d2h_pages <= before_pressure.backend_kv_d2h_pages) {
-        std::cerr << "Host pressure did not demote the complete MTP checkpoint: state="
+        std::cerr << "Host pressure did not move the complete MTP checkpoint to host "
+                     "(demote or whole-unit spill): state="
                   << after_pressure.state_d2h_count << " main=" << after_pressure.main_kv_d2h_pages
                   << " backend=" << after_pressure.backend_kv_d2h_pages
                   << " degraded=" << after_pressure.pressure_private_owners_degraded
@@ -1354,19 +1355,26 @@ int exercise_materialization_source_pressure_protection(const char* artifact) {
         after_branch.main_kv_d2h_pages - before_branch.main_kv_d2h_pages;
     const std::uint64_t degraded = after_branch.pressure_private_owners_degraded -
                                    before_branch.pressure_private_owners_degraded;
+    // P2.4 Slice 3 Inc 2: the per-replica KV demote that used to free the page is
+    // retired by default — the same relief now arrives as a whole-unit Evict
+    // (safety-net spill) of the smallest non-source owner, which advances the
+    // evicted counter instead of the degraded one (NINFER_KEEP_REPLICA_DEMOTES=1
+    // restores the demote path). The protected-source invariant is unchanged.
+    const std::uint64_t evicted = after_branch.pressure_private_owners_evicted -
+                                  before_branch.pressure_private_owners_evicted;
     const bool private_partial_source =
         branched.prefix_reuse_path == ninfer::PrefixReusePath::PrivateResponseReplay ||
         branched.prefix_reuse_path == ninfer::PrefixReusePath::PrivateTurnClosure;
     if (branched.generated_token_ids.size() != 1 || !private_partial_source ||
         branched.reused_prompt_tokens == 0 ||
         branched.reused_prompt_tokens >= branched.prompt.prompt_tokens || demoted_pages == 0 ||
-        degraded == 0 || branched.materialization.selected_maximal_fallback) {
+        (degraded == 0 && evicted == 0) || branched.materialization.selected_maximal_fallback) {
         std::cerr << "source-pressure branch did not preserve its source under guided Host KV "
                      "pressure: path="
                   << static_cast<int>(branched.prefix_reuse_path)
                   << " reused=" << branched.reused_prompt_tokens
                   << " prompt=" << branched.prompt.prompt_tokens << " demoted=" << demoted_pages
-                  << " degraded=" << degraded
+                  << " degraded=" << degraded << " evicted=" << evicted
                   << " maximal=" << branched.materialization.selected_maximal_fallback << " stop="
                   << ninfer::materialization_stop_reason_name(branched.materialization.stop_reason)
                   << '\n';

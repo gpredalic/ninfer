@@ -256,6 +256,23 @@ bool pressure_state_demotes(qwen3_6::detail::PressureStateDecision change) noexc
            change == qwen3_6::detail::PressureStateDecision::DemoteSharedToHost;
 }
 
+// P2.4 Slice 3 Inc 2 (2026-09-17): per-replica demotion retirement. The
+// pressure planner used to demote the state image and the KV pages of a unit
+// as INDEPENDENT resources (Demote*ToHost state + KV DemoteToHost), which is
+// how the "KV without state" loss class arises. With the whole-unit safety-net
+// spill as the unit's host home (Increments 1-2), the planner's device→host
+// pressure move is the whole-unit Evict decision (publishes via
+// release_materialization_victim → spill_victim_to_host_kv_safety_net); the
+// per-replica demote options are retired by default. NINFER_KEEP_REPLICA_DEMOTES=1
+// restores them for rollback during the soak.
+static bool keep_replica_demotes() noexcept {
+    static const bool keep = [] {
+        const char* v = std::getenv("NINFER_KEEP_REPLICA_DEMOTES");
+        return v != nullptr && v[0] != '\0' && std::string(v) != "0";
+    }();
+    return keep;
+}
+
 std::optional<StateImageHandle> pressure_state_source(qwen3_6::detail::PressureStateDecision change,
                                                       const SequenceState* sequence,
                                                       const SharedPrefixState* shared) {
@@ -516,7 +533,10 @@ select_kv_pressure_actions(const KVAddressSpaceStore& addresses, LogicalKVPageSt
     // cost of added host demand; the caller's feasibility check rejects the option if
     // the combined host demand exceeds the budget. Without this, a candidate that needs
     // host KV budget suppresses all demotes, causing full eviction instead of parking.
-    if (device_remaining != 0 && host_allocation_available &&
+    // P2.4 Slice 3 Inc 2: retired by default — a KV-only demote splits the unit
+    // (state half managed separately); the whole-unit Evict decision is the
+    // device→host pressure move. NINFER_KEEP_REPLICA_DEMOTES=1 restores it.
+    if (keep_replica_demotes() && device_remaining != 0 && host_allocation_available &&
         host_extents != nullptr) {
         select_device_runs(false);
     }
@@ -1504,7 +1524,8 @@ std::optional<qwen3_6::detail::PressureDecision> ProgramImplCore::inspect_shared
         } else if (deficit.device.state_slots != 0 && residency == StateReplicaResidency::Both) {
             state_change = qwen3_6::detail::PressureStateDecision::DropSharedDeviceDuplicate;
         } else if (deficit.device.state_slots != 0 &&
-                   residency == StateReplicaResidency::DeviceOnly && host_state_images != nullptr) {
+                   residency == StateReplicaResidency::DeviceOnly &&
+                   keep_replica_demotes() && host_state_images != nullptr) {
             state_change = qwen3_6::detail::PressureStateDecision::DemoteSharedToHost;
             ++option.effect.added.host.state_slots;
             append_pressure_transfer(option, state_transfer_requirement(
@@ -1725,7 +1746,8 @@ std::optional<qwen3_6::detail::PressureDecision> ProgramImplCore::inspect_pressu
         } else if (residual.device.state_slots != 0 && residency == StateReplicaResidency::Both) {
             change = endpoint_drop;
         } else if (residual.device.state_slots != 0 &&
-                   residency == StateReplicaResidency::DeviceOnly && host_state_images != nullptr) {
+                   residency == StateReplicaResidency::DeviceOnly &&
+                   keep_replica_demotes() && host_state_images != nullptr) {
             // Physical gate: model a demote only when the host pool can satisfy
             // it. A free slot satisfies it directly; a dual-resident
             // checkpoint's redundant host replica can be freed on demand

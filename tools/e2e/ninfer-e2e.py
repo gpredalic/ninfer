@@ -641,12 +641,17 @@ def evaluate(phase_name, sessions, stats0, stats1, log, expect_trash=False):
         v.append(f"PASS: {log['bad_alloc']} std::bad_alloc caught and recovered (extreme pressure handled)")
 
     # Pressure (skip for single-session phases and state-pool phases)
-    pressure = evicted > 0 or degraded > 0
+    # P2.4 Slice 3 Inc 2 (2026-09-17): device-KV pressure is relieved by
+    # demote (degraded), whole-unit eviction (evicted), or a net spill
+    # (spill_ok / safety-net restore) — per-replica demotes are retired by
+    # default, so count the net-spill evidence too, not only /stats.
+    pressure = evicted > 0 or degraded > 0 or restores > 0 or log.get("spill_ok", 0) > 0
     if phase_name not in ("checkpoint-advance", "tool-calling", "responses-tools", "reasoning-effort", "concurrent", "thinking-sig", "demotion", "state-saturation", "queued-relief"):
         if not pressure and not expect_trash:
             v.append("FAIL: no KV pressure")
         if pressure:
-            v.append(f"PASS: pressure (evicted={evicted}, degraded={degraded})")
+            v.append(f"PASS: pressure (evicted={evicted}, degraded={degraded}, "
+                     f"spill_ok={log.get('spill_ok', 0)}, restores={restores})")
 
     # Cache reuse (skip for single-session phases and state-pool phases)
     if phase_name not in ("checkpoint-advance", "tool-calling", "responses-tools", "reasoning-effort", "concurrent", "thinking-sig", "demotion", "state-saturation", "queued-relief"):
