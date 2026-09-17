@@ -469,6 +469,37 @@ void test_kv_store(ninfer::DeviceContext& device) {
                physical_pages.allocated_pages() == 0,
            "shared full-page occupancy survives until its final address reference releases");
 
+    // P2.4 Slice 3 Inc 1: the unique-page probe. A unit whose pages are all
+    // shared with a live shared prefix reports its full resident count to
+    // resident_device_pages but frees NOTHING on release — the 2026-09-17
+    // relief incident (a 235k unit scoring ~7300 "unique" pages freed ~10).
+    // The probe must see through the sharing so relief ranks the shared
+    // prefix (the actual page owner) above the forked unit.
+    const auto unique_src = addresses.create_active(4, 0);
+    expect(unique_src.has_value(), "unique-page probe source allocation");
+    addresses.materialize_to_tokens(*unique_src, 128, device.stream);
+    addresses.commit_frontier(*unique_src, 128);
+    addresses.deactivate(*unique_src);
+    expect(addresses.resident_device_pages(*unique_src) == 2 &&
+               addresses.unique_resident_device_pages(*unique_src) == 2,
+           "an unshared unit counts all resident pages as unique");
+    const auto unique_branch = addresses.create_inactive();
+    expect(unique_branch.has_value(), "unique-page probe branch allocation");
+    auto unique_fork = addresses.prepare_prefix_fork(*unique_src, *unique_branch, 128, 3, 1);
+    addresses.commit_prefix_fork(std::move(unique_fork), device.stream);
+    device.synchronize();
+    expect(addresses.resident_device_pages(*unique_src) == 2 &&
+               addresses.unique_resident_device_pages(*unique_src) == 0 &&
+               addresses.resident_device_pages(*unique_branch) == 2 &&
+               addresses.unique_resident_device_pages(*unique_branch) == 0,
+           "a fully-forked unit and its shared prefix overcount resident pages; "
+           "the unique probe sees nothing releasable in either");
+    addresses.deactivate(*unique_branch);
+    expect(addresses.release(*unique_branch) && physical_pages.allocated_pages() == 2,
+           "releasing the forked unit frees no device replicas (pages stay pinned)");
+    expect(addresses.release(*unique_src) && physical_pages.allocated_pages() == 0,
+           "only the shared prefix's release frees the pinned pages");
+
     const auto mixed_source = addresses.create_active(4, 0);
     expect(mixed_source.has_value(), "mixed snapshot retained-prefix source allocation");
     addresses.materialize_to_tokens(*mixed_source, 65, device.stream);

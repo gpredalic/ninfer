@@ -4851,16 +4851,30 @@ std::uint32_t ProgramImplCore::relieve_kv_fit(const KvReliefSkip& skip) noexcept
     // be in flight — and decode does not release KV pages, so the only
     // continuations that are neither in use nor about to be used are the
     // Catalogued ones that are not in the skip set (the caller's own
-    // source/root/shared source) and are not bound to a decode lane. Demote
-    // the one pinning the most UNIQUE device-resident pages: mapped pages
-    // overcount, because pages shared with the live shared prefix (or already
-    // host-resident) are not freed by a release — the 22:28 episode demoted
-    // 29k mapped pages and freed 77. The {KV + state} unit is preserved in
-    // the host safety net, so the session's next turn restores from host
-    // instead of re-prefilling.
-    std::uint32_t victim              = continuation_capacity;  // sentinel: none
-    std::uint32_t victim_pages        = 0;
-    bool victim_is_shared_prefix      = false;
+    // source/root/shared source) and are not bound to a decode lane.
+    //
+    // P2.4 Slice 3 Inc 1 (2026-09-17): rank by UNIQUE device-resident pages
+    // (address_references == 1) — a release frees a device replica only when
+    // the LAST reference drops, so pages shared with the live shared prefix
+    // are not freed by releasing the continuation. The old metric
+    // (resident_device_pages) overcounted them: the 19:40 incident demoted
+    // five ~235k units scoring ~7300 "unique" pages each while freeing 2–16
+    // real pages per demotion, and never reached the shared prefix that
+    // actually pinned the pool. Both stages are now scored in the same call
+    // and the higher score wins (tie → the content-preserving demotion); the
+    // returned value is the MEASURED free-page delta, not the score.
+    const auto unique_pages = [this](const SequenceKVBundle& kv) -> std::uint32_t {
+        std::uint32_t n = text_kv_addresses->unique_resident_device_pages(kv.text);
+        if (kv.backend && backend_kv_addresses) {
+            n += backend_kv_addresses->unique_resident_device_pages(*kv.backend);
+        }
+        return n;
+    };
+    // Stage 1: an idle continuation (demoted to the host safety net — the
+    // {KV + state} unit is preserved, so the session's next turn restores
+    // from host instead of re-prefilling).
+    std::uint32_t cont_victim = continuation_capacity;  // sentinel: none
+    std::uint32_t cont_pages  = 0;
     for (std::uint32_t i = 0; i < continuation_capacity; ++i) {
         if (continuation_slots[i].role != ContinuationSlotRole::Catalogued) { continue; }
         if (skip.source && *skip.source == i) { continue; }
@@ -4871,69 +4885,81 @@ std::uint32_t ProgramImplCore::relieve_kv_fit(const KvReliefSkip& skip) noexcept
             if (active_continuations[lane] == i) { lane_bound = true; break; }
         }
         if (lane_bound || !continuation_states[i].kv) { continue; }
-        const SequenceKVBundle& kv = *continuation_states[i].kv;
-        std::uint32_t unique = text_kv_addresses->resident_device_pages(kv.text);
-        if (kv.backend && backend_kv_addresses) {
-            unique += backend_kv_addresses->resident_device_pages(*kv.backend);
-        }
-        if (unique > victim_pages) {
-            victim_pages = unique;
-            victim       = i;
+        const std::uint32_t unique = unique_pages(*continuation_states[i].kv);
+        if (unique > cont_pages) {
+            cont_pages  = unique;
+            cont_victim = i;
         }
     }
-    if (victim == continuation_capacity) {
-        // Second stage (P1.5c): a shared prefix entry. The 00:32 episode
-        // quantified why this is needed: 13 idle-continuation demotions of one
-        // conversation's stale turn-continuations freed 156 of the ~3450 pages
-        // the demand was short — the continuations' pages stay resident under
-        // the shared prefix that pins the pool. Release the idle shared prefix
-        // (device KV + state) so the gate can fit. Its content survives in the
-        // host safety net through the spilled turn continuations (each compact
-        // prefix contains the shared prefix), so the conversation's next
-        // request restores via the normal safety-net fallback instead of
-        // re-prefilling. Bounded degradation: if no turn entry exists, the
-        // next request re-prefills from root — still cheaper than the 120s
-        // deadline abort + restart this stall would otherwise cause.
-        for (std::uint32_t i = 0; i < shared_prefix_capacity; ++i) {
-            if (shared_prefix_slots[i].role != SharedPrefixSlotRole::Catalogued) { continue; }
-            const SharedPrefixState& shared = shared_prefix_states[i];
-            if (!shared.kv || shared.active_references != 0) { continue; }
-            if (skip.shared_source && *skip.shared_source == i) { continue; }
-            const SequenceKVBundle& kv = *shared.kv;
-            std::uint32_t unique = text_kv_addresses->resident_device_pages(kv.text);
-            if (kv.backend && backend_kv_addresses) {
-                unique += backend_kv_addresses->resident_device_pages(*kv.backend);
-            }
-            if (unique > victim_pages) {
-                victim_pages            = unique;
-                victim                  = i;
-                victim_is_shared_prefix = true;
-            }
+    // Stage 2 (P1.5c): an idle shared prefix entry. The 00:32 episode
+    // quantified why this is needed: 13 idle-continuation demotions of one
+    // conversation's stale turn-continuations freed 156 of the ~3450 pages
+    // the demand was short — the continuations' pages stay resident under
+    // the shared prefix that pins the pool. Release the idle shared prefix
+    // (device KV + state) so the gate can fit. Its content survives in the
+    // host safety net through the spilled turn continuations (each compact
+    // prefix contains the shared prefix), so the conversation's next
+    // request restores via the normal safety-net fallback instead of
+    // re-prefilling. Bounded degradation: if no turn entry exists, the
+    // next request re-prefills from root — still cheaper than the 120s
+    // deadline abort + restart this stall would otherwise cause.
+    std::uint32_t shared_victim = 0;
+    std::uint32_t shared_pages  = 0;
+    bool shared_candidate       = false;
+    for (std::uint32_t i = 0; i < shared_prefix_capacity; ++i) {
+        if (shared_prefix_slots[i].role != SharedPrefixSlotRole::Catalogued) { continue; }
+        const SharedPrefixState& shared = shared_prefix_states[i];
+        if (!shared.kv || shared.active_references != 0) { continue; }
+        if (skip.shared_source && *skip.shared_source == i) { continue; }
+        const std::uint32_t unique = unique_pages(*shared.kv);
+        if (unique > shared_pages) {
+            shared_pages     = unique;
+            shared_victim    = i;
+            shared_candidate = true;
         }
     }
-    if (victim_pages == 0) { return 0; }
-    if (victim_is_shared_prefix) {
+    if (cont_pages == 0 && shared_pages == 0) {
+        // Nothing unique anywhere — a demotion would churn a multi-GB D2H
+        // burst to free ~0. The caller's 15s re-fire + 120s deadline bound it.
+        return 0;
+    }
+    // The higher score wins; a tie goes to the content-preserving demotion.
+    const bool do_shared = shared_candidate && shared_pages > cont_pages;
+    const std::uint32_t free_text_before    = text_kv_pages->physical_pool().available_pages();
+    const std::uint32_t free_backend_before =
+        backend_kv_pages ? backend_kv_pages->physical_pool().available_pages() : 0;
+    if (do_shared) {
         try {
-            release_shared_prefix_state(victim, SharedPrefixSlotRole::Catalogued);
+            release_shared_prefix_state(shared_victim, SharedPrefixSlotRole::Catalogued);
         } catch (...) { return 0; }
+        const std::uint32_t freed =
+            (text_kv_pages->physical_pool().available_pages() - free_text_before) +
+            (backend_kv_pages
+                 ? backend_kv_pages->physical_pool().available_pages() - free_backend_before
+                 : 0);
         std::fprintf(stderr,
                      "[relief-kv] fit gate stalled — released idle shared prefix %u "
-                     "(%u resident pages); content preserved in safety-net turn entries\n",
-                     victim, victim_pages);
-        return victim_pages;
+                     "(scored %u unique, freed %u pages); content preserved in "
+                     "safety-net turn entries\n",
+                     shared_victim, shared_pages, freed);
+        return freed;
     }
     // Same unit operation as the catalog-rotation and pressure-victim paths:
     // park the {KV + state} unit in the host safety net, then release the
     // device-side continuation (frees the device KV pages the gate is waiting
     // on). A refused state release (shared-prefix retention) still leaves the
     // KV freed — the state slot is a separate pool, not gated here.
-    spill_victim_to_host_kv_safety_net(victim);
-    release_continuation_slot(victim);
+    spill_victim_to_host_kv_safety_net(cont_victim);
+    release_continuation_slot(cont_victim);
+    const std::uint32_t freed =
+        (text_kv_pages->physical_pool().available_pages() - free_text_before) +
+        (backend_kv_pages ? backend_kv_pages->physical_pool().available_pages() - free_backend_before
+                          : 0);
     std::fprintf(stderr,
                  "[relief-kv] fit gate stalled — demoted idle continuation %u "
-                 "(%u unique resident pages) to the host safety net\n",
-                 victim, victim_pages);
-    return victim_pages;
+                 "(scored %u unique, freed %u pages) to the host safety net\n",
+                 cont_victim, cont_pages, freed);
+    return freed;
 }
 
 qwen3_6::KvAdmissionFit

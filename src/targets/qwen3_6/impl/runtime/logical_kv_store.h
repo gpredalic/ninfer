@@ -1729,6 +1729,28 @@ public:
         return count;
     }
 
+    // Quiet probe: how many of the space's logical pages hold a device
+    // replica that this space UNIQUELY owns (address_references == 1). A
+    // release of this space frees a device replica only when the LAST
+    // reference drops, so pages shared with another address space are not
+    // freed by releasing this one — resident_device_pages overcounts them
+    // (the 2026-09-17 relief incident: a 235k unit sharing a ~230k prefix
+    // reported ~7300 "unique" pages but freed ~10). Mirrors the
+    // address_references > 1 skip in resident_resources.
+    [[nodiscard]] std::uint32_t unique_resident_device_pages(KVAddressSpaceHandle handle) const noexcept {
+        if (!valid(handle)) { return 0; }
+        const Address& address = addresses_[handle.index_];
+        std::uint32_t count = 0;
+        for (std::uint32_t p = 0; p < address.page_count; ++p) {
+            const LogicalKVPageHandle logical = membership(address, p);
+            if (pages_->valid(logical) && pages_->device_resident(logical) &&
+                pages_->address_references(logical) == 1) {
+                ++count;
+            }
+        }
+        return count;
+    }
+
     [[nodiscard]] std::uint32_t entitlement(KVAddressSpaceHandle handle) const {
         return entitlement(require(handle));
     }
