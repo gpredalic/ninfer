@@ -968,6 +968,20 @@ shared meter.
 mid-conversation re-prefills, 0 ckpt-miss half-units, 0 "no resident state",
 no restarts during a 1-hour saturated run.
 
+**Checkpoint-capture coverage (investigated 2026-09-17, no bug found).** The
+e2e's "16/23 spills missing checkpoints" WARN was a measurement artifact, not a
+capture gap: 15 of the 16 were `at-ckpt` entries (retained AT their checkpoint
+frontier — complete units whose OK line hardcodes `ckpt_valid=0`), and the 1
+remaining was a clean-append turn whose only ckpt-miss reason was
+`rewrite_checkpoint_invalid` (the turn never *requested* a checkpoint — the
+e2e runs without `--thinking-mode`, so follow-ups append rather than rewrite).
+No capture-failure reasons (`capture_logic_failed` / `rewrite_state_invalid` /
+`_hostonly` / `_none`) appeared, so no rewrite turn failed to capture. The
+focused e2e (`~/ninfer-e2e/ninfer-e2e.py`) now (a) excludes at-ckpt entries from
+the missing-checkpoint count, (b) tallies the ckpt-miss reason distribution, and
+(c) FAILs only on genuine capture failures while reporting expected clean-append
+misses as a note. No server change needed.
+
 ### P3 — #2: strip-collapse (`--strip-thinking-cache`)
 
 Re-prefill only the 7 RoPE-bound attention layers after a thinking-strip;
