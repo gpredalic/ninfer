@@ -983,10 +983,24 @@ unit model; building the unit first makes this cheaper.
       2× in 24h (both post-10:28 deploy), self-recovering (worker recover +
       client retry). Too rare to act on yet; if it grows past a handful/day,
       trace the arena sizing at the throw site (P1.5's over-commit domain).
-- [ ] **#4d — planner pruning.** Prune long-idle/dead owners from the 4096-target
-      search space (e2e symptom: `budget_exhausted=True`,
-      `stop_reason=expansion_capacity`). Shrinks further after #7's unit
-      lifecycle.
+- [x] **#4d — planner pruning / search convergence (shipped 2026-09-17).**
+      The 8s proc-time regression (a few gen tokens, was <1s) was the
+      admission planner enumerating ~3,200 pressure targets in 3.2s
+      (`stop_reason=expansion_capacity`, `budget_exhausted=True`) — a
+      set-cover search over every parked catalog unit, seeded with the
+      evict-all incumbent so the optimality stops could never fire. Fixed in
+      three phases: **A** (8757a2a8) greedy eviction-cover seed + covered-
+      target stop + infeasible-branch prune + owner prefilter; **B+C**
+      (337daaed) fast infeasibility test (skip the ~1ms assess when the
+      summed effects can't cover) + 30ms wall-clock backstop (safe: the seed
+      is a verified Feasible cover, so a capped search still seals a
+      complete plan — unlike the removed 5ms cap). e2e: p95 search 3.2s →
+      30.2ms, 0 budget stops, 66 PASS / 0 FAIL. New `planner-latency` e2e
+      gate (p95 < 50ms, 0 budget stops) + `seed_type`/`owner_count` in the
+      request log keep it detectable. The e2e host arena was re-sized
+      4→12 GiB (~/ninfer-e2e, outside repo): the converged planner retains
+      ~3× more units on host (the intended P2.4 behavior), which starved the
+      old 4 GiB arena (thinking spills + state-saturation relief).
 - [ ] **15:15–15:32 stall (pre-deploy, uninvestigated).** ~15 min at
       `waiting=1, materializing=1`. May be error-loop fallout — recheck the
       post-deploy journal before chasing.
