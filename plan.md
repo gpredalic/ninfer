@@ -903,11 +903,7 @@ shared meter.
         both unique==0 / resident==2; branch release frees nothing, prefix
         release frees the pages. Soak exit signal: 0 wedge restarts +
         plausible freed counts under the monitor. **Increment 2 (planner
-        retirement) PENDING** — after a clean Inc 1 soak: stop generating
-        `Demote*ToHost` state options + KV `DemoteToHost` (Evict carries the
-        load), duplicate-drops + state-slot relief stay (tier-1 re-pointed at
-        whole-unit spill), `NINFER_KEEP_REPLICA_DEMOTES=1` kill-switch,
-        counter/e2e/test updates per the dependency map.
+        retirement)** — status below (implemented, e2e pending).
         **Slice 3 Increment 1 (relief metric) SHIPPED `569dbbd2`, 2026-09-17
         20:1x, e2e-verified (rc=0, 0 crashes) + deployed (prod up 20:14:44).**
         The 19:22/19:42/19:55 wedge loop (sentinel restarted the user's live
@@ -927,14 +923,33 @@ shared meter.
         pins the topology (fully-forked unit + prefix both unique==0; branch
         release frees nothing, prefix release frees the pages). Soak exit
         signal: 0 wedge restarts + plausible freed counts under the monitor.
-        **Slice 3 Increment 2 (planner retirement) PENDING** — after a clean
-        Inc 1 soak: stop generating `Demote*ToHost` state options + KV
-        `DemoteToHost` (Evict carries the load; duplicate-drops + state-slot
-        relief stay, tier-1 re-pointed at whole-unit spill); behind
-        `NINFER_KEEP_REPLICA_DEMOTES=1`; counter/e2e/test updates per the
-        dependency map (main_kv_d2h stops for pressure demotes,
-        pressure_spill_pages stops, e2e evidence lines re-pointed at
-        `[safety-spill]`/`[relief-kv]`).
+        **Slice 3 Increment 2 (planner retirement) IMPLEMENTED, e2e PENDING**
+        (2026-09-17 21:2x): `keep_replica_demotes()` helper + 3 generation
+        gates in program_impl.h (KV demote generation in
+        `select_kv_pressure_actions`, shared-state demote branch in
+        `inspect_shared_pressure_successors`, add-state demote branch in
+        `inspect_pressure_successors`) — default OFF (demotes retired, Evict
+        carries the load); `NINFER_KEEP_REPLICA_DEMOTES=1` restores the old
+        option set. Duplicate-drops + state-slot relief stay. **Tier-1
+        decision (differs from the original plan):** `demote_checkpoints_to_make_room`
+        tier-1 (DeviceOnly checkpoint D2H) is NOT re-pointed — it is a
+        state-SLOT-pool pre-allocation guard that is unit-completeness-
+        preserving (the state image moves to the net, its home; the unit is
+        never split into a KV-without-state form), so it stays as-is.
+        Verified: full build clean; resource_manager_test A/B-identical
+        failure sets (5 pre-existing baseline FAILs, no new); context_store_test
+        passes. E2E verdicts: focused suite pressure gate + mode checks
+        updated; repo suite pressure gate updated (spill_ok/safety-restores
+        counted) — the plan's "re-point" list turned out mostly unnecessary:
+        `checkpoint_demoted` (relay D2H, deferred exception),
+        `relief_demote`/`relief_dual_drop` (state-slot relief, kept),
+        `host_copy_ok` (safety-net spill, the new sole path) all stay live.
+        27b test_engine_prefix_real re-pointed: the source-pressure test now
+        accepts whole-unit Evict (evicted counter) as the relief mechanism
+        alongside demote; builds clean, needs a GPU-exclusive run to verify
+        (second 16GB model load would OOM alongside prod — run in a
+        prod-stopped window). Next: e2e full suite + phase 13 with the
+        kill-switch OFF, then ON as control; soak both; commit when directed.
 - [x] **P2.5 — Slice 4: unit LRU/retention + per-session guarantee.** One LRU
       over the shared budget, evicting whole units cost-aware smallest-first
       (kills the 19s class: state can no longer outlive its KV's retention
@@ -1073,6 +1088,23 @@ unit model; building the unit first makes this cheaper.
       silent; the sentinel only arms on `r=0 p=0 d=0 ∧ w/m≥1`, so a
       frozen-prefilling or silent wedge never fires (zero sentinel entries
       12:20–12:33). Folds into P1.5(d) Increment 2's sentinel update.
+      (b2) **2026-09-17 21:10 Class-C false positive (sentinel v3.1, fixed +
+      deployed to the live service):** a 360k-token prefill (this session's
+      own context) armed C at 153s and restarted a healthy prod. Mechanism:
+      Class C's progress clock is the /stats counter sum, but the /stats poll
+      (curl --max-time 5) fails during long engine steps — the HTTP pool
+      (worker_count = max_concurrency + max_pending + 1, one shared
+      ThreadPool, NO reserved slot for /stats) is saturated by streaming
+      handlers that span the whole prefill — and the journal fallback (no
+      counters by design) cannot advance the clock. The journal's 5s reporter
+      (own thread) kept sampling the same counters and logged a healthy
+      ~1000 tok/s throughout, proving the engine was computing. Fix
+      (wedge-sentinel.sh v3.1): a fresh journal throughput line with non-zero
+      prefill/decode tok/s is now ALSO progress evidence (a dead engine goes
+      silent or logs 0.0 — it cannot mask a wedge). Follow-up (next deploy
+      window): give /stats + /health a dedicated single-thread server/port
+      (a true reserved slot) so the :8090 dashboard stops suffering the same
+      false outages.
       **New findings, 2026-09-17 14:2x (e2e window, investigated 14:5x):**
       (c) **5 consecutive e2e-server crashes** (14:24/14:30/14:36/14:42/
       14:48, each ~107s after startup, identical `cudaEventElapsedTime →
