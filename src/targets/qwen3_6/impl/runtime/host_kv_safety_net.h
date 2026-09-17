@@ -745,11 +745,35 @@ public:
                          *victim, unit_context_pages(entries_[*victim]),
                          entry_state_bytes(entries_[*victim]),
                          state_retained_bytes_, shared_occupied_bytes(), state_budget_bytes_);
-            evictions_.fetch_add(1, std::memory_order_relaxed);
-            state_retained_bytes_ -= entry_state_bytes(entries_[*victim]);
-            entries_.erase(entries_.begin() + static_cast<std::ptrdiff_t>(*victim));
+            remove(*victim);
         }
         return true;
+    }
+
+    // P2.5 make-room: the shared HostStatePool can be exhausted by SLOT COUNT
+    // even when the byte budget has headroom (the pool is shared with the
+    // store's demoted replicas). When a new capture cannot get a slot, evict
+    // whole units under the same three-tier policy (dead-largest,
+    // live-smallest, active-session-last) until `needed` slots are free.
+    // Pinned entries (in-flight restores) are never evicted. Bounded per
+    // call so one capture cannot drain the net. Returns the slots freed.
+    [[nodiscard]] std::uint32_t make_room_for_state_slots(std::uint32_t needed) noexcept {
+        std::uint32_t freed = 0;
+        constexpr std::uint32_t kMaxEvictionsPerCall = 4;
+        for (std::uint32_t i = 0; i < kMaxEvictionsPerCall && freed < needed; ++i) {
+            const std::optional<std::size_t> victim = select_victim(/*allow_pinned=*/false);
+            if (!victim) { break; }
+            const HostKVSafetyNetEntry& entry = entries_[*victim];
+            const std::uint32_t entry_slots =
+                (entry.state_slot ? 1U : 0U) + (entry.checkpoint_state_slot ? 1U : 0U);
+            std::fprintf(stderr,
+                         "[host-state-pool] make-room: evict=%zu ctx_pages=%zu state_slots=%u "
+                         "(dead-largest, live-smallest, active-session-last)\n",
+                         *victim, unit_context_pages(entry), entry_slots);
+            remove(*victim);
+            freed += entry_slots;
+        }
+        return freed;
     }
 
     // P2.4 Increment 1 (spill-before-loss): is a unit with this identity still

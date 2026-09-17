@@ -6023,6 +6023,16 @@ void ProgramImplCore::prepare_pressure_work(MaterializationTransaction::Pressure
             std::optional<StateImageTransfer> transfer =
                 state_store->begin_device_to_host(*source, device.transfer_stream);
             if (!transfer) {
+                // P2.5 make-room: the pool may be full of retained net units
+                // (the store's own fallback only frees dual-resident
+                // replicas). Evict the coldest retained unit — whole
+                // {KV + state} unit, three-tier policy — and retry once.
+                host_kv_safety_net.make_room_for_state_slots(1);
+                std::optional<StateImageTransfer> retry =
+                    state_store->begin_device_to_host(*source, device.transfer_stream);
+                if (retry) { transfer.emplace(std::move(*retry)); }
+            }
+            if (!transfer) {
                 // Controlled failure: the pool state changed after planning
                 // (no free slot and no dual-resident replica to free). The
                 // outer catch converts this into a graceful abort-to-root-
@@ -6605,6 +6615,14 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index,
                     std::optional<qwen3_6::HostStateSlotHandle> new_slot =
                         host_state_images ? host_state_images->allocate() : std::nullopt;
                     if (!new_slot) {
+                        // P2.5 make-room: the pool is exhausted by slot count
+                        // (shared with the store's demoted replicas). Evict
+                        // the coldest retained unit (whole {KV + state} unit,
+                        // three-tier policy) and retry once.
+                        host_kv_safety_net.make_room_for_state_slots(1);
+                        new_slot = host_state_images ? host_state_images->allocate() : std::nullopt;
+                    }
+                    if (!new_slot) {
                         std::fprintf(stderr,
                                      "[safety-spill] state slot unavailable: index=%u — host "
                                      "state pool full, retaining nothing\n",
@@ -6679,6 +6697,12 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index,
                     }
                     std::optional<qwen3_6::HostStateSlotHandle> new_slot =
                         host_state_images ? host_state_images->allocate() : std::nullopt;
+                    if (!new_slot) {
+                        // P2.5 make-room: the pool is exhausted by slot count;
+                        // evict the coldest retained unit and retry once.
+                        host_kv_safety_net.make_room_for_state_slots(1);
+                        new_slot = host_state_images ? host_state_images->allocate() : std::nullopt;
+                    }
                     if (!new_slot) {
                         std::fprintf(stderr,
                                      "[safety-spill] ckpt state slot unavailable: index=%u — "

@@ -432,6 +432,69 @@ void test_state_slot_lifecycle() {
     (void)taken;
 }
 
+// P2.5 make-room: the shared HostStatePool can be exhausted by slot count
+// even with byte-budget headroom (it is shared with the store's demoted
+// replicas). When a new capture cannot get a slot, the net must free slots by
+// evicting its own units under the same three-tier policy — dead weight
+// first, never a pinned (in-flight restore) entry.
+void test_make_room_for_state_slots() {
+    HostKVSafetyNet net;
+    std::uint32_t released = 0;
+    net.set_state_slot_releaser([&released](const HostKVSafetyNetEntry& entry) {
+        if (entry.state_slot) { ++released; }
+        if (entry.checkpoint_state_slot) { ++released; }
+    });
+    net.set_dead_ttl(std::chrono::minutes(15));
+    const auto now = std::chrono::steady_clock::now();
+
+    // Dead giant: matched an hour ago (beyond the 15 min TTL).
+    auto dead = make_entry(40000, 0, 1024);
+    dead.ever_matched = true;
+    dead.last_matched = now - std::chrono::hours(1);
+    net.add(std::move(dead));
+    // Live small: matched just now.
+    auto live = make_entry(5000, 1000000, 1024);
+    live.ever_matched = true;
+    live.last_matched = now;
+    net.add(std::move(live));
+    check(net.state_slots_held() == 2, "two endpoint slots held");
+
+    // Pool exhausted by slot count: make-room must drop the dead giant
+    // (zero re-prefill cost), not the live unit.
+    const std::uint32_t freed = net.make_room_for_state_slots(1);
+    check(freed == 1, "make-room freed one slot");
+    check(released == 1, "evicted unit's slot returned to the pool");
+    check(net.size() == 1, "one unit evicted");
+    check(net.state_slots_held() == 1, "only the live unit's slot remains");
+    check(net.at(0).ledger[0] == 1000000, "live unit survived make-room");
+
+    // Pinned entries (in-flight restores) are never make-room victims.
+    const std::uint64_t id = net.pin(0);
+    check(net.make_room_for_state_slots(1) == 0, "pinned entry is not a make-room victim");
+    check(net.size() == 1, "pinned entry survived");
+    net.unpin(id);
+}
+
+// Regression (2026-09-17): byte-budget eviction used to erase the entry
+// without returning its state slots to the pool, leaking slots until the
+// shared pool saturated (112/112 in prod). Every eviction path must release.
+void test_byte_budget_eviction_releases_slots() {
+    HostKVSafetyNet net;
+    std::uint32_t released = 0;
+    net.set_state_slot_releaser([&released](const HostKVSafetyNetEntry& entry) {
+        if (entry.state_slot) { ++released; }
+        if (entry.checkpoint_state_slot) { ++released; }
+    });
+    const std::size_t sb = 1024;
+    net.set_state_budget_bytes(1 * sb);  // exactly one state image fits
+
+    net.add(make_entry(5000, 0, sb));
+    check(released == 0, "no eviction yet");
+    net.add(make_entry(6000, 1000000, sb));  // over budget -> evict one
+    check(released == 1, "byte-budget eviction released the evicted unit's slot");
+    check(net.size() == 1, "one entry retained under the budget");
+}
+
 }  // namespace
 
 int main() {
@@ -441,6 +504,8 @@ int main() {
     test_session_protection();
     test_retains();
     test_state_slot_lifecycle();
+    test_make_room_for_state_slots();
+    test_byte_budget_eviction_releases_slots();
     if (failures == 0) {
         std::fprintf(stderr, "PASS: host_kv_safety_net lifecycle\n");
         return 0;
