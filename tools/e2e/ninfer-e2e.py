@@ -905,6 +905,8 @@ def main():
     p.add_argument("--model", default="qwen3.8-27b")
     p.add_argument("--max-output-tokens", type=int, default=48)
     p.add_argument("--serve-log", default="/home/zenz/ninfer-serve.log")
+    p.add_argument("--request-log", default="/home/zenz/ninfer-requests.jsonl",
+                   help="JSONL request log with per-request materialization diagnostics")
     p.add_argument("--timeout", type=int, default=120)
     p.add_argument("--start-phase", type=int, default=1,
                    help="run phases N..13 (for split runs across separate e2e server windows)")
@@ -928,9 +930,9 @@ def main():
         print(f"ERROR: cannot read server config from /stats (host_kv={host_kv}, kv_pages={kv_pages}). "
               f"Is the server running and responsive?")
         return 1
-    if host_kv > 8 * 1024 * 1024 * 1024:
+    if host_kv > 16 * 1024 * 1024 * 1024:
         print(f"ERROR: host-kv capacity is {host_kv / 1024**3:.1f} GiB — this looks like the "
-              f"production server. The e2e tests require the test server (4 GiB host-kv, "
+              f"production server. The e2e tests require the test server (12 GiB host-kv, "
               f"32k context, 64k KV capacity). Start it with: tools/e2e/ninfer-start-test.sh")
         return 1
     if kv_pages > 4096:
@@ -939,6 +941,11 @@ def main():
               f"Start it with: tools/e2e/ninfer-start-test.sh")
         return 1
     print(f"Server config OK: host-kv={host_kv / 1024**3:.1f} GiB, KV pages={kv_pages}")
+
+    # Prod is stopped during the swap, so every request-log line written from
+    # here on belongs to the e2e server. Mark the offset so the planner-latency
+    # check (below) reads only this run's materialization diagnostics.
+    args._request_log_start = count_log_lines(args.request_log)
 
     all_verdicts = []
     phases = (phase_1, phase_2, phase_3, phase_4, phase_5, phase_6, phase_7,
@@ -953,6 +960,16 @@ def main():
         all_verdicts.extend(result)
         for pn, v in result:
             print(f"  [{pn}] {v}")
+
+    # Planner-latency gate: the admission planner must converge fast. The
+    # 2026-09-17 fix seeds with a feasible cover and caps the beam search at
+    # 30ms, so searches stop at model_optimal/queue_exhausted/
+    # value_of_next_expansion/time_budget instead of enumerating to the 4096-
+    # target budget (expansion_capacity/target_budget).
+    planner_verdicts = phase_planner_latency(args)
+    all_verdicts.extend(planner_verdicts)
+    for pn, v in planner_verdicts:
+        print(f"  [{pn}] {v}")
     return print_summary(all_verdicts)
 
 
@@ -1519,6 +1536,63 @@ def phase_13(args):
         all_verdicts.append(("state-saturation", f"PASS: {log13['spill_before_loss']} spill-before-loss backstops fired (unit retained in net before its state lost its last copy)"))
     if log13["state_relinquish"] > 0:
         all_verdicts.append(("state-saturation", f"PASS: {log13['state_relinquish']} state images relinquished to the net (move-not-copy; the net is the unit's host home)"))
+    return all_verdicts
+
+
+def phase_planner_latency(args):
+    """Admission-planner latency gate.
+
+    The pressure planner is a beam search over parked catalog units. Before
+    the 2026-09-17 convergence fix it enumerated to the 4096-target budget
+    (stop_reason expansion_capacity/target_budget, ~3.2s per search) whenever
+    the evict-all seed incumbent was hard to beat. The fix seeds with a
+    feasible cover (guided closure / greedy eviction cover), stops expanding
+    covered targets, prunes infeasible branches, and caps the search at
+    30ms (time_budget). Assert the search no longer enumerates and stays fast.
+    """
+    all_verdicts = []
+    start = getattr(args, "_request_log_start", 0)
+    rows = []
+    try:
+        with open(args.request_log, "r", errors="replace") as f:
+            for i, line in enumerate(f):
+                if i < start:
+                    continue
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                m = d.get("materialization")
+                if m:
+                    rows.append(m)
+    except OSError:
+        all_verdicts.append(("planner-latency", "WARN: request log unreadable — planner check skipped"))
+        return all_verdicts
+    if not rows:
+        all_verdicts.append(("planner-latency", "WARN: no materialization diagnostics in window — planner check skipped"))
+        return all_verdicts
+
+    search_ns = sorted(m.get("search_elapsed_ns", 0) for m in rows)
+    p95 = search_ns[min(len(search_ns) - 1, int(len(search_ns) * 0.95))]
+    budget_stops = sum(1 for m in rows if m.get("stop_reason") in ("expansion_capacity", "target_budget"))
+    stops = {}
+    for m in rows:
+        s = m.get("stop_reason", "?")
+        stops[s] = stops.get(s, 0) + 1
+    detail = (f"n={len(rows)} p95_search={p95 / 1e6:.1f}ms max_search={search_ns[-1] / 1e6:.1f}ms "
+              f"budget_stops={budget_stops} stops={stops}")
+    if budget_stops > 0:
+        all_verdicts.append(("planner-latency",
+                             f"FAIL: {budget_stops} searches enumerated to the target budget "
+                             f"(expansion_capacity/target_budget) — convergence regression. {detail}"))
+    elif p95 > 50 * 1000 * 1000:
+        all_verdicts.append(("planner-latency",
+                             f"FAIL: p95 search {p95 / 1e6:.1f}ms exceeds the 50ms budget. {detail}"))
+    else:
+        all_verdicts.append(("planner-latency", f"PASS: planner converged — {detail}"))
     return all_verdicts
 
 
