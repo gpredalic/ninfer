@@ -1146,8 +1146,37 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::assess(qwen3_6::PressureTarg
         ++projection_work;
     }
 
-    bool recovery_projection_valid = true;
+    // Fast infeasibility test (Phase B): the sum of the selected decisions'
+    // effects over-approximates the composed effect — relief aliased between
+    // decisions is credited once in composition, and composition can only
+    // add beyond the decisions' claimed additions — so the guided residual
+    // below is a lower bound on the composed one.  If it is already positive
+    // in some dimension, the composed target is Infeasible too: skip the
+    // recovery projection, deep copy, and compose (the ~1ms hot path).
+    bool infeasible_by_sum = false;
     if (!identity_target) {
+        detail::PhysicalDelta summed{};
+        for (std::size_t index = 0; index < owners.size(); ++index) {
+            const std::uint16_t choice = node.owner_choices[index];
+            if (choice == 0) { continue; }
+            const PressureDecision& decision = options.owners[index].decisions[choice - 1U];
+            summed.removed = NINFER_QWEN36_RUNTIME_NS::planning_resource_sum(
+                summed.removed, decision.effect.removed);
+            summed.added = NINFER_QWEN36_RUNTIME_NS::planning_resource_sum(
+                summed.added, decision.effect.added);
+        }
+        detail::PhysicalResources residual =
+            program->guided_materialization_deficit(*candidate.impl_, summed);
+        residual.host.kv_bytes =
+            std::max(residual.host.kv_bytes, candidate.impl_->blocked_host_allocation_bytes);
+        if (residual != detail::PhysicalResources{}) {
+            infeasible_by_sum = true;
+            node.assessed_residual = std::move(residual);
+        }
+    }
+
+    bool recovery_projection_valid = true;
+    if (!identity_target && !infeasible_by_sum) {
         recovery_projection_valid = program->pressure_checkpoint_recovery_impacts(
             *candidate.impl_, recovery_private_owners, recovery_private_decisions,
             recovery_private_ordinals, recovery_shared_owners, recovery_shared_decisions,
@@ -1162,6 +1191,8 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::assess(qwen3_6::PressureTarg
         candidate.impl_.get();
     if (identity_target) {
         status = candidate.impl_->identity_assessment.physical_status;
+    } else if (infeasible_by_sum) {
+        status = runtime::MaterializationPhysicalStatus::Infeasible;
     } else if (recovery_projection_valid) {
         AdmissionCandidate copy(
             std::make_unique<qwen3_6::detail::AdmissionCandidateImpl<NINFER_QWEN36_VARIANT>>(
@@ -1182,16 +1213,17 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::assess(qwen3_6::PressureTarg
         node.assessed_residual                = program->materialization_deficit(*projected);
         node.assessed_residual->host.kv_bytes = std::max(node.assessed_residual->host.kv_bytes,
                                                          projected->blocked_host_allocation_bytes);
-    } else {
+    } else if (!infeasible_by_sum) {
         node.assessed_residual.reset();
     }
     const runtime::MaterializationMachineSummary machine =
-        identity_target
+        (identity_target || infeasible_by_sum)
             ? candidate.impl_->identity_assessment.machine
             : NINFER_QWEN36_RUNTIME_NS::materialization_machine_summary(
                   *projected, selected_private_decisions, selected_shared_decisions, *machine_cost);
 
-    bool expandable = identity_target || (recovery_projection_valid && composed.has_value());
+    bool expandable = identity_target ||
+                      (infeasible_by_sum || (recovery_projection_valid && composed.has_value()));
     if (expandable) {
         // A target that already covers the deficit is a locally complete
         // solution: every further decision only adds cost (degradation,

@@ -270,13 +270,13 @@ public:
         }
 
         const Clock::time_point search_started = Clock::now();
-        // No time budget: the search terminates on its structural conditions
-        // (queue exhaustion, model-optimal, value-of-next-expansion, the
-        // 4096-target budget, expansion capacity). The old fixed 5 ms cap
-        // (min(5ms, incumbent/20)) did not grow with problem size, so under
-        // load 83-100% of searches exhausted it and sealed whatever
-        // incumbent happened to be seeded — the over-commit that produced
-        // bad_alloc. Planning elapsed time is still reported per request.
+        // Wall-clock backstop (Phase C): cap the search at kSearchBudgetNs.
+        // This is safe where the old fixed 5 ms cap (min(5ms, incumbent/20))
+        // was not: the seed is now a verified Feasible cover (guided closure
+        // or greedy eviction cover), so on budget exhaustion the incumbent
+        // is always a complete plan — only the search for a cheaper one is
+        // abandoned.  The old cap sealed weakly-seeded (evict-all)
+        // incumbents and caused the bad_alloc over-commit.
         std::uint64_t maximum_step_ns          = 0;
         std::uint32_t optional_targets         = 0;
         std::uint32_t guided_assessments       = 0;
@@ -539,6 +539,15 @@ public:
                 model_optimal = true;
                 break;
             }
+            if (elapsed_ns(search_started, Clock::now()) >= kSearchBudgetNs) {
+                // The incumbent is a verified Feasible cover (the seed), so
+                // sealing it is always a complete plan; only the search for
+                // a cheaper one is abandoned.
+                stop_reason      = MaterializationStopReason::TimeBudget;
+                model_optimal    = false;
+                budget_exhausted = true;
+                break;
+            }
             const std::uint64_t queue_bound   = queue_.empty()
                                                     ? std::numeric_limits<std::uint64_t>::max()
                                                     : queue_.front().lower_bound_ns;
@@ -628,6 +637,9 @@ private:
     static constexpr std::uint32_t kTargetBudget           = 4096;
     static constexpr std::uint32_t kGuidedBeamWidth        = 16;
     static constexpr std::uint32_t kGuidedAssessmentBudget = 32;
+    // Wall-clock cap on the beam search.  With a Feasible seed this only
+    // bounds the refinement, never the completeness of the sealed plan.
+    static constexpr std::uint64_t kSearchBudgetNs         = 30ULL * 1000U * 1000U;
 
     struct FoldedCost {
         std::uint64_t now_ns                    = 0;
