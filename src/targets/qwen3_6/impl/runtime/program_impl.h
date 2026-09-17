@@ -4837,26 +4837,34 @@ std::uint32_t ProgramImplCore::demote_checkpoints_to_make_room(std::uint32_t nee
 
 std::uint32_t
 ProgramImplCore::relieve_stalled_fit_gate(const MaterializationTransaction& transaction) noexcept {
+    return relieve_kv_fit(KvReliefSkip{
+        transaction.has_source ? std::optional<std::uint32_t>(transaction.source_index)
+                               : std::nullopt,
+        transaction.root_continuation_index,
+        transaction.has_shared_source
+            ? std::optional<std::uint32_t>(transaction.shared_source_index)
+            : std::nullopt});
+}
+
+std::uint32_t ProgramImplCore::relieve_kv_fit(const KvReliefSkip& skip) noexcept {
     // Safety: the context transaction is single — no other materialization can
     // be in flight — and decode does not release KV pages, so the only
     // continuations that are neither in use nor about to be used are the
-    // Catalogued ones that are not this transaction's source or destination
-    // and are not bound to a decode lane. Demote the one pinning the most
-    // UNIQUE device-resident pages: mapped pages overcount, because pages
-    // shared with the live shared prefix (or already host-resident) are not
-    // freed by a release — the 22:28 episode demoted 29k mapped pages and
-    // freed 77. The {KV + state} unit is preserved in the host safety net, so
-    // the session's next turn restores from host instead of re-prefilling.
+    // Catalogued ones that are not in the skip set (the caller's own
+    // source/root/shared source) and are not bound to a decode lane. Demote
+    // the one pinning the most UNIQUE device-resident pages: mapped pages
+    // overcount, because pages shared with the live shared prefix (or already
+    // host-resident) are not freed by a release — the 22:28 episode demoted
+    // 29k mapped pages and freed 77. The {KV + state} unit is preserved in
+    // the host safety net, so the session's next turn restores from host
+    // instead of re-prefilling.
     std::uint32_t victim              = continuation_capacity;  // sentinel: none
     std::uint32_t victim_pages        = 0;
     bool victim_is_shared_prefix      = false;
     for (std::uint32_t i = 0; i < continuation_capacity; ++i) {
         if (continuation_slots[i].role != ContinuationSlotRole::Catalogued) { continue; }
-        if (transaction.has_source && transaction.source_index == i) { continue; }
-        if (transaction.root_continuation_index &&
-            *transaction.root_continuation_index == i) {
-            continue;
-        }
+        if (skip.source && *skip.source == i) { continue; }
+        if (skip.root && *skip.root == i) { continue; }
         if (materialization_pins(i, continuation_slots[i].generation)) { continue; }
         bool lane_bound = false;
         for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
@@ -4890,9 +4898,7 @@ ProgramImplCore::relieve_stalled_fit_gate(const MaterializationTransaction& tran
             if (shared_prefix_slots[i].role != SharedPrefixSlotRole::Catalogued) { continue; }
             const SharedPrefixState& shared = shared_prefix_states[i];
             if (!shared.kv || shared.active_references != 0) { continue; }
-            if (transaction.has_shared_source && transaction.shared_source_index == i) {
-                continue;
-            }
+            if (skip.shared_source && *skip.shared_source == i) { continue; }
             const SequenceKVBundle& kv = *shared.kv;
             std::uint32_t unique = text_kv_addresses->resident_device_pages(kv.text);
             if (kv.backend && backend_kv_addresses) {
@@ -4928,6 +4934,147 @@ ProgramImplCore::relieve_stalled_fit_gate(const MaterializationTransaction& tran
                  "(%u unique resident pages) to the host safety net\n",
                  victim, victim_pages);
     return victim_pages;
+}
+
+qwen3_6::KvAdmissionFit
+ProgramImplCore::kv_admission_fit(const AdmissionCandidateImpl& candidate) const noexcept {
+    // Mirrors the prepare-time fit gate (text pool, then backend pool) against
+    // the candidate's reservation demand — the same two comparisons, read
+    // without reserving anything.
+    qwen3_6::KvAdmissionFit out;
+    out.need_text_pages    = candidate.demand.reservation_added.device.main_kv_pages;
+    out.need_backend_pages = candidate.demand.reservation_added.device.backend_kv_pages;
+    if (candidate.has_source) { out.source_index = candidate.source_index; }
+    if (candidate.has_shared_source) { out.shared_source_index = candidate.shared_source_index; }
+    if (text_kv_pages->physical_pool().available_pages() < out.need_text_pages) {
+        out.fits = false;
+    }
+    if (out.fits && out.need_backend_pages != 0 && backend_kv_pages != nullptr &&
+        backend_kv_pages->physical_pool().available_pages() < out.need_backend_pages) {
+        out.fits = false;
+    }
+    return out;
+}
+
+void ProgramImplCore::queue_kv_block(const qwen3_6::KvAdmissionFit& fit,
+                                     std::uint64_t request_id) noexcept {
+    QueuedKvBlock& block = queued_kv_block_;
+    const bool fresh = !block.active || block.request_id != request_id ||
+                       block.need_text != fit.need_text_pages ||
+                       block.need_backend != fit.need_backend_pages;
+    const auto now = Clock::now();
+    block.active       = true;
+    block.request_id   = request_id;
+    block.need_text    = fit.need_text_pages;
+    block.need_backend = fit.need_backend_pages;
+    block.skip_source  = fit.source_index;
+    block.skip_shared  = fit.shared_source_index;
+    if (!fresh) { return; }  // same head still blocked — keep the clocks
+    block.blocked_since = now;
+    block.flat_since    = now;
+    block.last_free_text = text_kv_pages->physical_pool().available_pages();
+    block.last_free_backend =
+        backend_kv_pages ? backend_kv_pages->physical_pool().available_pages() : 0;
+    block.last_logged             = std::chrono::steady_clock::time_point{};
+    block.last_logged_free_text   = block.last_free_text;
+    block.last_logged_free_backend = block.last_free_backend;
+    std::fprintf(stderr,
+                 "[admission] KV occupancy block: request %llu needs %u text/%u backend "
+                 "pages, free %u/%u — kept in the visible queue (relief-while-queued; "
+                 "abort if unfitted in 120s)\n",
+                 (unsigned long long)request_id, fit.need_text_pages, fit.need_backend_pages,
+                 block.last_free_text, block.last_free_backend);
+}
+
+void ProgramImplCore::clear_queued_kv_block() noexcept { queued_kv_block_.active = false; }
+
+bool ProgramImplCore::has_queued_kv_block() const noexcept {
+    return queued_kv_block_.active;
+}
+
+std::uint64_t ProgramImplCore::queued_kv_block_request_id() const noexcept {
+    return queued_kv_block_.request_id;
+}
+
+qwen3_6::QueuedKvBlockProgress
+ProgramImplCore::progress_queued_kv_block(bool relief_suppressed) noexcept {
+    QueuedKvBlock& block = queued_kv_block_;
+    if (!block.active) { return qwen3_6::QueuedKvBlockProgress::Inactive; }
+    const auto now = Clock::now();
+    if (now - block.blocked_since >= kKVDeferDeadline) {
+        // Same bound as the prepare-time fit-gate defer: a demand that cannot
+        // fit in 120s aborts instead of wedging the queue (the unbounded-defer
+        // livelock class). The engine aborts the request and re-arms admission
+        // for the next head.
+        std::fprintf(stderr,
+                     "[materialize] queued KV block deadline exceeded: request %llu needed "
+                     "%u text/%u backend pages (free %u/%u) for %.0fs — aborting\n",
+                     (unsigned long long)block.request_id, block.need_text, block.need_backend,
+                     text_kv_pages->physical_pool().available_pages(),
+                     backend_kv_pages ? backend_kv_pages->physical_pool().available_pages() : 0,
+                     std::chrono::duration<double>(now - block.blocked_since).count());
+        block.active = false;
+        return qwen3_6::QueuedKvBlockProgress::Expired;
+    }
+    const std::uint32_t free_text = text_kv_pages->physical_pool().available_pages();
+    const std::uint32_t free_backend =
+        backend_kv_pages ? backend_kv_pages->physical_pool().available_pages() : 0;
+    const bool fits =
+        free_text >= block.need_text &&
+        (block.need_backend == 0 || free_backend >= block.need_backend);
+    if (fits || free_text > block.last_free_text || free_backend > block.last_free_backend) {
+        // The demand now fits (the engine admits it on the next re-arm) or
+        // pages are growing (something is draining) — restart the stall clock.
+        block.flat_since = now;
+    }
+    block.last_free_text    = free_text;
+    block.last_free_backend = free_backend;
+    if (!relief_suppressed && !fits && now - block.flat_since >= kKVReliefDelay) {
+        // Nothing has drained for kKVReliefDelay: demote idle units toward the
+        // blocked demand (batch of 3, same as the in-flight fit-gate relief),
+        // skipping the head's own sources.
+        block.flat_since = now;
+        const KvReliefSkip skip{block.skip_source, std::nullopt, block.skip_shared};
+        std::uint32_t freed = 0;
+        for (int i = 0; i < 3; ++i) {
+            const std::uint32_t victim_pages = relieve_kv_fit(skip);
+            if (victim_pages == 0) { break; }
+            freed += victim_pages;
+        }
+        if (freed > 0) {
+            std::fprintf(stderr,
+                         "[relief-kv] queued demand (request %llu) — freed %u pages; "
+                         "need %u text/%u backend, free %u/%u\n",
+                         (unsigned long long)block.request_id, freed, block.need_text,
+                         block.need_backend, free_text, free_backend);
+            return qwen3_6::QueuedKvBlockProgress::ReliefFired;
+        }
+    }
+    // Rate-limited heartbeat (a 1ms-tick engine otherwise turns one blocked
+    // head into ~1000 log lines/second — same rationale as the defer log).
+    const bool free_progress =
+        free_text != block.last_logged_free_text ||
+        free_backend != block.last_logged_free_backend;
+    const bool heartbeat =
+        block.last_logged == std::chrono::steady_clock::time_point{} ||
+        now - block.last_logged >= std::chrono::seconds(5);
+    if (free_progress || heartbeat) {
+        const auto remaining = std::chrono::duration_cast<std::chrono::seconds>(
+            std::max<std::chrono::steady_clock::duration>(
+                std::chrono::steady_clock::duration::zero(),
+                block.blocked_since + kKVDeferDeadline - now));
+        std::fprintf(stderr,
+                     "[admission] queued KV block: request %llu needs %u text/%u backend "
+                     "pages, free %u/%u (%.1fs queued; abort if unfitted in %llds)\n",
+                     (unsigned long long)block.request_id, block.need_text, block.need_backend,
+                     free_text, free_backend,
+                     std::chrono::duration<double>(now - block.blocked_since).count(),
+                     static_cast<long long>(remaining.count()));
+        block.last_logged_free_text    = free_text;
+        block.last_logged_free_backend = free_backend;
+        block.last_logged              = now;
+    }
+    return qwen3_6::QueuedKvBlockProgress::InProgress;
 }
 
 bool ProgramImplCore::prepare_materialization(MaterializationTransaction& transaction) {

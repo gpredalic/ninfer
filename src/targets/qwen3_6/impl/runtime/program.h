@@ -723,6 +723,17 @@ public:
 
     [[nodiscard]] qwen3_6::PhysicalUsageSnapshot physical_usage() const noexcept;
 
+    // P1.5(d) Increment 2: admission-side occupancy probe + queued-KV block
+    // (see the QueuedKvBlock state below).
+    [[nodiscard]] qwen3_6::KvAdmissionFit
+    kv_admission_fit(const AdmissionCandidateImpl& candidate) const noexcept;
+    void queue_kv_block(const qwen3_6::KvAdmissionFit& fit, std::uint64_t request_id) noexcept;
+    void clear_queued_kv_block() noexcept;
+    [[nodiscard]] bool has_queued_kv_block() const noexcept;
+    [[nodiscard]] std::uint64_t queued_kv_block_request_id() const noexcept;
+    [[nodiscard]] qwen3_6::QueuedKvBlockProgress
+    progress_queued_kv_block(bool relief_suppressed) noexcept;
+
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
 
     void reset_memory_peaks() noexcept;
@@ -1059,6 +1070,43 @@ private:
     // a stalled fit gate. Returns the text pages freed (0 if no idle victim).
     [[nodiscard]] std::uint32_t relieve_stalled_fit_gate(
         const MaterializationTransaction& transaction) noexcept;
+
+    // P1.5(d) Increment 2: relief victim-skip set. The in-flight-transaction
+    // path skips its own source/root/shared source; the queued path skips the
+    // blocked head's sources (evicting what the queued request needs would
+    // loop on stale admission candidates).
+    struct KvReliefSkip {
+        std::optional<std::uint32_t> source;
+        std::optional<std::uint32_t> root;
+        std::optional<std::uint32_t> shared_source;
+    };
+    [[nodiscard]] std::uint32_t relieve_kv_fit(const KvReliefSkip& skip) noexcept;
+
+    // P1.5(d) Increment 2: queued-KV block — a FIFO head whose device-KV
+    // demand cannot fit the pools at admission time. The engine records it
+    // instead of admitting the request into a silent 120s fit-gate defer;
+    // the request stays in the visible queue (position/wait in /stats) while
+    // progress_queued_kv_block() runs the 15s stall relief toward its demand
+    // and enforces the 120s deadline (Expired => the engine aborts it — the
+    // same bound as the prepare-time fit-gate defer).
+    struct QueuedKvBlock {
+        bool active = false;
+        std::uint64_t request_id = 0;
+        std::uint32_t need_text    = 0;
+        std::uint32_t need_backend = 0;
+        std::optional<std::uint32_t> skip_source;
+        std::optional<std::uint32_t> skip_shared;
+        std::chrono::steady_clock::time_point blocked_since{};
+        std::chrono::steady_clock::time_point flat_since{};
+        std::uint32_t last_free_text    = 0;
+        std::uint32_t last_free_backend = 0;
+        // Log rate-limit (a 1ms-tick engine otherwise turns one blocked head
+        // into ~1000 log lines/second — same rationale as kv_defer_last_*).
+        std::uint32_t last_logged_free_text    = 0;
+        std::uint32_t last_logged_free_backend = 0;
+        std::chrono::steady_clock::time_point last_logged{};
+    };
+    QueuedKvBlock queued_kv_block_;
 
     std::uint64_t next_materialization_id_ = 1;
     CudaCompletionEvent context_source_ready_;

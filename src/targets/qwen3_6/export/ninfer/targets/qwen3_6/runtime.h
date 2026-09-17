@@ -684,6 +684,30 @@ struct ReleaseResult {
     runtime::ConsumeStatus status = runtime::ConsumeStatus::InvariantMismatch;
 };
 
+// P1.5(d) Increment 2: result of the admission-side KV occupancy probe
+// (Program::kv_admission_fit). `fits` answers the prepare-time fit gate's
+// question without reserving; the demand and source indices let the caller
+// record a queued-KV block (relief-while-queued + visible queue) instead of
+// admitting a request that would silently defer for up to 120s.
+struct KvAdmissionFit {
+    bool fits = true;
+    std::uint32_t need_text_pages    = 0;
+    std::uint32_t need_backend_pages = 0;
+    // The plan's sources, in program slot space — relief-while-queued must
+    // skip them (evicting what the queued request needs would loop on stale
+    // admission candidates).
+    std::optional<std::uint32_t> source_index;
+    std::optional<std::uint32_t> shared_source_index;
+};
+
+// P1.5(d) Increment 2: outcome of a queued-KV-block progress tick.
+enum class QueuedKvBlockProgress : std::uint8_t {
+    Inactive,    // no block recorded
+    InProgress,  // block active, nothing to do this tick
+    ReliefFired,  // relief demoted a victim (pages freed) — re-check admission
+    Expired,     // 120s deadline — abort the blocked request
+};
+
 template <class Variant>
 class Program {
 public:
@@ -781,6 +805,21 @@ public:
     progress_context_transaction(runtime::CancellationFlagView cancellation);
     void finalize_context_transaction() noexcept;
     [[nodiscard]] bool has_context_transaction() const noexcept;
+    // P1.5(d) Increment 2: admission-side occupancy probe + queued-KV block.
+    // The engine probes the FIFO head's plan before granting: a "no" keeps
+    // the request in the visible queue (position/wait in /stats) and records
+    // the block. While the block is active, progress_queued_kv_block() runs
+    // the 15s stall relief toward the blocked demand (skipping the head's own
+    // sources) and enforces the 120s deadline — the same bound as the
+    // prepare-time fit-gate defer, so a demand that never fits aborts
+    // instead of wedging the queue.
+    [[nodiscard]] KvAdmissionFit kv_admission_fit(const ResourcePlan<Variant>& plan) const noexcept;
+    void queue_kv_block(const KvAdmissionFit& fit, std::uint64_t request_id) noexcept;
+    void clear_queued_kv_block() noexcept;
+    [[nodiscard]] bool has_queued_kv_block() const noexcept;
+    [[nodiscard]] std::uint64_t queued_kv_block_request_id() const noexcept;
+    [[nodiscard]] QueuedKvBlockProgress
+    progress_queued_kv_block(bool relief_suppressed) noexcept;
     [[nodiscard]] PrefillProgress<Variant>
     advance_prefill(SequenceHandle<Variant> sequence,
                     runtime::ExecutionTiming* failed_timing = nullptr);

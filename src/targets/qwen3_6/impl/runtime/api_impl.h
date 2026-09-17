@@ -459,6 +459,41 @@ bool Program<Variant>::has_context_transaction() const noexcept {
 }
 
 template <>
+qwen3_6::KvAdmissionFit
+Program<Variant>::kv_admission_fit(const ResourcePlan<Variant>& plan) const noexcept {
+    if (plan.revision_ == 0 || plan.revision_ != impl_->resource_revision() ||
+        plan.admission_.impl_ == nullptr) {
+        return {};  // stale/empty plan — treat as "no probe" (the engine re-inspects)
+    }
+    return impl_->kv_admission_fit(*plan.admission_.impl_);
+}
+
+template <>
+void Program<Variant>::queue_kv_block(const qwen3_6::KvAdmissionFit& fit,
+                                      std::uint64_t request_id) noexcept {
+    impl_->queue_kv_block(fit, request_id);
+}
+
+template <>
+void Program<Variant>::clear_queued_kv_block() noexcept { impl_->clear_queued_kv_block(); }
+
+template <>
+bool Program<Variant>::has_queued_kv_block() const noexcept {
+    return impl_->has_queued_kv_block();
+}
+
+template <>
+std::uint64_t Program<Variant>::queued_kv_block_request_id() const noexcept {
+    return impl_->queued_kv_block_request_id();
+}
+
+template <>
+qwen3_6::QueuedKvBlockProgress
+Program<Variant>::progress_queued_kv_block(bool relief_suppressed) noexcept {
+    return impl_->progress_queued_kv_block(relief_suppressed);
+}
+
+template <>
 PrefillProgress<Variant>
 Program<Variant>::advance_prefill(SequenceHandle<Variant> sequence,
                                   runtime::ExecutionTiming* failed_timing) {

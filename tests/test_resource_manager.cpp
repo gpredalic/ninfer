@@ -346,6 +346,22 @@ struct FakePersistentBackfillProof {
     [[nodiscard]] std::uint64_t resource_revision() const noexcept { return revision; }
 };
 
+// P1.5(d) Increment 2 fakes: the admission-side KV occupancy probe.
+struct FakeKvAdmissionFit {
+    bool fits = true;
+    std::uint32_t need_text_pages    = 0;
+    std::uint32_t need_backend_pages = 0;
+    std::optional<std::uint32_t> source_index;
+    std::optional<std::uint32_t> shared_source_index;
+};
+
+enum class FakeQueuedKvBlockProgress : std::uint8_t {
+    Inactive,
+    InProgress,
+    ReliefFired,
+    Expired,
+};
+
 struct FakeStartResult {
     FakeSequenceHandle sequence;
 };
@@ -1019,6 +1035,12 @@ public:
 
     [[nodiscard]] FakePhysicalUsage physical_usage() const noexcept { return usage; }
 
+    // P1.5(d) Increment 2: the admission-side occupancy probe. The fake
+    // reports a fit by default; tests override the answer.
+    [[nodiscard]] FakeKvAdmissionFit kv_admission_fit(const FakeResourcePlan&) const noexcept {
+        return kv_admission_override.value_or(FakeKvAdmissionFit{});
+    }
+
     void invalidate_resources() noexcept { advance_revision(); }
 
     std::size_t required_pressure_actions       = 0;
@@ -1044,6 +1066,7 @@ public:
     FakeCaptureAssessment capture_assessment;
     FakeContinuationSummary capture_summary;
     FakePhysicalUsage usage;
+    std::optional<FakeKvAdmissionFit> kv_admission_override;
 
     std::uint64_t admission_inspections         = 0;
     std::uint64_t pressure_planning_sessions    = 0;
@@ -1657,6 +1680,8 @@ FakeProgram::begin_pressure_planning(const ninfer::runtime::ContextMachineCostMo
 
 struct FakePackage {
     using Program                    = FakeProgram;
+    using KvAdmissionFit             = FakeKvAdmissionFit;
+    using QueuedKvBlockProgress      = FakeQueuedKvBlockProgress;
     using PreparedPrompt             = FakePreparedPrompt;
     using RequestBasePlan            = FakeRequestBasePlan;
     using AdmissionCandidate         = FakeAdmissionCandidate;
@@ -2623,6 +2648,39 @@ void test_greedy_seed_covers_pressure_with_minimal_eviction() {
     require(eviction_count == 1, "seed evicted more owners than the cover requires");
 }
 
+void test_probe_kv_fit_delegates_to_program() {
+    // P1.5(d) Increment 2: the admission-side occupancy probe is a pure
+    // delegation to the program — the engine keeps an unfitted head in the
+    // visible queue (position/wait in /stats) instead of admitting it into a
+    // silent 120s fit-gate defer.
+    FakeManager manager = make_manager(1, 2);
+    FakeProgram program;
+    const ActiveRequest active = start_active(manager, program, 90, make_base(90), 1);
+    (void)finish_active(manager, program, active);
+    auto inspection = manager.inspect(program, FakePreparedPrompt{91}, make_base(91), 2);
+    require(inspection.choice.has_value(), "probe test has no inspection choice");
+
+    // No override: the fake program reports a fit (default).
+    const auto baseline = manager.probe_kv_fit(program, *inspection.choice);
+    require(baseline.fits, "default probe must report a fit");
+
+    // Overridden: the unfitted answer, demand, and skip indices pass through
+    // the RM untouched.
+    const FakeKvAdmissionFit unfitted{
+        /*fits*/ false,
+        /*need_text_pages*/ 4096,
+        /*need_backend_pages*/ 0,
+        /*source_index*/ std::optional<std::uint32_t>{3},
+        /*shared_source_index*/ std::nullopt};
+    program.kv_admission_override = unfitted;
+    const auto probe = manager.probe_kv_fit(program, *inspection.choice);
+    require(!probe.fits, "probe must surface the program's unfitted answer");
+    require(probe.need_text_pages == 4096, "probe must carry the text demand");
+    require(probe.source_index == std::optional<std::uint32_t>{3},
+            "probe must carry the source skip index");
+    require(!probe.shared_source_index.has_value(), "unexpected shared source");
+}
+
 void test_in_progress_adoption_and_private_capture() {
     FakeManager manager = make_manager(1, 2);
     FakeProgram program;
@@ -2982,6 +3040,7 @@ int main() {
              test_covered_pressure_target_is_not_expanded);
     run_test("greedy seed minimal eviction cover",
              test_greedy_seed_covers_pressure_with_minimal_eviction);
+    run_test("probe kv fit delegates to program", test_probe_kv_fit_delegates_to_program);
     run_test("in-progress and capture", test_in_progress_adoption_and_private_capture);
     run_test("projected shared marginal value",
              test_projected_nested_shared_candidates_use_marginal_value);

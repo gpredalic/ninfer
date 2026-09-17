@@ -62,6 +62,7 @@ template <class Package>
 class ResourceManager {
 public:
     using Program                 = typename Package::Program;
+    using KvAdmissionFit          = typename Package::KvAdmissionFit;
     using PreparedPrompt          = typename Package::PreparedPrompt;
     using RequestBasePlan         = typename Package::RequestBasePlan;
     using AdmissionCandidate      = typename Package::AdmissionCandidate;
@@ -517,6 +518,16 @@ public:
         }
         return program.prove_persistent_backfill(blocked_head, *candidate.plan_,
                                                  persistent_borrowers);
+    }
+
+    // P1.5(d) Increment 2: admission-side occupancy probe — answers the
+    // prepare-time fit gate's question for the choice's plan without
+    // reserving. A "no" keeps the request in the visible queue (the engine
+    // records a queued-KV block on the program) instead of admitting it into
+    // a silent 120s fit-gate defer.
+    [[nodiscard]] KvAdmissionFit probe_kv_fit(Program& program, const Choice& choice) const {
+        if (!choice.plan_) { return {}; }
+        return program.kv_admission_fit(*choice.plan_);
     }
 
     [[nodiscard]] MaterializationReserveResult

@@ -42,6 +42,8 @@ class EngineCore {
 public:
     using Package            = typename Instance::Package;
     using Program            = typename Package::Program;
+    using KvAdmissionFit     = typename Package::KvAdmissionFit;
+    using QueuedKvBlockProgress = typename Package::QueuedKvBlockProgress;
     using BasePlan           = typename Package::RequestBasePlan;
     using Plan               = typename Package::AdmissionCandidate;
     using SequenceHandle     = typename Package::SequenceHandle;
@@ -954,6 +956,41 @@ private:
         if (changed) { publish_runtime_stats(); }
     }
 
+    // P1.5(d) Increment 2: abort a queued request whose KV block hit the
+    // 120s deadline (the same bound as the prepare-time fit-gate defer).
+    // Mirrors expire_pending_requests' removal mechanics; returns false if
+    // the request is no longer queued (it completed or was cancelled first —
+    // the block is already cleared by the caller).
+    [[nodiscard]] bool abort_queued_kv_request(std::uint64_t request_id) {
+        std::shared_ptr<Request> request;
+        {
+            std::lock_guard lock(queue_mutex_);
+            for (auto it = pending_.begin(); it != pending_.end(); ++it) {
+                if ((*it)->id == request_id) {
+                    request = *it;
+                    pending_.erase(it);
+                    break;
+                }
+            }
+        }
+        if (!request) { return false; }
+        scheduler_.on_waiting_removed(request->id);
+        try {
+            complete_error(request,
+                           std::make_exception_ptr(RequestError(
+                               RequestErrorKind::QueueTimeout,
+                               "inference request expired waiting for device-KV capacity "
+                               "(120s queued; relief could not free enough pages)")));
+        } catch (...) {
+            const std::exception_ptr error = std::current_exception();
+            complete_error(request, error);
+            throw;
+        }
+        request_admission_check();
+        publish_runtime_stats();
+        return true;
+    }
+
     [[nodiscard]] bool expire_pending_requests() {
         std::vector<std::shared_ptr<Request>> cancelled;
         std::vector<std::shared_ptr<Request>> expired;
@@ -1695,6 +1732,28 @@ private:
                 if (!head_inspection.choice) {
                     throw std::logic_error("ready resource inspection has no admission choice");
                 }
+                // P1.5(d) Increment 2: occupancy-aware admission. The
+                // prepare-time fit gate would defer this request for up to
+                // 120s; probe the pool instead and keep an unfitted request
+                // in the visible queue (position/wait in /stats) while
+                // relief-while-queued works toward its demand.
+                const KvAdmissionFit kv_fit =
+                    resources_.probe_kv_fit(*instance_.program, *head_inspection.choice);
+                if (!kv_fit.fits) {
+                    instance_.program->queue_kv_block(kv_fit, head->id);
+                    // P1.6: the request stays in pending_. Do NOT re-arm
+                    // admission here — the worker ticks at ~1ms and an
+                    // immediate re-arm would re-run the full admission
+                    // planner (up to 30ms under pressure) every tick for a
+                    // head that still cannot fit. Re-arms come from:
+                    // relief-while-queued (pages freed), natural state
+                    // changes (completions/expirations), and the 5s
+                    // heartbeat in the worker loop.
+                    queued_kv_block_rearm_due_ = Clock::now() + std::chrono::seconds(5);
+                    return AdmissionProgress::ControlProgress;
+                }
+                queued_kv_block_rearm_due_.reset();
+                instance_.program->clear_queued_kv_block();
                 AdmissionGrant grant = scheduler_.grant_head(
                     head->id, head_inspection.choice->summary().service_work_quanta);
                 return admit_planned_request(head, std::move(*head_inspection.choice),
@@ -1969,6 +2028,33 @@ private:
                 HostPhaseMeasurement boundary = begin_host_phase();
                 const bool have_pending       = expire_pending_requests();
                 (void)progress_context_transaction(have_pending);
+                // P1.5(d) Increment 2: relief-while-queued — progress the
+                // blocked queued-KV block (15s stall relief toward the
+                // blocked demand + 120s deadline). Relief is suppressed while
+                // a context transaction is in flight (its own fit-gate
+                // relief clock owns demotions then); the deadline still runs.
+                if (instance_.program->has_queued_kv_block()) {
+                    const QueuedKvBlockProgress queued_progress =
+                        instance_.program->progress_queued_kv_block(
+                            instance_.program->has_context_transaction());
+                    if (queued_progress == QueuedKvBlockProgress::ReliefFired) {
+                        request_admission_check();  // pages freed — re-check the head
+                        queued_kv_block_rearm_due_ = Clock::now() + std::chrono::seconds(5);
+                    } else if (queued_progress == QueuedKvBlockProgress::Expired) {
+                        const std::uint64_t expired_id =
+                            instance_.program->queued_kv_block_request_id();
+                        instance_.program->clear_queued_kv_block();
+                        queued_kv_block_rearm_due_.reset();
+                        (void)abort_queued_kv_request(expired_id);
+                    } else if (queued_kv_block_rearm_due_ &&
+                               Clock::now() >= *queued_kv_block_rearm_due_) {
+                        // 5s heartbeat: a page-freeing event that did not
+                        // re-arm admission (or a relief that freed nothing)
+                        // must not wedge the queue — the P1.6 class.
+                        request_admission_check();
+                        queued_kv_block_rearm_due_ = Clock::now() + std::chrono::seconds(5);
+                    }
+                }
                 (void)settle_terminal_requests(boundary);
                 const auto cancelled_at_boundary = snapshot_cancellations();
                 cancel_active_requests(cancelled_at_boundary, boundary);
@@ -2165,6 +2251,11 @@ private:
     // visible wait_seconds stays fresh during a pure queue wait (no state
     // change to otherwise trigger a publish). Worker-thread-only.
     Clock::time_point last_queue_stats_publish_{};
+    // P1.5(d) Increment 2: next admission re-arm for the blocked queued-KV
+    // head. Set on a KV occupancy block (5s out) and after each relief-fire
+    // or heartbeat; the worker loop re-arms when it is due. Empty = no
+    // blocked head. Worker-thread-only.
+    std::optional<Clock::time_point> queued_kv_block_rearm_due_;
     bool stopping_ = false;
     bool failed_   = false;
     static constexpr std::uint32_t kOomBackoffIterations = 4;
