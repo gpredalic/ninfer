@@ -279,6 +279,21 @@ development. Each is verified with the P0 e2e gate + the live journal.
       15s — **done `a53db4b4`**; (c) make the **shared prefix itself a demotion unit** — **stage 2 shipped `f02bc048`**: when no private victim exists, relief releases the idle shared prefix entry (Catalogued, active_references==0, not the transaction's shared source) with the most resident pages; content survives in the safety net via spilled turn continuations. **Regression:** its admission→reserve race with pending captures (victim chosen at admission, pinned only at reserve) threw `capture replacement capability is stale` 38× — fixed by the `622c841d` degrade-to-no-replacement (runtime-reserve side) and `4e712ab3` RM catalog probe (RM-planning side; see P1.2). Full unit-grade version (D2H spill of the shared prefix as one {KV + state} unit) is P2.4; also noted: the incoming restore allocates NEW device pages for a prefix that is already device-resident (identity-based restore is the deeper fix — shipped `33c53fb9`/`a1cd9dda`, see P1.7); (d) admission
       should see the pool's shared-prefix occupancy and queue the request
       (visible queue position) instead of a 120s silent defer.
+      **Increment 2 implemented `b811ab23`+`344d8f69` (2026-09-17), NOT
+      deployed — blocked on a crash regression.** Occupancy-aware admission
+      (probe before grant; unfitted head stays in the visible queue) +
+      relief-while-queued (15s stall relief toward the blocked demand, 120s
+      deadline) + sentinel Class-C (shipped `0214e6ef`). Unit-tested (probe
+      delegation; 5 baseline RM FAILs unchanged). **e2e blocked:** the
+      increment-2 binary crashed the e2e server 5/5 at ~107s (P4.1-family
+      `InvalidResourceHandle` on the event timer, at the first H2D restore
+      while a queued block was active); the make-room binary (f264074b)
+      completed the same suite crash-free in the same environment minutes
+      later — the binary is the variable. Prime suspect: relief-while-queued
+      firing a D2H spill + device release while another lane is mid-H2D-
+      restore (the in-flight fit-gate relief only ever fires when the engine
+      is quiescent). See P4.1 for the crash log. Do not deploy until the
+      crash is resolved on a clean system.
       **State-pool sizing fix deployed 2026-09-16 01:04 (config-only, no code):**
       the 500s from the (reverted) P2.4 gate fix were device-state-pool
       exhaustion — total slots = `max_concurrency + device_state_slots` = 3+5 =
@@ -989,6 +1004,97 @@ unit model; building the unit first makes this cheaper.
       silent; the sentinel only arms on `r=0 p=0 d=0 ∧ w/m≥1`, so a
       frozen-prefilling or silent wedge never fires (zero sentinel entries
       12:20–12:33). Folds into P1.5(d) Increment 2's sentinel update.
+      **New findings, 2026-09-17 14:2x (e2e window, investigated 14:5x):**
+      (c) **5 consecutive e2e-server crashes** (14:24/14:30/14:36/14:42/
+      14:48, each ~107s after startup, identical `cudaEventElapsedTime →
+      InvalidResourceHandle` signature, each at the first H2D restore after
+      3 concurrent ~20k-token prefills — far smaller than the 210k–481k
+      prefills of the original events, so prefill size is not the trigger).
+      **Isolation (14:53–14:55): the f264074b (make-room) binary completed
+      the same suite with NO crash in the same environment** — the binary is
+      the variable. (d) **Environment degraded all day:** weston (WSLg)
+      SIGSEGV crash-loop ~every 100s since 00:01 (229× today,
+      `rdp-backend.so`); WSL's own crash-capture pipeline is active. The
+      degraded WSL state is a suspected amplifier, not the sole cause (the
+      old binary passed in the same degraded environment). **Status: P1.5(d)
+      Increment 2 (b811ab23+344d8f69) is committed but NOT deployable until
+      this is resolved.** Prime suspect: relief-while-queued firing a D2H
+      spill + device-page release while another lane is mid-H2D-restore —
+      the in-flight fit-gate relief only ever fires when the engine is
+      quiescent, so this DMA overlap is new. *Next (post-reboot):* re-run
+      e2e on the clean instance — if the new binary still crashes 5/5 on a
+      clean system it is a code regression (fix the relief/restore
+      concurrency); if it passes, the trigger was the new DMA-timing pattern
+      meeting the degraded WSL state (still worth making queued relief
+      quiescent-only).
+      **New findings, 2026-09-17 14:2x (e2e window, investigated 14:5x):**
+      (c) **5 consecutive e2e-server crashes** (14:24/14:30/14:36/14:42/
+      14:48, each ~107s after startup, identical `cudaEventElapsedTime →
+      InvalidResourceHandle` signature, each at the first H2D restore after
+      3 concurrent ~20k-token prefills — far smaller than the 210k–481k
+      prefills of the original events, so prefill size is not the trigger).
+      **Isolation (14:53–14:55): the f264074b (make-room) binary completed
+      the same suite in the same environment with NO crash** — the binary is
+      the variable. (d) **Environment degraded all day:** weston (WSLg)
+      SIGSEGV crash-loop ~every 100s since 00:01 (229× today,
+      `rdp-backend.so`); WSL's own crash-capture pipeline is active.
+      Suspected amplifier, not the sole cause (the old binary passed in the
+      same degraded environment). **Status: P1.5(d) Increment 2
+      (b811ab23+344d8f69) is committed but NOT deployable until this is
+      resolved.** Prime suspect: relief-while-queued firing a D2H spill +
+      device-page release while another lane is mid-H2D-restore (the
+      in-flight fit-gate relief only ever fires when the engine is
+      quiescent, so this DMA overlap is new). *Next:* user directed a system
+      reboot (2026-09-17 15:0x) — after reboot, re-run e2e on the clean
+      instance: if the new binary still crashes 5/5 on a clean system it is
+      a code regression (fix the relief/restore concurrency); if it passes,
+      the trigger was the new DMA-timing pattern meeting the degraded WSL
+      state (still worth making the queued relief quiescent-only).
+      **New findings, 2026-09-17 14:2x (e2e window, investigated 14:5x):**
+      (c) **5 consecutive e2e-server crashes** (14:24/14:30/14:36/14:42/
+      14:48, each ~107s after startup, identical `cudaEventElapsedTime →
+      InvalidResourceHandle` signature, each at the first H2D restore after
+      3 concurrent ~20k-token prefills — far smaller than the 210k–481k
+      prefills of the original events, so prefill size is not the trigger).
+      **Isolation (14:53–14:55): the f264074b (make-room) binary completed
+      the same suite in the same environment with NO crash** — the binary is
+      the variable. (d) **Environment degraded all day:** weston (WSLg)
+      SIGSEGV crash-loop ~every 100s since 00:01 (229× today,
+      `rdp-backend.so`); WSL's own crash-capture pipeline is active. The
+      degraded WSL state is a suspected amplifier, not the sole cause.
+      **Status: P1.5(d) Increment 2 (b811ab23+344d8f69) is committed but NOT
+      deployable until this is resolved.** Prime suspect: relief-while-
+      queued firing a D2H spill + device-page release while another lane is
+      mid-H2D-restore (the in-flight fit-gate relief only ever fires when
+      the engine is quiescent, so this DMA overlap is new). Next: re-run
+      e2e on the rebooted (clean) instance — if the new binary still
+      crashes 5/5 on a clean system it is a code regression (fix the
+      relief/restore concurrency); if it passes, the trigger was the new
+      DMA-timing pattern meeting the degraded WSL state.
+      **New findings, 2026-09-17 14:2x (e2e window 14:24–14:55):**
+      (c) **5 consecutive e2e-server crashes** (14:24/14:30/14:36/14:42/
+      14:48, each ~107s after startup, identical `cudaEventElapsedTime →
+      InvalidResourceHandle` signature, each at the first H2D restore after
+      3 concurrent ~20k-token prefills — far smaller than the 210k–481k
+      prefills of the original events, so prefill size is not the trigger).
+      **Isolation:** the f264074b (make-room) binary completed the same
+      suite crash-free in the same environment minutes later (14:54), and
+      had passed it at 08:44/09:56 — while the P1.5(d) Increment 2 binary
+      (b811ab23) crashed 5/5. The queued block was 10–15s old at each crash
+      — the first relief burst (15s stall) is the prime suspect: it is the
+      first D2H spill burst that can overlap an active lane's H2D restore
+      (the in-flight fit-gate relief only ever fires when the engine is
+      quiescent). (d) **Environment degraded today:** weston (WSLg)
+      SIGSEGV crash-loop ~every 100s (229× today, `rdp-backend.so`) — a
+      chronic all-day background condition (present during the passing runs
+      too), suspected amplifier, not the sole cause. **Status:** Increment 2
+      is committed (b811ab23+344d8f69) but NOT deployable until this is
+      resolved. Next step (user directed a system reboot 2026-09-17 15:0x):
+      re-run e2e on the clean instance — if the new binary still crashes
+      5/5 on a clean system it is a code regression (suspect: queued-relief
+      D2H spill + device release overlapping a concurrent H2D restore; or
+      the probe/re-arm scheduling shift); if it passes, the trigger is the
+      new DMA-timing pattern meeting the degraded WSL state.
       *If it recurs:* capture pre-abort journal (last 30s unfiltered) +
       `nvidia-smi` + `dmesg`; fix the core pipe so a backtrace exists;
       consider a WSL2 GPU driver update (user decision — the 09-15 undervolt
