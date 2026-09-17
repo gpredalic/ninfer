@@ -379,7 +379,7 @@ development. Each is verified with the P0 e2e gate + the live journal.
       machine; only if the class recurs. The 0.5s double-submission is
       client retry logic — not server-addressable. *Exit:* 0
       `finish=cancelled` on queued requests over a live day.
-- [ ] **P1.7 — planner H2D demand + identity-based restore (Slice 0 of #7).**
+- [x] **P1.7 — planner H2D demand + identity-based restore (Slice 0 of #7).**
       Two standalone fixes that ship before the unit refactor and address
       today's live pain: (a) model the restore's new device state slot when the
       source is HostOnly at materialization time (the planner H2D demand gap,
@@ -949,16 +949,20 @@ shared meter.
       Unit tests: `test_session_protection` (protected tier exhausted last,
       dead tier precedes protection, active unit survives idle evictions in
       the state-pool loop, exhaustion displaces it only when alone).
-- [ ] **P2.6 — config.** `--host-state-slots` derived from (or replaced by) the
-      shared budget; document the single `--host-cache-mib`. **In progress
-      (source-only, ships with the relief-fix deploy):** `host_cache_mib` +
+- [x] **P2.6 — config.** `--host-state-slots` derived from (or replaced by) the
+      shared budget; document the single `--host-cache-mib`. **Shipped
+      (2026-09-17, with the P4.1 relief-fix deploy):** `host_cache_mib` +
       explicitness flags in `ContextCacheOptions`; `--host-cache-mib` parse
       branch + usage text in serve_options.cpp; derivation in
       `build_sequence_candidate` (layouts_impl.h) — when the knob is set and a
       component is not explicit, ~20% of the total becomes checkpoint state
       slots (derived from the model's `StateImageHostLayout.image_bytes`),
       ~80% host KV; an explicit component keeps its value and is subtracted
-      from the total. Parse tests in test_serve_options.cpp.
+      from the total. Parse tests in test_serve_options.cpp (passing). The
+      flag is present in the deployed binary; prod still uses explicit
+      `--host-state-slots 112 --host-kv-mib 30720` (explicit components keep
+      their values, so the derivation is a no-op there until the config
+      switches to `--host-cache-mib`).
 
 *#7 exit criteria:* e2e full suite + 3-session long conversation: 0 full-root
 mid-conversation re-prefills, 0 ckpt-miss half-units, 0 "no resident state",
