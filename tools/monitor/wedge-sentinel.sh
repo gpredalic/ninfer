@@ -1,5 +1,5 @@
 #!/bin/bash
-# ninfer wedge sentinel (v3, 2026-09-17).
+# ninfer wedge sentinel (v3.1, 2026-09-17).
 #
 # Restarts ninfer.service when the engine is wedged: work outstanding, no
 # engine progress. Three classes per poll (15s):
@@ -12,18 +12,25 @@
 #          -> SIGABRT) froze the engine mid-prefill. A/B never armed — they
 #          need r=p=d=0, but the zombie last reported prefilling=1 and then
 #          went fully silent for 13 min. C arms when, with work in
-#          flight/queued, the engine's monotonic progress counters (the
-#          /stats "counters" object: prefill/decode tokens, rounds, capture
-#          completions) have not advanced for 150s. Any real engine progress
-#          advances at least one counter at the 15s poll scale, so flat
-#          counters with work outstanding is a wedge — including a frozen
-#          prefilling=1 (the 12:20 case) and a fully silent process.
+#          flight/queued, there has been no engine progress for 150s.
+#          Progress evidence (v3.1): a /stats "counters" advance (prefill/
+#          decode tokens, rounds, capture completions) OR a fresh journal
+#          throughput line with non-zero tok/s. Any real engine progress
+#          shows up in at least one of the two at the 15s poll scale, so
+#          flat evidence with work outstanding is a wedge — including a
+#          frozen prefilling=1 (the 12:20 case) and a fully silent process.
 #
 # Signal sources per poll, in order:
 #   1. HTTP /stats — scheduler gauges + counters sum.
-#   2. journal "throughput interval" line within 60s — fallback (gauges
-#      only; it is NOT progress evidence for C — a live ticker with a dead
-#      engine would otherwise mask the wedge).
+#   2. journal "throughput interval" line within 60s — fallback for the
+#      gauges. The line's NON-ZERO prefill/decode tok/s is ALSO progress
+#      evidence for C (v3.1): the 5s reporter samples the same cumulative
+#      counters on its own thread, so a non-zero rate proves the counters
+#      advanced even when the /stats poll failed (the HTTP pool can be
+#      saturated during a long engine step — 2026-09-17 21:10 misfire: a
+#      360k-token prefill armed C at 153s while the journal showed a healthy
+#      ~1000 tok/s prefill throughout). A wedged engine cannot fake this:
+#      it either goes silent (no fresh line) or logs 0.0 tok/s.
 #   3. no signal at all — A/B hold (a wedged engine goes silent, so absence
 #      of data must NOT clear an armed timer; v1 bug #1). For C, silence
 #      with work outstanding IS the no-progress signal (c_last_advance
@@ -37,15 +44,17 @@
 #
 # The 150s threshold MUST exceed the engine's 120s fit-gate defer deadline:
 # a deferring request self-aborts at 120s, drains the gauges (the all-zero
-# line disarms C), and completes before C's threshold. A prefill or decode
-# in flight always advances counters, so a healthy busy server never arms C.
+# line disarms C), and completes before C's threshold. Progress evidence is
+# a /stats counter advance OR a fresh journal line with non-zero tok/s, so a
+# healthy busy server — including a multi-minute prefill — never arms C.
 #
 # Arm/disarm:
 #   A/B (v2): active line (r|p|d>=1) -> disarm; all-zero line -> disarm;
 #            pending-only line -> arm; restart at arm+150s.
-#   C: counter advance -> disarm; all-zero line -> disarm; arm requires
-#      150s of stale progress with work outstanding, restart at arm+15s
-#      (total ~165s from wedge start).
+#   C: progress (counter advance or journal non-zero tok/s) -> stops the
+#      staleness; all-zero line -> disarm; arm requires 150s of stale
+#      progress with work outstanding, restart at arm+15s (total ~165s
+#      from wedge start).
 #
 # Deployment: the running process never picks up on-disk edits — bash
 # parses the whole `while` compound at startup. Any change to this file
@@ -85,6 +94,23 @@ poll_journal_state() {
     | sed -nE 's/.*running=([0-9]+) prefilling=([0-9]+) decode_ready=([0-9]+) waiting=([0-9]+) materializing=([0-9]+).*/\1 \2 \3 \4 \5/p'
 }
 
+journal_progress() {
+  # exit 0 if the newest journal throughput line within 60s shows non-zero
+  # prefill or decode tok/s — the engine is demonstrably computing. The 5s
+  # reporter samples the same cumulative counters the /stats poll reads, on
+  # its own thread, so a non-zero rate proves counter advance even when the
+  # /stats poll failed (HTTP pool saturated during a long engine step).
+  # A wedged engine cannot satisfy this: it goes silent (no fresh line) or
+  # logs 0.0 tok/s.
+  local rates
+  rates=$($JC -u ninfer.service --since "60 sec ago" --no-pager 2>/dev/null \
+    | grep "throughput interval" \
+    | sed -nE 's/.* prefill=([0-9]+\.[0-9]+)tok\/s decode=([0-9]+\.[0-9]+)tok\/s.*/\1 \2/p' \
+    | tail -1)
+  [ -n "$rates" ] && \
+    awk -v r="$rates" 'BEGIN { split(r, a, " "); exit !(a[1] > 0 || a[2] > 0) }'
+}
+
 fresh_server() {
   $JC -u ninfer.service --since "120 sec ago" --no-pager 2>/dev/null \
     | grep -q "listening on http"
@@ -119,6 +145,10 @@ while true; do
     fi
   else
     state=$(poll_journal_state)
+    # v3.1: the /stats poll failed — a fresh journal line with non-zero tok/s
+    # still proves engine progress (2026-09-17 21:10 misfire: long prefill,
+    # /stats unreachable, journal showed a healthy ~1000 tok/s throughout).
+    journal_progress && c_last_advance=$now
   fi
   echo "$state" | grep -qE '^[0-9]+( [0-9]+){4}$' || state=""
 
