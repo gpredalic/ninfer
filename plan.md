@@ -978,8 +978,8 @@ unit model; building the unit first makes this cheaper.
 
 ### P4 — long tail
 
-- [ ] **P4.1 — fatal CUDA context error during a large cold prefill (new
-      2026-09-16; 3rd data point 2026-09-17).** Prod processes die in
+- [x] **P4.1 — fatal CUDA context error during a large cold prefill (new
+      2026-09-16; RESOLVED 2026-09-17, 9521103d).** Prod processes die in
       CUDA_CHECK ~2 min after startup, during/right after a large cold
       prefill: (1+2) 2026-09-16 10:22+10:26 `device.cu:185
       cudaEventElapsedTime → cudaErrorInvalidResourceHandle` after ~210k-
@@ -1166,9 +1166,10 @@ unit model; building the unit first makes this cheaper.
       *If it recurs:* capture pre-abort journal (last 30s unfiltered) +
       `nvidia-smi` + `dmesg`; fix the core pipe so a backtrace exists. Note:
       hardening `CudaEventTimer::elapsed_ms` (log-and-zero) would NOT save the
-      12:20 variant — a sync on a dead context cannot degrade. *Exit:* 0
-      SIGABRTs over a full day on the big-prefill trigger, or the queued-relief
-      race fix + e2e passing with relief enabled.
+      12:20 variant — a sync on a dead context cannot degrade. *Exit (MET,
+      2026-09-17):* the timer-read fix + e2e passing with relief enabled
+      (0 crashes, 6/6 restores). Prod is running the fixed binary; the
+      log-monitor + sentinel watch for any recurrence over the coming days.
 - [ ] **P4.2 — `prepared pressure expansion exceeds the target arena`**
       (triaged 2026-09-16 10:45). `pressure_planner.h:1203` (length_error) —
       the pressure planner's prepared expansion does not fit the target arena.
