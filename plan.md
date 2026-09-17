@@ -963,20 +963,40 @@ unit model; building the unit first makes this cheaper.
 
 ### P4 — long tail
 
-- [ ] **P4.1 — SIGABRT on CUDA event timer (new 2026-09-16).** Two successive
-      prod processes aborted at `device.cu:185 cudaEventElapsedTime →
-      cudaErrorInvalidResourceHandle`, each ~2 min after startup, each right
-      after a ~210k-token cold prefill (75s TTFT) and on the first
-      net-restore's transfer-timer read; the 3rd process stable 15+ min.
+- [ ] **P4.1 — fatal CUDA context error during a large cold prefill (new
+      2026-09-16; 3rd data point 2026-09-17).** Prod processes die in
+      CUDA_CHECK ~2 min after startup, during/right after a large cold
+      prefill: (1+2) 2026-09-16 10:22+10:26 `device.cu:185
+      cudaEventElapsedTime → cudaErrorInvalidResourceHandle` after ~210k-
+      token prefills (75s TTFT); (3) 2026-09-17 12:20:30 `device.cu:126
+      cudaStreamSynchronize → cudaErrorUnknown` mid-way through a **481k-
+      token** cold prefill (926-message session — the largest yet). The
+      first-failed call site varies (whichever CUDA call runs first on an
+      already-dead context): this is context death, not a timer bug. The
+      3rd process (09-16 10:30 → 09-17 12:11, 25.8h) survived a full day —
+      *Step 0 met* — but the NEXT process died on its first big prefill.
       GPU clean at inspection (54°C, no Xid). Suspect a WSL2 GPU context
-      reset during a large DMA window (the 75s TTFT precedes each abort).
-      *Step 0:* confirm the 3rd process survives a full day (if it does, this
-      is a rare driver event, not a code regression — the relief fix touches
-      no CUDA events/timers). *If it recurs:* capture the pre-abort journal
-      (last 30s unfiltered) + `nvidia-smi` + `dmesg` at the moment; consider
-      making `CudaEventTimer::elapsed_ms` log-and-zero instead of aborting on
-      `InvalidResourceHandle` (a timing read must not take down the engine).
-      *Exit:* 0 SIGABRTs over a full day, or a hardening commit + e2e.
+      reset during a large sustained DMA window. **New findings, 12:20
+      event (investigated 09-17 13:3x):** (a) **13-min zombie window** —
+      `[engine] CRASH: SIGABRT` logged 12:20:30, but the exec'd main process
+      kept running until 12:33:23 (zero journal lines, ~100% CPU, both
+      in-flight requests hung 13 min; systemd's auto-restart then recovered
+      them) — mechanism unknown, and the core was **not captured**:
+      `core_pattern` pipes to `/wsl-capture-crash`, which does not exist, so
+      every core on this box is silently lost (fix = create the pipe
+      target; root/WSL-image level). (b) **Sentinel Class-C blind spot** —
+      the wedged process last reported `prefilling=1` and then went fully
+      silent; the sentinel only arms on `r=0 p=0 d=0 ∧ w/m≥1`, so a
+      frozen-prefilling or silent wedge never fires (zero sentinel entries
+      12:20–12:33). Folds into P1.5(d) Increment 2's sentinel update.
+      *If it recurs:* capture pre-abort journal (last 30s unfiltered) +
+      `nvidia-smi` + `dmesg`; fix the core pipe so a backtrace exists;
+      consider a WSL2 GPU driver update (user decision — the 09-15 undervolt
+      attempt was abandoned over driver-update crashes). Note: hardening
+      `CudaEventTimer::elapsed_ms` (log-and-zero) would NOT save the 12:20
+      variant — a sync on a dead context cannot degrade. *Exit:* 0
+      SIGABRTs over a full day on the big-prefill trigger, or a driver-level
+      fix / hardening commit + e2e.
 - [ ] **P4.2 — `prepared pressure expansion exceeds the target arena`**
       (triaged 2026-09-16 10:45). `pressure_planner.h:1203` (length_error) —
       the pressure planner's prepared expansion does not fit the target arena.
