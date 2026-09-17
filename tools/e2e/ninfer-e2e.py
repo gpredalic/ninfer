@@ -443,6 +443,9 @@ def parse_serve_log(path, skip_lines=0):
         "missing_source_result",
         "relief_demote",
         "relief_dual_drop",
+        "kv_occupancy_block",
+        "queued_kv_relief",
+        "queued_kv_deadline",
         "pressure_expansion_fail",
         "state_replan",
         "entitlement_mismatch",
@@ -552,6 +555,17 @@ def parse_serve_log(path, skip_lines=0):
                     d["relief_demote"] += 1
                     if " dropped " in line and "dropped 0 dual" not in line:
                         d["relief_dual_drop"] += 1
+                # P1.5(d) Increment 2: occupancy-aware admission — a head whose
+                # device-KV demand cannot fit is kept in the visible queue
+                # (position/wait in /stats) instead of a silent 120s defer;
+                # relief-while-queued works toward it; the 120s deadline
+                # aborts a demand that never fits.
+                if "KV occupancy block: request" in line:
+                    d["kv_occupancy_block"] += 1
+                if "[relief-kv] queued demand (request" in line:
+                    d["queued_kv_relief"] += 1
+                if "queued KV block deadline exceeded" in line:
+                    d["queued_kv_deadline"] += 1
                 # P4.2: the pressure planner's expansion-capacity limit — a
                 # known self-recovering class (triaged 2026-09-16), not a
                 # saturated-restore failure.
@@ -628,14 +642,14 @@ def evaluate(phase_name, sessions, stats0, stats1, log, expect_trash=False):
 
     # Pressure (skip for single-session phases and state-pool phases)
     pressure = evicted > 0 or degraded > 0
-    if phase_name not in ("checkpoint-advance", "tool-calling", "responses-tools", "reasoning-effort", "concurrent", "thinking-sig", "demotion", "state-saturation"):
+    if phase_name not in ("checkpoint-advance", "tool-calling", "responses-tools", "reasoning-effort", "concurrent", "thinking-sig", "demotion", "state-saturation", "queued-relief"):
         if not pressure and not expect_trash:
             v.append("FAIL: no KV pressure")
         if pressure:
             v.append(f"PASS: pressure (evicted={evicted}, degraded={degraded})")
 
     # Cache reuse (skip for single-session phases and state-pool phases)
-    if phase_name not in ("checkpoint-advance", "tool-calling", "responses-tools", "reasoning-effort", "concurrent", "thinking-sig", "demotion", "state-saturation"):
+    if phase_name not in ("checkpoint-advance", "tool-calling", "responses-tools", "reasoning-effort", "concurrent", "thinking-sig", "demotion", "state-saturation", "queued-relief"):
         if reused > 0:
             v.append(f"PASS: cache reuse ({reused} tokens)")
         elif not expect_trash:
@@ -949,7 +963,7 @@ def main():
 
     all_verdicts = []
     phases = (phase_1, phase_2, phase_3, phase_4, phase_5, phase_6, phase_7,
-              phase_8, phase_9, phase_10, phase_11, phase_12, phase_13)
+              phase_8, phase_9, phase_10, phase_11, phase_12, phase_13, phase_14)
     for i, phase_fn in enumerate(phases, start=1):
         if i < args.start_phase:
             print(f"=== Phase {i}: skipped (--start-phase {args.start_phase}) ===")
@@ -1536,6 +1550,64 @@ def phase_13(args):
         all_verdicts.append(("state-saturation", f"PASS: {log13['spill_before_loss']} spill-before-loss backstops fired (unit retained in net before its state lost its last copy)"))
     if log13["state_relinquish"] > 0:
         all_verdicts.append(("state-saturation", f"PASS: {log13['state_relinquish']} state images relinquished to the net (move-not-copy; the net is the unit's host home)"))
+    return all_verdicts
+
+
+def phase_14(args):
+    all_verdicts = []
+    # Phase 14: queued-relief — P1.5(d) Increment 2.
+    # 4 sessions x 24k-token prompts against the 64k-token device-KV pool:
+    # only ~2 fit in the pool at once, so the overflowing requests cannot be
+    # admitted without exceeding the pool. Pre-Increment-2 they would be
+    # admitted into a silent 120s fit-gate defer; now the engine keeps them
+    # in the visible queue (position/wait in /stats) and runs
+    # relief-while-queued toward their demand (15s stall cadence, 120s
+    # deadline).
+    print("\n=== Phase 14: queued-relief (4 sessions, 3 rounds, 24k prompts vs 64k device KV) ===")
+    log_off = count_log_lines(args.serve_log)
+    stats0 = get_stats(args)
+    s14 = [Session(f"QR{i}", 24000, 1000, args) for i in range(4)]
+    for s in s14:
+        s.args = type(args)(**vars(args))
+        s.args.max_output_tokens = 512
+    for r in range(1, 4):
+        print(f"Round {r}:")
+        errors = run_round(s14, r, args.timeout)
+        if errors:
+            for n, e in errors: print(f"  ERROR {n}: {e}")
+            print("  Retrying failed sessions...")
+            time.sleep(3)
+            failed = [s for s in s14 if s.name in [n for n, _ in errors]]
+            errors2 = run_round(failed, r, args.timeout)
+            if errors2:
+                for n, e in errors2: print(f"  ERROR {n}: {e}")
+            continue
+    stats1 = get_stats(args)
+    log14 = parse_serve_log(args.serve_log, log_off)
+    for v in evaluate("queued-relief", s14, stats0, stats1, log14):
+        all_verdicts.append(("queued-relief", v))
+    if log14["kv_occupancy_block"] > 0:
+        all_verdicts.append(("queued-relief",
+            f"PASS: {log14['kv_occupancy_block']} KV occupancy block(s) — unfitted head(s) kept in the visible queue instead of a silent 120s defer"))
+    else:
+        all_verdicts.append(("queued-relief",
+            "WARN: no KV occupancy block — the device-KV gap never blocked a head (non-deterministic; path unexercised)"))
+    if log14["queued_kv_relief"] > 0:
+        all_verdicts.append(("queued-relief",
+            f"PASS: relief-while-queued fired {log14['queued_kv_relief']}x (freed pages toward the blocked demand)"))
+    elif log14["kv_occupancy_block"] > 0:
+        all_verdicts.append(("queued-relief",
+            "WARN: occupancy block fired but relief never ran (gap closed by lane drain before the 15s stall)"))
+    if log14["queued_kv_deadline"] > 0:
+        all_verdicts.append(("queued-relief",
+            f"WARN: {log14['queued_kv_deadline']} request(s) hit the 120s queued-KV deadline (structural over-commit — the gap could not be closed)"))
+    else:
+        all_verdicts.append(("queued-relief", "PASS: no queued-KV deadline aborts"))
+    if log14["bad_alloc"] > 0 or log14["worker_recover"] > 0:
+        all_verdicts.append(("queued-relief",
+            f"FAIL: {log14['bad_alloc']} bad_alloc / {log14['worker_recover']} worker recoveries under queueing"))
+    else:
+        all_verdicts.append(("queued-relief", "PASS: zero bad_alloc / worker recoveries under queueing"))
     return all_verdicts
 
 
