@@ -1,13 +1,14 @@
 #!/bin/bash
-# wsl-capture-crash — core-dump capture for WSL2 (DRAFT — install pending).
+# wsl-capture-crash — core-dump capture for WSL2.
 #
 # The kernel core_pattern on this box is:
 #   |/wsl-capture-crash %t %E %p %s
-# but /wsl-capture-crash does not exist, so every core dump is silently
+# but /wsl-capture-crash did not exist, so every core dump was silently
 # discarded (the 2026-09-17 12:20 SIGABRT core was lost this way).
 #
 # Install (root, takes effect on the NEXT crash — no reboot needed):
 #   sudo install -m 755 -o root tools/monitor/wsl-capture-crash.sh /wsl-capture-crash
+# (installed 2026-09-17)
 #
 # The kernel pipes the core image on stdin; args are %t (epoch), %E (exe),
 # %p (pid), %s (signal number). Cores land in ~/crash-cores (a 27B-model
