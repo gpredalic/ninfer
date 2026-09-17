@@ -884,6 +884,57 @@ shared meter.
         demotes whole units, not replicas: retire the state-only and KV-only
         demote decisions; the safety-net spill becomes the only device→host
         path. (Largest risk; do last, after #7's full gate.)
+        **Slice 3 Increment 1 (relief metric) SHIPPED `569dbbd2`, 2026-09-17
+        20:1x, e2e-verified (rc=0, 0 crashes) + deployed (prod up 20:14:44).**
+        The 19:22/19:42/19:55 wedge loop (sentinel restarted the user's live
+        server 3×) was traced to `relieve_kv_fit` ranking victims by
+        `resident_device_pages` — which counts pages shared with other address
+        spaces. A ~235k unit sharing a ~230k prefix with an idle shared-prefix
+        entry scored ~7300 "unique" pages but freed 2–16 real pages per
+        demotion (free 777→793→802→804→807 over five 15s bursts, each a 3.3GB
+        D2H + 154MB state copy), and stage-2 (release the idle shared prefix —
+        where the pages were actually pinned) never ran because stage-1 kept
+        finding "victims". Fix: `unique_resident_device_pages` probe
+        (device_resident && address_references == 1, mirroring the
+        `resident_resources` skip); both stages scored in one call, higher
+        score wins (tie → content-preserving demotion); both zero → no-op;
+        returned value is the MEASURED free-page delta. Unit test
+        (test_context_store.cpp) pins the topology: fully-forked unit + prefix
+        both unique==0 / resident==2; branch release frees nothing, prefix
+        release frees the pages. Soak exit signal: 0 wedge restarts +
+        plausible freed counts under the monitor. **Increment 2 (planner
+        retirement) PENDING** — after a clean Inc 1 soak: stop generating
+        `Demote*ToHost` state options + KV `DemoteToHost` (Evict carries the
+        load), duplicate-drops + state-slot relief stay (tier-1 re-pointed at
+        whole-unit spill), `NINFER_KEEP_REPLICA_DEMOTES=1` kill-switch,
+        counter/e2e/test updates per the dependency map.
+        **Slice 3 Increment 1 (relief metric) SHIPPED `569dbbd2`, 2026-09-17
+        20:1x, e2e-verified (rc=0, 0 crashes) + deployed (prod up 20:14:44).**
+        The 19:22/19:42/19:55 wedge loop (sentinel restarted the user's live
+        server 3×) was traced to `relieve_kv_fit` ranking victims by
+        `resident_device_pages` — which counts pages shared with other address
+        spaces. A ~235k unit sharing a ~230k prefix with an idle shared-prefix
+        entry scored ~7300 "unique" pages but freed 2–16 real pages per
+        demotion (free 777→793→802→804→807 over five 15s bursts, each a 3.3GB
+        D2H + 154MB state copy), and stage-2 (release the idle shared prefix —
+        where the pages were actually pinned) never ran because stage-1 kept
+        finding "victims". Fix: new `unique_resident_device_pages` probe
+        (device_resident && address_references == 1, mirroring the
+        `resident_resources` skip); both stages scored in one call, higher
+        score wins (tie → content-preserving demotion); both zero → no-op;
+        returned value is the MEASURED free-page delta (available_pages
+        before/after), logged as `scored X unique, freed Y pages`. Unit test
+        pins the topology (fully-forked unit + prefix both unique==0; branch
+        release frees nothing, prefix release frees the pages). Soak exit
+        signal: 0 wedge restarts + plausible freed counts under the monitor.
+        **Slice 3 Increment 2 (planner retirement) PENDING** — after a clean
+        Inc 1 soak: stop generating `Demote*ToHost` state options + KV
+        `DemoteToHost` (Evict carries the load; duplicate-drops + state-slot
+        relief stay, tier-1 re-pointed at whole-unit spill); behind
+        `NINFER_KEEP_REPLICA_DEMOTES=1`; counter/e2e/test updates per the
+        dependency map (main_kv_d2h stops for pressure demotes,
+        pressure_spill_pages stops, e2e evidence lines re-pointed at
+        `[safety-spill]`/`[relief-kv]`).
 - [x] **P2.5 — Slice 4: unit LRU/retention + per-session guarantee.** One LRU
       over the shared budget, evicting whole units cost-aware smallest-first
       (kills the 19s class: state can no longer outlive its KV's retention
