@@ -1095,14 +1095,80 @@ unit model; building the unit first makes this cheaper.
       D2H spill + device release overlapping a concurrent H2D restore; or
       the probe/re-arm scheduling shift); if it passes, the trigger is the
       new DMA-timing pattern meeting the degraded WSL state.
+      **DECISIVE A/B bisection, 2026-09-17 17:5x (settles code-vs-environment):**
+      rebuilt increment-2 with a `NINFER_NO_QUEUED_RELIEF` env gate that
+      disables ONLY the queued-relief D2H burst (probe + visible queue + 120s
+      deadline kept) and ran the same e2e suite with the gate on. Gate
+      confirmed active in the server log. Request 13 queued (needs 33/33
+      pages, free 10/13), sat 120s with NO relief burst (zero `[relief-kv]
+      queued demand` lines), was cleanly aborted at the 120s deadline (503 to
+      client) — and **the server did NOT crash**: no core, no SIGABRT, healthy
+      throughput line until the swap's own pkill. Contrast: with the burst
+      enabled, 8/8 runs crashed ~100–130s after startup, always right after the
+      `[relief-kv] queued demand — freed ~1390 pages` burst, at the next
+      request's H2D-restore timer read. **Verdict: the queued-relief D2H burst
+      is the trigger — a code problem, not the environment.** The dxgvmbus
+      field-spanning-write warning (seen once at boot) is NOT the trigger. The
+      user's pushback was correct; the earlier "WSL2 driver bug, code is clean"
+      conclusion was an over-claim. The new pattern the make-room binary never
+      had: a relief D2H burst fired on a 15s stall timer while other lanes are
+      mid-flight (make-room's in-flight fit-gate relief only fires for the
+      request that is itself materializing, so it never created this overlap).
+      **RESOLVED (2026-09-17 evening) — root cause + fix + e2e-verified.**
+      Deeper probes (context-health + timer-handle dumps) disproved the "dead
+      context" theory: at the crash the context was ALIVE (both streams
+      `no error`/`not ready`, `cudaPeekAtLastError` clean) and the MainKV
+      timer's `start_`/`stop_` were VALID + COMPLETED (`cudaEventQuery` = no
+      error on both) — yet `cudaEventElapsedTime` returned
+      `InvalidResourceHandle`. The distinguishing condition: the transfer stream
+      was BUSY (pending H2D) at the read. **Root cause: `cudaEventElapsedTime`
+      on WSL2/dxgkrnl returns a spurious `InvalidResourceHandle` for valid,
+      completed events when called while the transfer stream has pending DMA**
+      (the dmesg field-spanning-write is in that sync-object wait path). The
+      safety-net restore path (`start_sequence`) called
+      `context_transfer_observation` (→ `elapsed_ms`) right after enqueuing its
+      H2D copies, while the stream was still busy — and read a STALE timer
+      (never started/stopped in that path, unlike the materialization path which
+      observes after its transfers drain). **Fix (restore path,
+      program_impl.h):** for each of the three H2D restores (MainKV, BackendKV,
+      State), wrap the copy in `start_context_transfer_timer`/
+      `stop_context_transfer_timer` (matching the materialization pattern) and
+      add a `cudaStreamSynchronize(transfer_stream)` immediately before the
+      `context_transfer_observation`, so the timer is read on an idle stream.
+      Verified: full e2e ran to completion, 0 crashes, 6/6 restores completed,
+      probe shows `transfer=no error` (idle) at the observation. The
+      queued-relief burst itself was NOT the bug (its D2H synced fine, context
+      alive after) — it only *enabled* the restore path to run. Also in the fix
+      build: single-victim queued relief (was batch-of-3; one ~700-950-page
+      demotion exceeds any single demand) + a `NINFER_NO_QUEUED_RELIEF` env
+      kill-switch (off by default). Prod is running the fixed binary.
+      **Two PRE-EXISTING e2e verdict FAILs surfaced (NOT from this fix):**
+      (1) "no KV pressure" — the verdict reads `main_kv_d2h_pages`/
+      `private_owners_evicted`/`private_owners_degraded`, which the safety-net
+      spill/relief path does not increment (23 spills + 6 restores actually
+      happened); a detection gap. (2) "15 spills corrupt ledger/identity" — all
+      15 are `at-ckpt=1` units (retained at the checkpoint frontier,
+      `ledger == frontier`) vs endpoint units (`ledger == frontier+1`); the
+      e2e check only exempts `fallback=1`, not `at-ckpt=1`. Whether
+      `ledger == frontier` is a genuine off-by-one in the at-ckpt retention
+      (program_impl.h ~7106-7107) or a check gap needs a separate look.
+      **Sentinel/swap interaction bug (found same evening, fixed):** the wedge
+      sentinel polls /stats on 8080 and cannot tell the e2e swap server from
+      prod (the e2e process's counters start at 0, below prod's final totals,
+      so its Class-C "no progress" logic false-arms during the swap). During
+      the 17:57 swap it restarted the service at 17:59:43 mid-swap; the swap's
+      pkill then killed that half-loaded prod, the swap's own `systemctl start`
+      collided with the stopping unit, and prod stayed down until the user
+      manually restarted it at 18:13:57 (the sentinel had also hit its
+      3-restart cap at 18:02:30). Fix: `e2e-swap.sh` now stops
+      `ninfer-wedge-sentinel.service` before the swap and restarts it after
+      prod is restored (with a manual-restart warning on the FATAL paths).
       *If it recurs:* capture pre-abort journal (last 30s unfiltered) +
-      `nvidia-smi` + `dmesg`; fix the core pipe so a backtrace exists;
-      consider a WSL2 GPU driver update (user decision — the 09-15 undervolt
-      attempt was abandoned over driver-update crashes). Note: hardening
-      `CudaEventTimer::elapsed_ms` (log-and-zero) would NOT save the 12:20
-      variant — a sync on a dead context cannot degrade. *Exit:* 0
-      SIGABRTs over a full day on the big-prefill trigger, or a driver-level
-      fix / hardening commit + e2e.
+      `nvidia-smi` + `dmesg`; fix the core pipe so a backtrace exists. Note:
+      hardening `CudaEventTimer::elapsed_ms` (log-and-zero) would NOT save the
+      12:20 variant — a sync on a dead context cannot degrade. *Exit:* 0
+      SIGABRTs over a full day on the big-prefill trigger, or the queued-relief
+      race fix + e2e passing with relief enabled.
 - [ ] **P4.2 — `prepared pressure expansion exceeds the target arena`**
       (triaged 2026-09-16 10:45). `pressure_planner.h:1203` (length_error) —
       the pressure planner's prepared expansion does not fit the target arena.

@@ -20,6 +20,21 @@ safe=$(basename "${2:-unknown}" | tr -c 'A-Za-z0-9._-' '_')
 out="$OUTDIR/$(date '+%Y%m%d-%H%M%S')-pid${3:-?}-sig${4:-?}-${safe}.core"
 cat > "$out"
 echo "$(date -Iseconds) captured exe=${2:-?} pid=${3:-?} sig=${4:-?} size=$(stat -c %s "$out" 2>/dev/null || echo '?') -> $out" >> "$OUTDIR/capture.log"
+# P4.1 (2026-09-17): snapshot GPU + kernel state at the moment of death, into a
+# sidecar next to the core. nvidia-smi can hang on a wedged GPU, so it is
+# timeout-guarded; dmesg carries the dxgkrnl sync-object warnings. Captured
+# AFTER the core (the core is the priority; a hung GPU must not lose it).
+side="${out%.core}.diagnostics"
+{
+  echo "=== captured $(date -Iseconds) exe=${2:-?} pid=${3:-?} sig=${4:-?} ==="
+  echo "=== nvidia-smi ==="
+  timeout 10 nvidia-smi 2>&1 || echo "nvidia-smi FAILED or hung (timeout 10s)"
+  echo "=== dmesg (last 40) ==="
+  timeout 5 dmesg 2>/dev/null | tail -40 || echo "dmesg unavailable"
+  echo "=== gpu processes ==="
+  ps -o pid,rss,etime,cmd -C ninfer-serve 2>/dev/null || true
+} > "$side" 2>&1
 # keep the 3 most recent cores
 ls -1t "$OUTDIR"/*.core 2>/dev/null | tail -n +4 | xargs -r rm -f --
+ls -1t "$OUTDIR"/*.diagnostics 2>/dev/null | tail -n +4 | xargs -r rm -f --
 exit 0

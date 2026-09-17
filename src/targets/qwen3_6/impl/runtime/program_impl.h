@@ -5029,18 +5029,32 @@ ProgramImplCore::progress_queued_kv_block(bool relief_suppressed) noexcept {
     }
     block.last_free_text    = free_text;
     block.last_free_backend = free_backend;
-    if (!relief_suppressed && !fits && now - block.flat_since >= kKVReliefDelay) {
-        // Nothing has drained for kKVReliefDelay: demote idle units toward the
-        // blocked demand (batch of 3, same as the in-flight fit-gate relief),
-        // skipping the head's own sources.
+    // A/B bisection (2026-09-17): NINFER_NO_QUEUED_RELIEF=1 disables the
+    // queued-relief D2H burst (keeps the probe + visible queue + 120s
+    // deadline) to isolate whether the relief burst is the crash trigger.
+    static const bool no_queued_relief = [] {
+        const char* v = std::getenv("NINFER_NO_QUEUED_RELIEF");
+        const bool on = v != nullptr && v[0] != '\0' && std::string(v) != "0";
+        if (on) {
+            std::fprintf(stderr,
+                         "[admission] NINFER_NO_QUEUED_RELIEF active — queued-relief "
+                         "D2H burst disabled (A/B bisection)\n");
+        }
+        return on;
+    }();
+    if (!relief_suppressed && !no_queued_relief && !fits && now - block.flat_since >= kKVReliefDelay) {
+        // Nothing has drained for kKVReliefDelay: demote an idle unit toward the
+        // blocked demand, skipping the head's own sources.
+        //
+        // P4.1 (2026-09-17): ONE victim per fire (was a batch of 3). A single
+        // demotion (~700-950 pages) already exceeds any single queued demand
+        // (≤~475 pages), so the batch was unnecessary; smaller per-fire bursts
+        // are also gentler on the transfer stream. (The crash root cause was the
+        // restore-path timer read, fixed there — not the burst size.) Further
+        // victims come on subsequent stall re-fires (the 15s clock restarts).
         block.flat_since = now;
         const KvReliefSkip skip{block.skip_source, std::nullopt, block.skip_shared};
-        std::uint32_t freed = 0;
-        for (int i = 0; i < 3; ++i) {
-            const std::uint32_t victim_pages = relieve_kv_fit(skip);
-            if (victim_pages == 0) { break; }
-            freed += victim_pages;
-        }
+        const std::uint32_t freed = relieve_kv_fit(skip);
         if (freed > 0) {
             std::fprintf(stderr,
                          "[relief-kv] queued demand (request %llu) — freed %u pages; "
@@ -7037,6 +7051,16 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index,
                    checkpoint_frontier <= entry.execution_frontier) {
             // Retain the unit at the checkpoint frontier — the deepest
             // frontier with a state image.
+            //
+            // Convention (P4.1, 2026-09-17): for at-ckpt entries the frontier
+            // is a TOKEN COUNT — kv_pages_for_frontier, find() and the restore
+            // path all treat it as a count — so ledger/identity/compact_prefix
+            // are truncated to exactly `frontier` tokens (ledger == frontier).
+            // Endpoint entries keep the sequence's ledger, where
+            // execution_frontier is a last-index (ledger == frontier + 1). Do
+            // NOT "normalize" the two: every consumer bounds itself by
+            // min(frontier, ledger.size(), compact_prefix.size()), so the
+            // count-form entry is self-consistent as-is.
             const std::uint32_t frontier = checkpoint_frontier;
             const std::uint32_t be_frontier =
                 (speculative_backend == SpeculativeBackend::Mtp && frontier > 0) ? frontier - 1U
@@ -11936,6 +11960,7 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                             ++text_shared;
                         }
                     }
+                    start_context_transfer_timer(runtime::ContextResourceClass::MainKV);
                     text_kv_addresses->materialize_to_tokens(
                         sequence.kv->text, restore_frontier, device.transfer_stream);
                     if (text_shared > 0) {
@@ -11989,6 +12014,17 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                     }
                     }
                     text_kv_addresses->commit_frontier(sequence.kv->text, restore_frontier);
+                    // P4.1 fix (2026-09-17): close the MainKV timer and drain the
+                    // transfer stream BEFORE observing. Reading a timer via
+                    // cudaEventElapsedTime while the stream has pending DMA trips a
+                    // WSL2/dxgkrnl bug (spurious InvalidResourceHandle on valid,
+                    // completed events; the dmesg field-spanning-write is in that
+                    // sync-object wait path). Observing on an idle stream takes the
+                    // safe path, as the materialization path does (it observes after
+                    // its transfers drain). start/stop bracket this copy so the
+                    // timing is real, not a stale read.
+                    stop_context_transfer_timer(runtime::ContextResourceClass::MainKV);
+                    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
                     // Record the H2D restore for byte accounting — the safety-net
                     // restore path previously never observed its transfers, so
                     // main_kv_h2d_bytes stayed 0 despite successful restores.
@@ -12032,6 +12068,7 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                             ++backend_shared;
                         }
                     }
+                    start_context_transfer_timer(runtime::ContextResourceClass::BackendKV);
                     backend_kv_addresses->materialize_to_tokens(
                         *sequence.kv->backend, backend_frontier, device.transfer_stream);
                     if (backend_shared > 0) {
@@ -12075,6 +12112,10 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                     }
                     }
                     backend_kv_addresses->commit_frontier(*sequence.kv->backend, backend_frontier);
+                    // P4.1 fix: close the BackendKV timer + drain before observing
+                    // (see the MainKV note above — observe on an idle stream).
+                    stop_context_transfer_timer(runtime::ContextResourceClass::BackendKV);
+                    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
                     if (const HostKVPageLayout* layout =
                             host_kv_arena
                                 ? host_kv_arena->layout_for(
@@ -12117,7 +12158,11 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                 const std::int32_t slot_num = state_store->physical_slot(sequence.state.write);
                 const HostStateImageConstView state_view =
                     host_state_images->view(*state_src_slot);
+                start_context_transfer_timer(runtime::ContextResourceClass::State);
                 state_images->copy_from_host(state_view, slot_num, device.transfer_stream);
+                // P4.1 fix: close the State timer + drain before observing (idle stream).
+                stop_context_transfer_timer(runtime::ContextResourceClass::State);
+                CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
                 auto observation = context_transfer_observation(
                     runtime::ContextResourceClass::State,
                     runtime::ContextTransferDirection::HostToDevice, TransferWork{}, 0, 1);
