@@ -71,6 +71,9 @@ private:
     void log_throughput(const ThroughputReport& report);
     void run_stats_reporter();
     void stop_stats_reporter();
+    // Stops the dedicated /stats + /health listener (no-op when --stats-port
+    // is unset or the listener never started).
+    void stop_stats_listener();
 
     GenerationService* service_ = nullptr;
     ServeOptions options_;
@@ -79,6 +82,11 @@ private:
     OpenAIResponsesStore openai_responses_store_;
     JsonlRequestLog request_jsonl_;
     httplib::Server server_;
+    // Dedicated single-thread server for /stats + /health (only when
+    // --stats-port is set): liveness and stats must stay reachable while the
+    // main pool is saturated by streaming handlers spanning long prefills.
+    httplib::Server stats_server_;
+    std::thread stats_listener_;
     std::atomic<std::uint64_t> request_seq_{0};
     std::mutex stats_mutex_;
     std::condition_variable stats_cv_;

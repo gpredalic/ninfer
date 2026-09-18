@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """E2E test suite for ninfer safety-net eviction system.
 
-Runs eleven phases by default against a single test server (no flags needed):
+Runs twelve phases by default against a single test server (no flags needed):
   Phase 1 "pressure":           4 sessions — basic safety net (spills, restores, no re-prefills)
   Phase 2 "mixed":              1 big + 3 small — eviction order (smallest-first, big preserved)
   Phase 3 "trash":              10 sessions — graceful degradation under trashing (no crash)
@@ -12,8 +12,12 @@ Runs eleven phases by default against a single test server (no flags needed):
   Phase 8 "reasoning-effort":   5 requests — reasoning effort tier mapping (high, minimal, max, medium, low)
   Phase 9 "concurrent":         2 sessions + title-gen — source eviction fallback, no cross-session state destruction
   Phase 10 "thinking-sig":      4 requests — thinking signature skip when preserve_thinking=false
+  Phase 11 "demotion":          3 sessions, large prompts — host demotion + checkpoint restore
+  Phase 12 "state-lease":       4 thinking sessions — rewrite-recycle pressure; zero state-lease
+                                leaks / orphaned state slots (regression: 2026-09-14 prod wedge)
 
-Server config: 32k max-context, 64k kv-capacity, 4GB host-kv, 3 continuations.
+Server config: 32k max-context, 64k kv-capacity, 4GB host-kv, 3 continuations,
+5 device state slots (production parity — required by phase 12).
 All phases use the same server — no restarts.
 
 Usage: python3 ninfer-e2e.py [--host 127.0.0.1] [--port 8080] [--serve-log /home/zenz/ninfer-serve.log]
@@ -21,6 +25,7 @@ Usage: python3 ninfer-e2e.py [--host 127.0.0.1] [--port 8080] [--serve-log /home
 
 import argparse
 import json
+import os
 import re
 import random
 import sys
@@ -70,6 +75,8 @@ class Session:
             "store": True,
             "stream": False,
         }
+        if getattr(self.args, "thinking_mode", False):
+            payload["reasoning"] = {"effort": "low"}
         if self.response_id:
             payload["previous_response_id"] = self.response_id
         t0 = time.monotonic()
@@ -130,6 +137,8 @@ class ChatSession:
             "tool_choice": "auto",
             "stream": False,
         }
+        if getattr(self.args, "thinking_mode", False):
+            payload["enable_thinking"] = True
         t0 = time.monotonic()
         out = json.load(urllib.request.urlopen(urllib.request.Request(
             f"http://{self.args.host}:{self.args.port}/v1/chat/completions",
@@ -416,7 +425,7 @@ def parse_serve_log(path, skip_lines=0):
         "restore_started", "restore_completed", "restore_failed",
         "safety_find_hit", "safety_find_miss", "max_net_entries",
         "worker_crash", "bad_alloc", "capture_skip", "restore_skip",
-        "refind_hit", "evict_smallest", "multi_extent_ok", "admit_session",
+        "refind_hit", "evict_smallest", "compact", "admit_session",
         "rewrite_prefix_hit", "rewrite_restore_fail", "worker_recover",
         "private_turn_closure", "tool_calls_done",
         "materialize_fallback", "materialize_safety_hit",
@@ -430,6 +439,20 @@ def parse_serve_log(path, skip_lines=0):
         "mixed_copy_ok",
         "kv_not_resident_stale",
         "kv_not_resident_no_device",
+        "state_lease_leak",
+        "state_lease_orphan",
+        "missing_source_result",
+        "relief_demote",
+        "relief_dual_drop",
+        "kv_occupancy_block",
+        "queued_kv_relief",
+        "queued_kv_deadline",
+        "pressure_expansion_fail",
+        "state_replan",
+        "entitlement_mismatch",
+        "no_resident_state",
+        "spill_before_loss",
+        "state_relinquish",
     ]}
     d["evict_pages"] = []
     d["checkpoint_frontiers"] = []
@@ -451,7 +474,7 @@ def parse_serve_log(path, skip_lines=0):
                     if "ckpt_valid=1" in line: d["spill_ckpt_ok"] += 1
                     elif "ckpt_valid=0" in line: d["spill_ckpt_missing"] += 1
                 if "[safety-spill] FAIL" in line: d["spill_fail"] += 1
-                if "[safety-spill] multi-extent OK" in line or "[safety-spill] backend multi-extent OK" in line: d["multi_extent_ok"] += 1
+                if "[safety-spill] compact:" in line: d["compact"] += 1
                 if "WORKER CRASH" in line: d["worker_crash"] += 1
                 if "std::bad_alloc" in line: d["bad_alloc"] += 1
                 if "[capture] skip zero-prefill" in line: d["capture_skip"] += 1
@@ -509,6 +532,75 @@ def parse_serve_log(path, skip_lines=0):
                     d["kv_copy_skip"] += 1
                 if "[materialize] HostOnly restore failed" in line:
                     d["hostonly_restore_fail"] += 1
+                # State-lease leak: a state image whose release was refused
+                # (checkpoint_references != 0 at clear time). Two sub-cases:
+                #   shared_refs >= 1 -> LEGITIMATE retention: the image backs
+                #     a live shared prefix (publish_active_capture retains a
+                #     ref on the active state; released only on shared-prefix
+                #     eviction). The "LEAK" log is a false alarm here.
+                #   shared_refs == 0  -> TRUE orphan: a reference with no
+                #     owner — an unbalanced retain/release pair.
+                # Two labels: 'LEAK (orphan)' = shared_refs=0 (a real bug);
+                # 'retained (shared prefix)' = shared_refs>=1 (legitimate).
+                if "[state-lease] LEAK (orphan)" in line:
+                    d["state_lease_leak"] += 1
+                    d["state_lease_orphan"] += 1
+                elif "[state-lease] retained (shared prefix)" in line:
+                    d["state_lease_leak"] += 1
+                # State relief: freeing device state slots for an H2D restore —
+                # demoting a DeviceOnly checkpoint to host, or dropping the
+                # redundant device replica of a dual-resident checkpoint (its
+                # host half is current). Presence proves the pool-saturation +
+                # restore path was exercised.
+                if "[relief] demoted" in line or "[relief] freed" in line:
+                    d["relief_demote"] += 1
+                    if " dropped " in line and "dropped 0 dual" not in line:
+                        d["relief_dual_drop"] += 1
+                # P1.5(d) Increment 2: occupancy-aware admission — a head whose
+                # device-KV demand cannot fit is kept in the visible queue
+                # (position/wait in /stats) instead of a silent 120s defer;
+                # relief-while-queued works toward it; the 120s deadline
+                # aborts a demand that never fits.
+                if "KV occupancy block: request" in line:
+                    d["kv_occupancy_block"] += 1
+                if "[relief-kv] queued demand (request" in line:
+                    d["queued_kv_relief"] += 1
+                if "queued KV block deadline exceeded" in line:
+                    d["queued_kv_deadline"] += 1
+                # P4.2: the pressure planner's expansion-capacity limit — a
+                # known self-recovering class (triaged 2026-09-16), not a
+                # saturated-restore failure.
+                if "prepared pressure expansion exceeds the target arena" in line:
+                    d["pressure_expansion_fail"] += 1
+                # P2.4 Increment 1: the plan was re-baselined to the
+                # materialized unit after relief left a plan-optional state
+                # image unrealized — the request succeeded (no 500).
+                if "[replan] state entitlement re-baselined" in line:
+                    d["state_replan"] += 1
+                # The strict check still rejects a core-incomplete mismatch.
+                if "[entitlement] MISMATCH" in line:
+                    d["entitlement_mismatch"] += 1
+                # P2.4 exit criterion: a materialization whose selected state
+                # image has no replica anywhere (true last-replica loss) —
+                # the request degrades to root prefill, so this is a WARN,
+                # not a hard FAIL (the unit invariant is enforced upstream).
+                if "no resident state" in line:
+                    d["no_resident_state"] += 1
+                # P2.4 Increment 1: the slot release found the unit missing
+                # from the net and spilled the complete unit before its state
+                # could lose its last copy (the unit-invariant backstop).
+                if "[spill-before-loss]" in line:
+                    d["spill_before_loss"] += 1
+                # P2.4 Increment 2: the release path handed the store's host
+                # replica to the net entry (move-not-copy) — the net is the
+                # unit's host home. Presence proves the relinquish path fired.
+                if "state relinquished (move)" in line:
+                    d["state_relinquish"] += 1
+                # The adopt-path error that followed the leak in prod: the
+                # root-prefill fallback publishes no source, but the admission
+                # claim still expects one.
+                if "] error materialization private source result is missing" in line:
+                    d["missing_source_result"] += 1
     except OSError:
         pass
     return d
@@ -532,6 +624,8 @@ def evaluate(phase_name, sessions, stats0, stats1, log, expect_trash=False):
         v.append(f"FAIL: {log['bad_alloc']} std::bad_alloc — OOM was not prevented")
     if log.get("hostonly_restore_fail", 0) > 0:
         v.append(f"WARN: {log['hostonly_restore_fail']} HostOnly restore failures (aborted to root prefill)")
+    if log.get("no_resident_state", 0) > 0:
+        v.append(f"WARN: {log['no_resident_state']} 'no resident state' losses (P2.4 exit criterion is 0; degraded to root prefill)")
     if log.get("kv_not_resident_no_device", 0) > 0:
         v.append(f"WARN: {log['kv_not_resident_no_device']} pages with no device replica (demoted to host)")
     if log.get("mixed_copy_ok", 0) > 0:
@@ -547,16 +641,21 @@ def evaluate(phase_name, sessions, stats0, stats1, log, expect_trash=False):
     if log["bad_alloc"] > 0 and phase_name in ("trash", "mixed", "concurrent", "tool-calling"):
         v.append(f"PASS: {log['bad_alloc']} std::bad_alloc caught and recovered (extreme pressure handled)")
 
-    # Pressure (skip for single-session phases)
-    pressure = evicted > 0 or degraded > 0
-    if phase_name not in ("checkpoint-advance", "tool-calling", "responses-tools", "reasoning-effort", "concurrent", "thinking-sig", "demotion"):
+    # Pressure (skip for single-session phases and state-pool phases)
+    # P2.4 Slice 3 Inc 2 (2026-09-17): device-KV pressure is relieved by
+    # demote (degraded), whole-unit eviction (evicted), or a net spill
+    # (spill_ok / safety-net restore) — per-replica demotes are retired by
+    # default, so count the net-spill evidence too, not only /stats.
+    pressure = evicted > 0 or degraded > 0 or restores > 0 or log.get("spill_ok", 0) > 0
+    if phase_name not in ("checkpoint-advance", "tool-calling", "responses-tools", "reasoning-effort", "concurrent", "thinking-sig", "demotion", "state-saturation", "queued-relief"):
         if not pressure and not expect_trash:
             v.append("FAIL: no KV pressure")
         if pressure:
-            v.append(f"PASS: pressure (evicted={evicted}, degraded={degraded})")
+            v.append(f"PASS: pressure (evicted={evicted}, degraded={degraded}, "
+                     f"spill_ok={log.get('spill_ok', 0)}, restores={restores})")
 
-    # Cache reuse (skip for single-session phases)
-    if phase_name not in ("checkpoint-advance", "tool-calling", "responses-tools", "reasoning-effort", "concurrent", "thinking-sig", "demotion"):
+    # Cache reuse (skip for single-session phases and state-pool phases)
+    if phase_name not in ("checkpoint-advance", "tool-calling", "responses-tools", "reasoning-effort", "concurrent", "thinking-sig", "demotion", "state-saturation", "queued-relief"):
         if reused > 0:
             v.append(f"PASS: cache reuse ({reused} tokens)")
         elif not expect_trash:
@@ -574,8 +673,8 @@ def evaluate(phase_name, sessions, stats0, stats1, log, expect_trash=False):
         v.append(f"FAIL: {incomplete} restores started but not completed (excluding {log['restore_failed']} failures)")
     if log["max_net_entries"] >= 3 and log["restore_completed"] > 2:
         v.append(f"PASS: net accumulated (max={log['max_net_entries']})")
-    if log["multi_extent_ok"] > 0:
-        v.append(f"PASS: {log['multi_extent_ok']} scatter-gather allocations")
+    if log["compact"] > 0:
+        v.append(f"PASS: {log['compact']} arena compactions (fragmentation repaired)")
     if log["capture_skip"] > 0 or log["restore_skip"] > 0:
         v.append(f"PASS: {log['capture_skip'] + log['restore_skip']} capture skips (no crash)")
     if log["refind_hit"] > 0:
@@ -723,6 +822,8 @@ def evaluate(phase_name, sessions, stats0, stats1, log, expect_trash=False):
     # But restore without demotion would be unexpected
     if log["checkpoint_restored"] > 0 and log["checkpoint_demoted"] == 0:
         v.append(f"WARN: {log['checkpoint_restored']} restores without demotions (unexpected)")
+    if log["relief_dual_drop"] > 0:
+        v.append(f"PASS: {log['relief_dual_drop']} dual device-replica drops relieved a saturated state pool")
 
     # Concurrent sessions (concurrent phase)
     if phase_name == "concurrent":
@@ -824,7 +925,11 @@ def main():
     p.add_argument("--model", default="qwen3.8-27b")
     p.add_argument("--max-output-tokens", type=int, default=48)
     p.add_argument("--serve-log", default="/home/zenz/ninfer-serve.log")
+    p.add_argument("--request-log", default="/home/zenz/ninfer-requests.jsonl",
+                   help="JSONL request log with per-request materialization diagnostics")
     p.add_argument("--timeout", type=int, default=120)
+    p.add_argument("--start-phase", type=int, default=1,
+                   help="run phases N..13 (for split runs across separate e2e server windows)")
     args = p.parse_args()
 
     # Verify we're running against the test server, not production.
@@ -845,9 +950,9 @@ def main():
         print(f"ERROR: cannot read server config from /stats (host_kv={host_kv}, kv_pages={kv_pages}). "
               f"Is the server running and responsive?")
         return 1
-    if host_kv > 8 * 1024 * 1024 * 1024:
+    if host_kv > 16 * 1024 * 1024 * 1024:
         print(f"ERROR: host-kv capacity is {host_kv / 1024**3:.1f} GiB — this looks like the "
-              f"production server. The e2e tests require the test server (4 GiB host-kv, "
+              f"production server. The e2e tests require the test server (12 GiB host-kv, "
               f"32k context, 64k KV capacity). Start it with: tools/e2e/ninfer-start-test.sh")
         return 1
     if kv_pages > 4096:
@@ -857,8 +962,39 @@ def main():
         return 1
     print(f"Server config OK: host-kv={host_kv / 1024**3:.1f} GiB, KV pages={kv_pages}")
 
-    all_verdicts = []
+    # Prod is stopped during the swap, so every request-log line written from
+    # here on belongs to the e2e server. Mark the offset so the planner-latency
+    # check (below) reads only this run's materialization diagnostics.
+    args._request_log_start = count_log_lines(args.request_log)
 
+    all_verdicts = []
+    phases = (phase_1, phase_2, phase_3, phase_4, phase_5, phase_6, phase_7,
+              phase_8, phase_9, phase_10, phase_11, phase_12, phase_13, phase_14)
+    for i, phase_fn in enumerate(phases, start=1):
+        if i < args.start_phase:
+            print(f"=== Phase {i}: skipped (--start-phase {args.start_phase}) ===")
+            continue
+        result = phase_fn(args)
+        if result is None:
+            return 1  # phase aborted
+        all_verdicts.extend(result)
+        for pn, v in result:
+            print(f"  [{pn}] {v}")
+
+    # Planner-latency gate: the admission planner must converge fast. The
+    # 2026-09-17 fix seeds with a feasible cover and caps the beam search at
+    # 30ms, so searches stop at model_optimal/queue_exhausted/
+    # value_of_next_expansion/time_budget instead of enumerating to the 4096-
+    # target budget (expansion_capacity/target_budget).
+    planner_verdicts = phase_planner_latency(args)
+    all_verdicts.extend(planner_verdicts)
+    for pn, v in planner_verdicts:
+        print(f"  [{pn}] {v}")
+    return print_summary(all_verdicts)
+
+
+def phase_1(args):
+    all_verdicts = []
     # Phase 1: pressure — 4 sessions, basic safety net
     print("\n=== Phase 1: pressure (4 sessions, 8 rounds) ===")
     log_off = count_log_lines(args.serve_log)
@@ -869,12 +1005,16 @@ def main():
         errors = run_round(s1, r, args.timeout)
         if errors:
             for n, e in errors: print(f"  ERROR {n}: {e}")
-            print("ABORT: phase 1 failed"); return 1
+            print("ABORT: phase 1 failed"); return None
     stats1 = get_stats(args)
     log1 = parse_serve_log(args.serve_log, log_off)
     for v in evaluate("pressure", s1, stats0, stats1, log1):
         all_verdicts.append(("pressure", v))
+    return all_verdicts
 
+
+def phase_2(args):
+    all_verdicts = []
     # Phase 2: mixed — 1 big + 3 small, eviction order
     print("\n=== Phase 2: mixed (1 BIG + 3 small, 10 rounds) ===")
     log_off = count_log_lines(args.serve_log)
@@ -903,7 +1043,11 @@ def main():
     log2 = parse_serve_log(args.serve_log, log_off)
     for v in evaluate("mixed", s2, stats0, stats1, log2):
         all_verdicts.append(("mixed", v))
+    return all_verdicts
 
+
+def phase_3(args):
+    all_verdicts = []
     # Phase 3: trash — 10 sessions, graceful degradation (no crash)
     print("\n=== Phase 3: trash (10 sessions, 6 rounds) ===")
     log_off = count_log_lines(args.serve_log)
@@ -928,7 +1072,11 @@ def main():
     log3 = parse_serve_log(args.serve_log, log_off)
     for v in evaluate("trash", s3, stats0, stats1, log3, expect_trash=True):
         all_verdicts.append(("trash", v))
+    return all_verdicts
 
+
+def phase_4(args):
+    all_verdicts = []
     # Phase 4: thinking — session-key fallback with rewrite checkpoint
     print("\n=== Phase 4: thinking (3 sessions, 6 rounds, reasoning mode) ===")
     log_off = count_log_lines(args.serve_log)
@@ -996,12 +1144,21 @@ def main():
         cold = sum(1 for s in s4 for t in s.turns if t["turn"] > 1 and t["wall_s"] > 60)
         if cold > 0:
             all_verdicts.append(("thinking", f"WARN: {cold} cold-starts in thinking mode (session-key fallback may not have fired)"))
+    return all_verdicts
 
+
+def phase_5(args):
+    all_verdicts = []
     # Phase 5: checkpoint-advance — single session, verify frontier advances
     print("\n=== Phase 5: checkpoint-advance (1 session, 8 turns) ===")
     log_off = count_log_lines(args.serve_log)
     stats0 = get_stats(args)
     s5 = [Session("CKPT", 12000, 2000, args)]
+    # Force reasoning (rewrite checkpoints) like phase 4 so the
+    # checkpoint-advance assertions don't flap on model mood.
+    s5[0].args = type(args)(**vars(args))
+    s5[0].args.thinking_mode = True
+    s5[0].args.max_output_tokens = 128
     for r in range(1, 9):
         print(f"Round {r}:")
         errors = run_round(s5, r, args.timeout)
@@ -1047,7 +1204,11 @@ def main():
         all_verdicts.append(("checkpoint-advance", f"PASS: 0 cold-starts across {len(s5[0].turns)} turns"))
     elif cold > 0:
         all_verdicts.append(("checkpoint-advance", f"FAIL: {cold} cold-starts — checkpoint not reused"))
+    return all_verdicts
 
+
+def phase_6(args):
+    all_verdicts = []
     # Phase 6: tool-calling — multi-turn with tools, simulating Claude Code
     print("\n=== Phase 6: tool-calling (1 session, 6 turns, tools) ===")
     log_off = count_log_lines(args.serve_log)
@@ -1056,6 +1217,9 @@ def main():
     # Override max_output_tokens so the model has room to generate tool calls
     s6[0].args = type(args)(**vars(args))
     s6[0].args.max_output_tokens = 256
+    # Force reasoning (rewrite checkpoints) like phase 4 so the
+    # checkpoint assertions don't flap on model mood.
+    s6[0].args.thinking_mode = True
     for r in range(1, 7):
         print(f"Round {r}:")
         errors = run_round(s6, r, args.timeout)
@@ -1075,7 +1239,11 @@ def main():
         all_verdicts.append(("tool-calling", f"PASS: 0 cold-starts across {len(s6[0].turns)} tool-call turns"))
     elif cold > 0:
         all_verdicts.append(("tool-calling", f"WARN: {cold} cold-starts during tool-calling"))
+    return all_verdicts
 
+
+def phase_7(args):
+    all_verdicts = []
     # Phase 7: responses-tools — Responses API tool-calling with checkpoint reuse
     print("\n=== Phase 7: responses-tools (1 session, 5 turns, Responses API) ===")
     log_off = count_log_lines(args.serve_log)
@@ -1094,7 +1262,7 @@ def main():
             errors = run_round(s7, r, args.timeout)
             if errors:
                 for n, e in errors: print(f"  ERROR {n}: {e}")
-                print("ABORT: phase 7 failed"); return 1
+                print("ABORT: phase 7 failed"); return None
     stats1 = get_stats(args)
     log7 = parse_serve_log(args.serve_log, log_off)
     for v in evaluate("responses-tools", s7, stats0, stats1, log7):
@@ -1104,7 +1272,11 @@ def main():
         all_verdicts.append(("responses-tools", f"PASS: 0 cold-starts across {len(s7[0].turns)} Responses API turns"))
     elif cold > 0:
         all_verdicts.append(("responses-tools", f"WARN: {cold} cold-starts in Responses API"))
+    return all_verdicts
 
+
+def phase_8(args):
+    all_verdicts = []
     # Phase 8: reasoning-effort — verify tier mapping (high, minimal, max, low, medium)
     print("\n=== Phase 8: reasoning-effort (5 effort levels) ===")
     log_off = count_log_lines(args.serve_log)
@@ -1115,7 +1287,11 @@ def main():
     log8 = parse_serve_log(args.serve_log, log_off)
     for v in evaluate("reasoning-effort", [tester], stats0, stats1, log8):
         all_verdicts.append(("reasoning-effort", v))
+    return all_verdicts
 
+
+def phase_9(args):
+    all_verdicts = []
     # Phase 9: concurrent — 2 sessions + title-gen, verify no cross-session destruction
     print("\n=== Phase 9: concurrent (2 sessions + title-gen, 6 rounds) ===")
     log_off = count_log_lines(args.serve_log)
@@ -1150,7 +1326,11 @@ def main():
     log9 = parse_serve_log(args.serve_log, log_off)
     for v in evaluate("concurrent", all_sessions_9, stats0, stats1, log9):
         all_verdicts.append(("concurrent", v))
+    return all_verdicts
 
+
+def phase_10(args):
+    all_verdicts = []
     # Phase 10: thinking-sig — verify signature skip when preserve_thinking=false
     print("\n=== Phase 10: thinking-sig (4 requests) ===")
     log_off = count_log_lines(args.serve_log)
@@ -1161,7 +1341,11 @@ def main():
     log10 = parse_serve_log(args.serve_log, log_off)
     for v in evaluate("thinking-sig", [sig_tester], stats0, stats1, log10):
         all_verdicts.append(("thinking-sig", v))
+    return all_verdicts
 
+
+def phase_11(args):
+    all_verdicts = []
     # Phase 11: demotion — 3 sessions, large prompts, verify checkpoint demotion
     print("\n=== Phase 11: demotion (3 sessions, 5 rounds, verify host demotion) ===")
     log_off = count_log_lines(args.serve_log)
@@ -1191,7 +1375,310 @@ def main():
         all_verdicts.append(("demotion", f"PASS: 0 cold-starts across {sum(len(s.turns) for s in s11)} turns"))
     elif cold > 0:
         all_verdicts.append(("demotion", f"WARN: {cold} cold-starts — demotion may not have prevented all re-prefills"))
+    return all_verdicts
 
+
+def phase_12(args):
+    all_verdicts = []
+    # Phase 12: state-lease — rewrite-checkpoint recycle pressure.
+    # Reproduces the 2026-09-14 production wedge: forced-thinking sessions fill
+    # the device state pool, so captures fork + recycle checkpoint slots. The
+    # buggy recycle-capture publish path dropped the rewrite handle without
+    # releasing its checkpoint reference, so every fork+recycle cycle leaked a
+    # state slot (release refused -> orphaned slot -> pool exhaustion ->
+    # "no resident state" -> "private source result is missing" request errors
+    # -> client retry loop).
+    # Requires the test server with --device-state-slots 5 (8 total: 3 cache +
+    # 5 active): with the old 6-slot total the pool was exactly full under 4
+    # thinking sessions, forks failed, and the recycle-with-fork path was never
+    # exercised — which is how the bug shipped.
+    print("\n=== Phase 12: state-lease (4 thinking sessions, 5 rounds, rewrite-recycle pressure) ===")
+    log_off = count_log_lines(args.serve_log)
+    stats0 = get_stats(args)
+    s12 = [Session(f"SL{i}", 10000, 1500, args) for i in range(4)]
+    for s in s12:
+        s.args = type(args)(**vars(args))
+        s.args.max_output_tokens = 128
+    # Force reasoning (rewrite checkpoints) like phase 4.
+    original_turn = Session.turn
+    def thinking_turn(self, index):
+        question = f"Question {index}: Consider the paragraph about '{self.rng.choice(WORDS)}'. Answer briefly."
+        new_text = filler(self.rng, self.turn_tokens) + "\n\n" + question
+        if index == 1:
+            new_text = self.doc + "\n\n---\n\n" + new_text
+        payload = {
+            "model": self.args.model,
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": new_text}]}],
+            "instructions": "You are a concise assistant.",
+            "max_output_tokens": self.args.max_output_tokens,
+            "store": True,
+            "stream": False,
+            "reasoning": {"effort": "low"},
+        }
+        if self.response_id:
+            payload["previous_response_id"] = self.response_id
+        t0 = time.monotonic()
+        out = json.load(urllib.request.urlopen(urllib.request.Request(
+            f"http://{self.args.host}:{self.args.port}/v1/responses",
+            data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"},
+            method="POST"), timeout=self.args.timeout))
+        wall = time.monotonic() - t0
+        usage = out.get("usage", {}) or {}
+        self.response_id = out.get("id", self.response_id)
+        record = {"session": self.name, "turn": index, "wall_s": round(wall, 2),
+                  "input_tokens": usage.get("input_tokens"), "output_tokens": usage.get("output_tokens")}
+        self.turns.append(record)
+        print(f"  {self.name} t{index}: wall={record['wall_s']:.1f}s prompt={record['input_tokens']} out={record['output_tokens']}")
+        return record
+    Session.turn = thinking_turn
+    for r in range(1, 6):
+        print(f"Round {r}:")
+        errors = run_round(s12, r, args.timeout)
+        if errors:
+            for n, e in errors: print(f"  ERROR {n}: {e}")
+            print("  Retrying failed sessions...")
+            time.sleep(3)
+            failed = [s for s in s12 if s.name in [n for n, _ in errors]]
+            errors2 = run_round(failed, r, args.timeout)
+            if errors2:
+                for n, e in errors2: print(f"  ERROR {n}: {e}")
+            continue
+    Session.turn = original_turn
+    stats1 = get_stats(args)
+    log12 = parse_serve_log(args.serve_log, log_off)
+
+    # The leak signatures. A refused release is only a TRUE bug when the
+    # image has no owner (shared_refs == 0). shared_refs >= 1 is legitimate
+    # retention (the image backs a live shared prefix) and is expected.
+    if log12["state_lease_orphan"] > 0:
+        all_verdicts.append(("state-lease", f"FAIL: {log12['state_lease_orphan']} orphaned state image(s) (shared_refs=0) — unbalanced checkpoint ref"))
+    else:
+        all_verdicts.append(("state-lease", "PASS: zero orphaned state images (no shared_refs=0 refusals)"))
+    if log12["missing_source_result"] > 0:
+        all_verdicts.append(("state-lease", f"FAIL: {log12['missing_source_result']} 'private source result is missing' request error(s)"))
+    else:
+        all_verdicts.append(("state-lease", "PASS: zero 'private source result is missing' errors"))
+    # Refused releases that are LEGITIMATE (shared-prefix retention) are
+    # expected under pressure; report them as info, not failure.
+    if log12["state_lease_leak"] > 0:
+        all_verdicts.append(("state-lease", f"INFO: {log12['state_lease_leak']} refused release(s), {log12['state_lease_leak'] - log12['state_lease_orphan']} legitimate (shared-prefix retention)"))
+    # Orphaned state slots surface in /stats as refused releases.
+    h0 = (stats0.get("pressure", {}) or {}).get("host_slot_release_failures", 0)
+    h1 = (stats1.get("pressure", {}) or {}).get("host_slot_release_failures", 0)
+    if h1 > h0:
+        all_verdicts.append(("state-lease", f"WARN: host_slot_release_failures grew by {h1 - h0} (includes legitimate shared-prefix retention)"))
+    else:
+        all_verdicts.append(("state-lease", "PASS: host_slot_release_failures unchanged"))
+    # Vacuity guards: the pressure path must have actually been exercised.
+    captured = log12["spill_ckpt_ok"]
+    restored = log12["checkpoint_restored"] + log12["rewrite_prefix_hit"]
+    demoted = log12["checkpoint_demoted"]
+    if captured < 4:
+        all_verdicts.append(("state-lease", f"WARN: only {captured} checkpoint captures (expected >= 4) — state pressure may not have been reached"))
+    else:
+        all_verdicts.append(("state-lease", f"PASS: {captured} checkpoint captures (rewrite-recycle precondition)"))
+    if restored == 0 and demoted == 0 and log12["relief_demote"] == 0:
+        all_verdicts.append(("state-lease", "WARN: no checkpoint demote/restore/relief observed — state pool never pressurized (H2D-restore path may be unexercised)"))
+    else:
+        all_verdicts.append(("state-lease", f"PASS: state pool pressurized (demoted={demoted}, restored={restored}, relief={log12['relief_demote']})"))
+    return all_verdicts
+
+
+def phase_13(args):
+    all_verdicts = []
+    # Phase 13: state-saturation — the device state pool at 100% with a
+    # HostOnly checkpoint that must be restored (H2D) while it stays full.
+    # This is the exact production class that 500ed on 2026-09-16: the
+    # rewrite-restore H2D takes a NEW device slot, and the emergency relief
+    # must free one (DeviceOnly demotion, or dropping the redundant device
+    # replica of a dual-resident checkpoint) or the materialization throws
+    # std::bad_alloc. Phases 11/12 pressurize the pool but do not saturate
+    # it (relief=0 in a full run), so this phase exists to force the
+    # saturated-restore path: more thinking sessions (5) than decode lanes
+    # (3), so the working set (endpoint + fork-write + rewrite checkpoint per
+    # active session) exceeds the 8-slot pool (3 cache + 5 active).
+    print("\n=== Phase 13: state-saturation (6 tool-calling sessions, 8 rounds, pool at 100%) ===")
+    log_off = count_log_lines(args.serve_log)
+    stats0 = get_stats(args)
+    # Tool-calling sessions (the production shape): every tool-call turn is a
+    # rewrite boundary, so turns capture rewrite checkpoints — the images the
+    # saturated H2D-restore relief path operates on. Plain thinking turns
+    # capture almost none (ckpt=0), which leaves the pool full of endpoints
+    # only and never triggers the relief path.
+    s13 = [ChatSession(f"SS{i}", 10000, 1500, args) for i in range(6)]
+    for s in s13:
+        s.args = type(args)(**vars(args))
+        s.args.max_output_tokens = 512
+    # PHASE13_ROUNDS (env, default 8): reduced-round A/B variant — the full
+    # 8-round phase exceeds the 10-minute foreground swap limit when the
+    # pressure relief does D2H work (P2.4 Slice 3 Inc 3, 2026-09-17).
+    rounds = int(os.environ.get("PHASE13_ROUNDS", "8"))
+    for r in range(1, rounds + 1):
+        print(f"Round {r}:")
+        errors = run_round(s13, r, args.timeout)
+        if errors:
+            for n, e in errors: print(f"  ERROR {n}: {e}")
+            print("  Retrying failed sessions...")
+            time.sleep(3)
+            failed = [s for s in s13 if s.name in [n for n, _ in errors]]
+            errors2 = run_round(failed, r, args.timeout)
+            if errors2:
+                for n, e in errors2: print(f"  ERROR {n}: {e}")
+            continue
+    stats1 = get_stats(args)
+    log13 = parse_serve_log(args.serve_log, log_off)
+    for v in evaluate("state-saturation", s13, stats0, stats1, log13):
+        all_verdicts.append(("state-saturation", v))
+    # Phase-specific gates: a saturated restore must never 500. Worker
+    # recoveries from the P4.2 pressure-expansion class are known and
+    # self-recovering (tracked in plan.md) — they are not saturated-restore
+    # failures.
+    other_recoveries = log13["worker_recover"] - log13["pressure_expansion_fail"]
+    if other_recoveries > 0:
+        all_verdicts.append(("state-saturation", f"FAIL: {other_recoveries} worker recoveries — saturated restore failed (relief did not free a slot)"))
+    else:
+        all_verdicts.append(("state-saturation", "PASS: zero worker recoveries (saturated restores resolved)"))
+    if log13["pressure_expansion_fail"] > 0:
+        all_verdicts.append(("state-saturation", f"WARN: {log13['pressure_expansion_fail']} pressure-expansion recoveries (P4.2 known class, self-recovering)"))
+    # Occupancy readout: did the pool actually reach its ceiling?
+    p1 = (stats1.get("pressure", {}) or {})
+    cap = p1.get("checkpoint_device_state_slots", 0)
+    occ = p1.get("device_state_occupied_slots", 0)
+    if cap and occ >= cap:
+        all_verdicts.append(("state-saturation", f"PASS: device state pool saturated ({occ}/{cap} at phase end)"))
+    else:
+        all_verdicts.append(("state-saturation", f"WARN: device state pool not saturated ({occ}/{cap} at phase end)"))
+    if log13["relief_demote"] > 0:
+        all_verdicts.append(("state-saturation", f"PASS: relief freed device state slots {log13['relief_demote']}x (dual drops: {log13['relief_dual_drop']})"))
+    else:
+        all_verdicts.append(("state-saturation", "WARN: relief never fired — pool may not have saturated (non-deterministic; the no-OOM gate still holds)"))
+    if log13["state_replan"] > 0:
+        all_verdicts.append(("state-saturation", f"PASS: {log13['state_replan']} entitlement re-plans (plan re-baselined after relief; no 500)"))
+    if log13["entitlement_mismatch"] > 0:
+        all_verdicts.append(("state-saturation", f"FAIL: {log13['entitlement_mismatch']} core-incomplete entitlement mismatches (strict check fired)"))
+    if log13["spill_before_loss"] > 0:
+        all_verdicts.append(("state-saturation", f"PASS: {log13['spill_before_loss']} spill-before-loss backstops fired (unit retained in net before its state lost its last copy)"))
+    if log13["state_relinquish"] > 0:
+        all_verdicts.append(("state-saturation", f"PASS: {log13['state_relinquish']} state images relinquished to the net (move-not-copy; the net is the unit's host home)"))
+    return all_verdicts
+
+
+def phase_14(args):
+    all_verdicts = []
+    # Phase 14: queued-relief — P1.5(d) Increment 2.
+    # 4 sessions x 24k-token prompts against the 64k-token device-KV pool:
+    # only ~2 fit in the pool at once, so the overflowing requests cannot be
+    # admitted without exceeding the pool. Pre-Increment-2 they would be
+    # admitted into a silent 120s fit-gate defer; now the engine keeps them
+    # in the visible queue (position/wait in /stats) and runs
+    # relief-while-queued toward their demand (15s stall cadence, 120s
+    # deadline).
+    print("\n=== Phase 14: queued-relief (4 sessions, 3 rounds, 24k prompts vs 64k device KV) ===")
+    log_off = count_log_lines(args.serve_log)
+    stats0 = get_stats(args)
+    s14 = [Session(f"QR{i}", 24000, 1000, args) for i in range(4)]
+    for s in s14:
+        s.args = type(args)(**vars(args))
+        s.args.max_output_tokens = 512
+    for r in range(1, 4):
+        print(f"Round {r}:")
+        errors = run_round(s14, r, args.timeout)
+        if errors:
+            for n, e in errors: print(f"  ERROR {n}: {e}")
+            print("  Retrying failed sessions...")
+            time.sleep(3)
+            failed = [s for s in s14 if s.name in [n for n, _ in errors]]
+            errors2 = run_round(failed, r, args.timeout)
+            if errors2:
+                for n, e in errors2: print(f"  ERROR {n}: {e}")
+            continue
+    stats1 = get_stats(args)
+    log14 = parse_serve_log(args.serve_log, log_off)
+    for v in evaluate("queued-relief", s14, stats0, stats1, log14):
+        all_verdicts.append(("queued-relief", v))
+    if log14["kv_occupancy_block"] > 0:
+        all_verdicts.append(("queued-relief",
+            f"PASS: {log14['kv_occupancy_block']} KV occupancy block(s) — unfitted head(s) kept in the visible queue instead of a silent 120s defer"))
+    else:
+        all_verdicts.append(("queued-relief",
+            "WARN: no KV occupancy block — the device-KV gap never blocked a head (non-deterministic; path unexercised)"))
+    if log14["queued_kv_relief"] > 0:
+        all_verdicts.append(("queued-relief",
+            f"PASS: relief-while-queued fired {log14['queued_kv_relief']}x (freed pages toward the blocked demand)"))
+    elif log14["kv_occupancy_block"] > 0:
+        all_verdicts.append(("queued-relief",
+            "WARN: occupancy block fired but relief never ran (gap closed by lane drain before the 15s stall)"))
+    if log14["queued_kv_deadline"] > 0:
+        all_verdicts.append(("queued-relief",
+            f"WARN: {log14['queued_kv_deadline']} request(s) hit the 120s queued-KV deadline (structural over-commit — the gap could not be closed)"))
+    else:
+        all_verdicts.append(("queued-relief", "PASS: no queued-KV deadline aborts"))
+    if log14["bad_alloc"] > 0 or log14["worker_recover"] > 0:
+        all_verdicts.append(("queued-relief",
+            f"FAIL: {log14['bad_alloc']} bad_alloc / {log14['worker_recover']} worker recoveries under queueing"))
+    else:
+        all_verdicts.append(("queued-relief", "PASS: zero bad_alloc / worker recoveries under queueing"))
+    return all_verdicts
+
+
+def phase_planner_latency(args):
+    """Admission-planner latency gate.
+
+    The pressure planner is a beam search over parked catalog units. Before
+    the 2026-09-17 convergence fix it enumerated to the 4096-target budget
+    (stop_reason expansion_capacity/target_budget, ~3.2s per search) whenever
+    the evict-all seed incumbent was hard to beat. The fix seeds with a
+    feasible cover (guided closure / greedy eviction cover), stops expanding
+    covered targets, prunes infeasible branches, and caps the search at
+    30ms (time_budget). Assert the search no longer enumerates and stays fast.
+    """
+    all_verdicts = []
+    start = getattr(args, "_request_log_start", 0)
+    rows = []
+    try:
+        with open(args.request_log, "r", errors="replace") as f:
+            for i, line in enumerate(f):
+                if i < start:
+                    continue
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                m = d.get("materialization")
+                if m:
+                    rows.append(m)
+    except OSError:
+        all_verdicts.append(("planner-latency", "WARN: request log unreadable — planner check skipped"))
+        return all_verdicts
+    if not rows:
+        all_verdicts.append(("planner-latency", "WARN: no materialization diagnostics in window — planner check skipped"))
+        return all_verdicts
+
+    search_ns = sorted(m.get("search_elapsed_ns", 0) for m in rows)
+    p95 = search_ns[min(len(search_ns) - 1, int(len(search_ns) * 0.95))]
+    budget_stops = sum(1 for m in rows if m.get("stop_reason") in ("expansion_capacity", "target_budget"))
+    stops = {}
+    for m in rows:
+        s = m.get("stop_reason", "?")
+        stops[s] = stops.get(s, 0) + 1
+    detail = (f"n={len(rows)} p95_search={p95 / 1e6:.1f}ms max_search={search_ns[-1] / 1e6:.1f}ms "
+              f"budget_stops={budget_stops} stops={stops}")
+    if budget_stops > 0:
+        all_verdicts.append(("planner-latency",
+                             f"FAIL: {budget_stops} searches enumerated to the target budget "
+                             f"(expansion_capacity/target_budget) — convergence regression. {detail}"))
+    elif p95 > 50 * 1000 * 1000:
+        all_verdicts.append(("planner-latency",
+                             f"FAIL: p95 search {p95 / 1e6:.1f}ms exceeds the 50ms budget. {detail}"))
+    else:
+        all_verdicts.append(("planner-latency", f"PASS: planner converged — {detail}"))
+    return all_verdicts
+
+
+def print_summary(all_verdicts):
     # Summary
     print("\n=== FINAL VERDICTS ===")
     for pn, v in all_verdicts:

@@ -15,6 +15,15 @@ json arena(const ninfer::ArenaMemorySummary& a) {
 } // namespace
 
 std::string format_stats_json(const StatsSnapshot& s) {
+    // P1.5(d): visible queue — the first kQueueReportCap waiting requests, in
+    // FIFO order, with their wait so far.
+    json queue_entries = json::array();
+    for (std::uint32_t i = 0; i < s.scheduler.queue_report_count; ++i) {
+        const auto& e = s.scheduler.queue_report[i];
+        queue_entries.push_back(json{{"request_id", e.request_id},
+                                     {"position", e.position},
+                                     {"wait_seconds", e.wait_seconds}});
+    }
     const json out = json{
         {"schema", "ninfer_serve_stats"},
         {"schema_version", 1},
@@ -27,6 +36,9 @@ std::string format_stats_json(const StatsSnapshot& s) {
               {"materializing", s.scheduler.materializing_requests},
               {"capture_pending", s.scheduler.capture_pending_requests},
               {"terminal_pending", s.scheduler.terminal_pending_requests}}},
+        {"queue",
+         json{{"depth", s.scheduler.waiting_requests},
+              {"entries", queue_entries}}},
         {"counters",
          json{{"computed_prefill_tokens", s.scheduler.computed_prefill_tokens},
               {"committed_decode_tokens", s.scheduler.committed_decode_tokens},
@@ -71,7 +83,27 @@ std::string format_stats_json(const StatsSnapshot& s) {
               {"admission_safety_net_restores", s.scheduler.admission_safety_net_restores},
               {"device_main_kv_occupied_pages", s.scheduler.device_main_kv_occupied_pages},
               {"device_backend_kv_occupied_pages", s.scheduler.device_backend_kv_occupied_pages},
-              {"device_state_occupied_slots", s.scheduler.device_state_occupied_slots}}},
+              {"device_state_occupied_slots", s.scheduler.device_state_occupied_slots},
+              {"materialize_state_slot_alloc_failures", s.scheduler.materialize_state_slot_alloc_failures},
+              {"materialize_dual_device_replica_drops", s.scheduler.materialize_dual_device_replica_drops},
+              {"materialize_kv_page_alloc_failures", s.scheduler.materialize_kv_page_alloc_failures},
+              {"materialize_kv_page_alloc_failures_main", s.scheduler.materialize_kv_page_alloc_failures_main},
+              {"materialize_kv_page_alloc_failures_backend", s.scheduler.materialize_kv_page_alloc_failures_backend},
+              {"materialize_kv_defers", s.scheduler.materialize_kv_defers},
+              {"materialize_state_replans", s.scheduler.materialize_state_replans},
+              {"relief_kv_releases", s.scheduler.relief_kv_releases},
+              {"relief_kv_not_retained", s.scheduler.relief_kv_not_retained},
+              {"relief_kv_pages_freed", s.scheduler.relief_kv_pages_freed},
+              {"slot_release_destroys", s.scheduler.slot_release_destroys},
+              {"spill_state_d2h_count", s.scheduler.spill_state_d2h_count},
+              {"spill_state_d2h_bytes", s.scheduler.spill_state_d2h_bytes},
+              {"checkpoint_device_count", s.scheduler.checkpoint_device_count},
+              {"checkpoint_host_only_count", s.scheduler.checkpoint_host_only_count},
+              {"checkpoint_device_state_slots", s.scheduler.checkpoint_device_state_slots},
+              {"state_dual_resident_count", s.scheduler.state_dual_resident_count},
+              {"state_active_with_host_count", s.scheduler.state_active_with_host_count},
+              {"state_pending_host_slots", s.scheduler.state_pending_host_slots},
+              {"host_slot_release_failures", s.scheduler.host_slot_release_failures}}},
         {"cache_reuse",
          json{{"root_selections", s.scheduler.root_selections},
               {"private_endpoint_selections", s.scheduler.private_endpoint_selections},
@@ -88,11 +120,52 @@ std::string format_stats_json(const StatsSnapshot& s) {
               {"planned_slack_bytes", s.memory.planned_slack_bytes},
               {"host_kv_capacity_bytes", s.memory.host_kv_capacity_bytes},
               {"host_kv_occupied_bytes", s.memory.host_kv_occupied_bytes},
+              {"host_kv_free_bytes", s.memory.host_kv_free_bytes},
+              {"host_kv_largest_free_extent_bytes", s.memory.host_kv_largest_free_extent_bytes},
+              {"host_kv_free_extent_count", s.memory.host_kv_free_extent_count},
+              {"host_kv_fragmentation_ratio", s.memory.host_kv_fragmentation_ratio},
               {"host_state_capacity_slots", s.memory.host_state_capacity_slots},
               {"host_state_occupied_slots", s.memory.host_state_occupied_slots},
               {"weights", arena(s.memory.weights)},
               {"sequence", arena(s.memory.sequence)},
               {"workspace", arena(s.memory.workspace)}}},
+        {"host_kv",
+         json{{"single_alloc_failures", s.scheduler.host_kv_single_alloc_failures},
+              {"compactions", s.scheduler.host_kv_compactions},
+              {"evictions", s.scheduler.host_kv_evictions},
+              {"superseded", s.scheduler.host_kv_superseded},
+              {"net_entries", s.scheduler.host_kv_net_entries},
+              {"net_state_bytes", s.scheduler.host_kv_net_state_bytes},
+              {"unit_bytes", s.scheduler.host_unit_occupied_bytes},
+              {"unit_count", s.scheduler.host_unit_count},
+              // P2.5 Increment 3 (O0 census): per-eviction-tier composition of
+              // the net — which tier (dead / live / idle-catalogued / active)
+              // holds the retained units and their bytes.
+              {"tier_census",
+               json{{"dead",   json{{"entries", s.scheduler.host_kv_tier_census.dead_entries},
+                                    {"bytes",   s.scheduler.host_kv_tier_census.dead_bytes}}},
+                    {"live",   json{{"entries", s.scheduler.host_kv_tier_census.live_entries},
+                                    {"bytes",   s.scheduler.host_kv_tier_census.live_bytes}}},
+                    {"idle",   json{{"entries", s.scheduler.host_kv_tier_census.idle_entries},
+                                    {"bytes",   s.scheduler.host_kv_tier_census.idle_bytes}}},
+                    {"active", json{{"entries", s.scheduler.host_kv_tier_census.active_entries},
+                                    {"bytes",   s.scheduler.host_kv_tier_census.active_bytes}}}}},
+              // P2.5 Increment 3 (O0+): the net's largest retained units — the
+              // per-entry view (frontier, bytes, tier, session, active-session).
+              {"top_units",
+               [&] {
+                   json arr = json::array();
+                   for (const auto& u : s.scheduler.host_kv_top_units) {
+                       arr.push_back(json{{"frontier",       u.frontier},
+                                          {"bytes",          u.bytes},
+                                          {"tier",           u.tier},
+                                          {"matched",        u.ever_matched},
+                                          {"pinned",         u.pinned},
+                                          {"active_session", u.active_session},
+                                          {"session",        u.session}});
+                   }
+                   return arr;
+               }()}}},
         {"load",
          json{{"target", s.load.target},
               {"model_id", s.load.model_id},

@@ -454,6 +454,21 @@ public:
                page.source_pins != std::numeric_limits<std::uint32_t>::max();
     }
 
+    // P1.7(b): true when this page can be adopted into another address space
+    // without a copy: device-resident, full, and writer-free. KV columns are
+    // append-only, so a full writer-free page is frozen — its content cannot
+    // change, and aliasing it is exact.
+    [[nodiscard]] bool can_share_frozen_page(LogicalKVPageHandle handle) const noexcept {
+        if (!valid(handle)) { return false; }
+        const Page& page = pages_[handle.index_];
+        return page.device_replica.has_value() && page.writer_references == 0 &&
+               page.committed_columns == static_cast<std::uint32_t>(kPagedKVPageSize) &&
+               !page.destination_pinned &&
+               page.source_pins != std::numeric_limits<std::uint32_t>::max() &&
+               page.references != std::numeric_limits<std::uint32_t>::max() &&
+               page.active_references < page.references;
+    }
+
     [[nodiscard]] DeviceKVPageHandle reserve_device_replica(LogicalKVPageHandle handle,
                                                             DeviceKVPageReservation& reservation) {
         Page& page = require(handle);
@@ -1459,6 +1474,89 @@ public:
         address.page_count = target;
     }
 
+    // P1.7(b) identity-based restore: replace the destination's first
+    // `source.size()` freshly materialized pages with the given frozen
+    // device-resident logical pages, dematerializing the fresh pages back
+    // into the reservation. A frozen page (full, no writer) is append-only —
+    // its content never changes — so aliasing it is exact. The safety-net
+    // root restore calls this AFTER materializing + H2D-copying the unshared
+    // suffix, so a failure here cannot corrupt a committed restore.
+    // The destination must be active, fresh (committed_frontier == 0), and
+    // mapped at least `source.size()` pages.
+    void adopt_resident_prefix(KVAddressSpaceHandle handle,
+                               std::span<const LogicalKVPageHandle> source,
+                               cudaStream_t stream = nullptr) {
+        Address& address = require_active(handle);
+        if (source.empty() || source.size() > address.page_count ||
+            address.committed_frontier != 0) {
+            throw std::logic_error("KV resident-prefix adoption destination is not fresh");
+        }
+        for (const LogicalKVPageHandle page : source) {
+            if (!pages_->can_share_frozen_page(page) ||
+                !pages_->can_retain_reference(page, false)) {
+                throw std::logic_error("KV resident-prefix source page is not shareable");
+            }
+        }
+        for (const LogicalKVPageHandle page : source) { pages_->pin_source(page); }
+        try {
+            publish_scratch_.clear();
+            for (const LogicalKVPageHandle page : source) {
+                publish_scratch_.push_back(pages_->physical(page));
+            }
+            tables_->publish(address.row->handle(), 0, publish_scratch_, stream);
+            for (std::uint32_t page = 0; page < source.size(); ++page) {
+                const LogicalKVPageHandle fresh = membership(address, page);
+                pages_->release_active_reference(fresh);
+                pages_->dematerialize(fresh, address.reservation);
+                const LogicalKVPageHandle logical = source[page];
+                pages_->retain_reference(logical, false);
+                pages_->protect_coverage(logical, static_cast<std::uint32_t>(kPagedKVPageSize));
+                membership(address, page) = logical;
+                pages_->retain_active_reference(logical);
+            }
+        } catch (...) {
+            for (const LogicalKVPageHandle page : source) { pages_->unpin_source(page); }
+            throw;
+        }
+        for (const LogicalKVPageHandle page : source) { pages_->unpin_source(page); }
+    }
+
+    // P1.7(b): undo adopt_resident_prefix() — the safety-net restore failed
+    // after an adoption (state H2D, stream sync) and the root-prefill
+    // fallback must start from an empty address space: an adopted page is a
+    // shared frozen page, not a prefill writer page. Releases this address
+    // space's references on the first `adopted` pages and dematerializes the
+    // remaining (fresh) pages back into the reservation.
+    void release_adopted_prefix(KVAddressSpaceHandle handle, std::uint32_t adopted) noexcept {
+        if (!valid(handle)) { return; }
+        Address& address = addresses_[handle.index_];
+        if (adopted > address.page_count) { adopted = address.page_count; }
+        for (std::uint32_t page = 0; page < adopted; ++page) {
+            const LogicalKVPageHandle logical = membership(address, page);
+            if (!logical.valid()) { continue; }
+            if (pages_->active_address_references(logical) != 0) {
+                pages_->release_active_reference(logical);
+            }
+            pages_->release_reference(logical, false);
+            membership(address, page) = {};
+        }
+        for (std::uint32_t page = adopted; page < address.page_count; ++page) {
+            const LogicalKVPageHandle logical = membership(address, page);
+            if (!logical.valid()) { continue; }
+            if (pages_->active_address_references(logical) != 0) {
+                pages_->release_active_reference(logical);
+            }
+            if (pages_->can_dematerialize(logical)) {
+                pages_->dematerialize(logical, address.reservation);
+            } else {
+                pages_->release_reference(logical, pages_->writer_references(logical) != 0);
+            }
+            membership(address, page) = {};
+        }
+        address.page_count         = 0;
+        address.committed_frontier = 0;
+    }
+
     void commit_frontier(KVAddressSpaceHandle handle, std::uint32_t frontier) {
         Address& address = require_active(handle);
         if (frontier < address.committed_frontier ||
@@ -1612,6 +1710,45 @@ public:
 
     [[nodiscard]] std::uint32_t mapped_pages(KVAddressSpaceHandle handle) const {
         return require(handle).page_count;
+    }
+
+    // Quiet probe: how many of the space's logical pages currently hold a
+    // device replica. Unlike physical_page_if_resident() this logs nothing,
+    // so it can be used to rank fit-gate relief victims by the pages a
+    // release would actually free (a space whose pages are already
+    // host-resident, or shared with a space that stays resident, frees
+    // almost nothing despite a large mapped count).
+    [[nodiscard]] std::uint32_t resident_device_pages(KVAddressSpaceHandle handle) const noexcept {
+        if (!valid(handle)) { return 0; }
+        const Address& address = addresses_[handle.index_];
+        std::uint32_t count = 0;
+        for (std::uint32_t p = 0; p < address.page_count; ++p) {
+            const LogicalKVPageHandle logical = membership(address, p);
+            if (pages_->valid(logical) && pages_->device_resident(logical)) { ++count; }
+        }
+        return count;
+    }
+
+    // Quiet probe: how many of the space's logical pages hold a device
+    // replica that this space UNIQUELY owns (address_references == 1). A
+    // release of this space frees a device replica only when the LAST
+    // reference drops, so pages shared with another address space are not
+    // freed by releasing this one — resident_device_pages overcounts them
+    // (the 2026-09-17 relief incident: a 235k unit sharing a ~230k prefix
+    // reported ~7300 "unique" pages but freed ~10). Mirrors the
+    // address_references > 1 skip in resident_resources.
+    [[nodiscard]] std::uint32_t unique_resident_device_pages(KVAddressSpaceHandle handle) const noexcept {
+        if (!valid(handle)) { return 0; }
+        const Address& address = addresses_[handle.index_];
+        std::uint32_t count = 0;
+        for (std::uint32_t p = 0; p < address.page_count; ++p) {
+            const LogicalKVPageHandle logical = membership(address, p);
+            if (pages_->valid(logical) && pages_->device_resident(logical) &&
+                pages_->address_references(logical) == 1) {
+                ++count;
+            }
+        }
+        return count;
     }
 
     [[nodiscard]] std::uint32_t entitlement(KVAddressSpaceHandle handle) const {

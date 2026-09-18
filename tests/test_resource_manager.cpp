@@ -346,6 +346,22 @@ struct FakePersistentBackfillProof {
     [[nodiscard]] std::uint64_t resource_revision() const noexcept { return revision; }
 };
 
+// P1.5(d) Increment 2 fakes: the admission-side KV occupancy probe.
+struct FakeKvAdmissionFit {
+    bool fits = true;
+    std::uint32_t need_text_pages    = 0;
+    std::uint32_t need_backend_pages = 0;
+    std::optional<std::uint32_t> source_index;
+    std::optional<std::uint32_t> shared_source_index;
+};
+
+enum class FakeQueuedKvBlockProgress : std::uint8_t {
+    Inactive,
+    InProgress,
+    ReliefFired,
+    Expired,
+};
+
 struct FakeStartResult {
     FakeSequenceHandle sequence;
 };
@@ -489,6 +505,8 @@ public:
     [[nodiscard]] std::optional<FakePressureTargetHandle>
     guided_closure_target(const FakeAdmissionCandidate& candidate,
                           std::span<const std::uint32_t> preferred_owner_ordinals);
+    [[nodiscard]] std::optional<FakePressureTargetHandle>
+    greedy_cover_target(const FakeAdmissionCandidate& candidate);
     [[nodiscard]] ninfer::runtime::PressureTargetGuidance guidance(FakePressureTargetHandle target);
     [[nodiscard]] ninfer::runtime::PressureTargetAssessment assess(FakePressureTargetHandle target);
     void retain_assessment(FakePressureTargetHandle target);
@@ -553,6 +571,49 @@ public:
     [[nodiscard]] std::uint64_t safety_net_restore_count() const noexcept {
         return 0;
     }
+
+    // Stats accessors read by populate_runtime_stats (the fake reports no activity).
+    [[nodiscard]] std::uint64_t host_kv_single_alloc_failures() const noexcept { return 0; }
+    [[nodiscard]] std::uint64_t host_kv_compaction_count() const noexcept { return 0; }
+    [[nodiscard]] std::uint64_t host_kv_eviction_count() const noexcept { return 0; }
+    [[nodiscard]] std::uint64_t relief_kv_releases() const noexcept { return 0; }
+    [[nodiscard]] std::uint64_t relief_kv_not_retained() const noexcept { return 0; }
+    [[nodiscard]] std::uint64_t relief_kv_pages_freed() const noexcept { return 0; }
+    [[nodiscard]] std::uint64_t slot_release_destroys() const noexcept { return 0; }
+    [[nodiscard]] std::uint64_t spill_state_d2h_count() const noexcept { return 0; }
+    [[nodiscard]] std::uint64_t spill_state_d2h_bytes() const noexcept { return 0; }
+    [[nodiscard]] std::uint64_t materialize_state_slot_alloc_failures() const noexcept {
+        return 0;
+    }
+    [[nodiscard]] std::uint64_t materialize_dual_device_replica_drops() const noexcept {
+        return 0;
+    }
+    [[nodiscard]] std::uint64_t materialize_kv_page_alloc_failures() const noexcept {
+        return 0;
+    }
+    [[nodiscard]] std::uint64_t materialize_kv_page_alloc_failures_main() const noexcept {
+        return 0;
+    }
+    [[nodiscard]] std::uint64_t materialize_kv_page_alloc_failures_backend() const noexcept {
+        return 0;
+    }
+    [[nodiscard]] std::uint64_t materialize_kv_defers() const noexcept { return 0; }
+    [[nodiscard]] std::uint64_t materialize_state_replans() const noexcept { return 0; }
+    [[nodiscard]] std::uint32_t checkpoint_device_count() const noexcept { return 0; }
+    [[nodiscard]] std::uint32_t checkpoint_host_only_count() const noexcept { return 0; }
+    [[nodiscard]] std::uint32_t checkpoint_device_state_slots() const noexcept { return 0; }
+    [[nodiscard]] std::uint32_t state_dual_resident_count() const noexcept { return 0; }
+    [[nodiscard]] std::uint32_t state_active_with_host_count() const noexcept { return 0; }
+    [[nodiscard]] std::uint32_t state_pending_host_slots() const noexcept { return 0; }
+    [[nodiscard]] std::uint32_t host_kv_net_entries() const noexcept { return 0; }
+    [[nodiscard]] std::uint64_t host_kv_net_state_bytes() const noexcept { return 0; }
+    [[nodiscard]] ninfer::NetTierCensus host_kv_net_tier_census() const noexcept { return {}; }
+    [[nodiscard]] std::vector<ninfer::NetUnitInfo>
+    host_kv_net_top_units(std::size_t) const noexcept { return {}; }
+    [[nodiscard]] std::uint64_t host_unit_occupied_bytes() const noexcept { return 0; }
+    [[nodiscard]] std::uint32_t host_unit_count() const noexcept { return 0; }
+    [[nodiscard]] std::uint64_t host_kv_superseded_count() const noexcept { return 0; }
+    [[nodiscard]] std::uint64_t host_slot_release_failures() const noexcept { return 0; }
 
     [[nodiscard]] bool isolated_request_feasible(const FakeRequestBasePlan& base) const noexcept {
         return base.isolated_feasible;
@@ -866,6 +927,17 @@ public:
         return 0;
     }
 
+    bool stale_private_probe = false;
+    bool stale_shared_probe  = false;
+
+    [[nodiscard]] bool valid_continuation(const FakeContinuationHandle&) const noexcept {
+        return !stale_private_probe;
+    }
+
+    [[nodiscard]] bool valid_shared_prefix(const FakeSharedPrefixHandle&) const noexcept {
+        return !stale_shared_probe;
+    }
+
     [[nodiscard]] FakeAdmissionCandidate make_capture_pressure_candidate(
         const FakeCaptureAssessment& assessment,
         const ninfer::runtime::ContextMachineCostModel& machine_cost) const {
@@ -972,6 +1044,12 @@ public:
 
     [[nodiscard]] FakePhysicalUsage physical_usage() const noexcept { return usage; }
 
+    // P1.5(d) Increment 2: the admission-side occupancy probe. The fake
+    // reports a fit by default; tests override the answer.
+    [[nodiscard]] FakeKvAdmissionFit kv_admission_fit(const FakeResourcePlan&) const noexcept {
+        return kv_admission_override.value_or(FakeKvAdmissionFit{});
+    }
+
     void invalidate_resources() noexcept { advance_revision(); }
 
     std::size_t required_pressure_actions       = 0;
@@ -997,6 +1075,7 @@ public:
     FakeCaptureAssessment capture_assessment;
     FakeContinuationSummary capture_summary;
     FakePhysicalUsage usage;
+    std::optional<FakeKvAdmissionFit> kv_admission_override;
 
     std::uint64_t admission_inspections         = 0;
     std::uint64_t pressure_planning_sessions    = 0;
@@ -1250,6 +1329,56 @@ std::optional<FakePressureTargetHandle> FakePressurePlanningSession::guided_clos
     return std::nullopt;
 }
 
+std::optional<FakePressureTargetHandle> FakePressurePlanningSession::greedy_cover_target(
+    const FakeAdmissionCandidate& candidate) {
+    require(!scratch_live_, "fake greedy cover conflicts with expansion scratch");
+    const std::uint32_t selected_candidate = candidate_index(candidate);
+    populate_options(selected_candidate);
+    Target target{
+        .candidate_index = selected_candidate,
+        .choices         = std::vector<std::uint16_t>(owners_.size(), 0),
+    };
+    const auto selected_decisions = [&] {
+        std::vector<FakeTargetDecision> decisions;
+        for (std::size_t index = 0; index < owners_.size(); ++index) {
+            const std::uint16_t choice = target.choices[index];
+            if (choice != 0) {
+                decisions.push_back(options_[selected_candidate][index][choice - 1U]);
+            }
+        }
+        return decisions;
+    };
+    // Evict owners in ordinal order (the fake has no per-owner freed resources
+    // to rank by) until the deficit is covered — the same minimal-cover
+    // semantics as the real session's efficiency-ordered greedy.  No identity
+    // short-circuit: the seed is only reached when the identity has no logical
+    // goal, so at least one eviction is required even when the physical
+    // deficit is already zero.
+    for (std::size_t index = 0; index < owners_.size(); ++index) {
+        const auto& alternatives = options_[selected_candidate][index];
+        if (alternatives.empty()) { continue; }
+        target.choices[index] = static_cast<std::uint16_t>(alternatives.size());
+        if (program_->target_feasible(selected_decisions())) {
+            auto existing = std::find_if(targets_.begin(), targets_.end(),
+                                         [&](const Target& prior) {
+                                             return same_target(prior, target);
+                                         });
+            std::uint32_t target_index = 0;
+            if (existing != targets_.end()) {
+                target_index = static_cast<std::uint32_t>(existing - targets_.begin());
+            } else {
+                target.stable_ordinal = static_cast<std::uint32_t>(targets_.size());
+                targets_.push_back(std::move(target));
+                target_index = static_cast<std::uint32_t>(targets_.size() - 1U);
+                program_->pressure_target_count_peak =
+                    std::max(program_->pressure_target_count_peak, targets_.size());
+            }
+            return FakePressureTargetHandle{.generation = generation_, .index = target_index};
+        }
+    }
+    return std::nullopt;
+}
+
 ninfer::runtime::PressureTargetGuidance
 FakePressurePlanningSession::guidance(FakePressureTargetHandle handle) {
     require(valid(handle) && !scratch_live_, "fake pressure guidance is stale");
@@ -1368,6 +1497,12 @@ FakePressurePlanningSession::assess(FakePressureTargetHandle handle) {
         }
         if (!decision.evicts_continuation) { expandable = true; }
     }
+    const bool feasible = program_->target_feasible(selected);
+    // Mirror the real session: a target that already covers the deficit is a
+    // locally complete solution — further decisions only add cost.  An
+    // identity target keeps the computed value (pressure may still remove a
+    // copy the identity requires).
+    if (!selected.empty() && feasible) { expandable = false; }
 
     ninfer::runtime::MaterializationMachineSummary machine = candidate.identity.machine;
     const bool combined_copy_cancelled =
@@ -1399,7 +1534,7 @@ FakePressurePlanningSession::assess(FakePressureTargetHandle handle) {
         digest ^= target.candidate_index;
     }
     return ninfer::runtime::PressureTargetAssessment{
-        .physical_status       = program_->target_feasible(selected)
+        .physical_status       = feasible
                                      ? ninfer::runtime::MaterializationPhysicalStatus::Feasible
                                      : ninfer::runtime::MaterializationPhysicalStatus::Infeasible,
         .source_disposition    = candidate.disposition,
@@ -1554,6 +1689,8 @@ FakeProgram::begin_pressure_planning(const ninfer::runtime::ContextMachineCostMo
 
 struct FakePackage {
     using Program                    = FakeProgram;
+    using KvAdmissionFit             = FakeKvAdmissionFit;
+    using QueuedKvBlockProgress      = FakeQueuedKvBlockProgress;
     using PreparedPrompt             = FakePreparedPrompt;
     using RequestBasePlan            = FakeRequestBasePlan;
     using AdmissionCandidate         = FakeAdmissionCandidate;
@@ -2457,6 +2594,102 @@ void test_combined_target_reprices_cancelled_pressure_copy() {
             "planner accumulated parent transfer cost instead of repricing the complete target");
 }
 
+void test_covered_pressure_target_is_not_expanded() {
+    // Four parked owners, one required pressure unit: every single-decision
+    // target already covers the deficit.  Without the covered-target stop the
+    // search enumerates the whole 2^4 choice space; with it, only the root's
+    // direct children are ever assessed.
+    constexpr std::size_t owner_count = 4;
+    FakeManager manager = make_manager(1, owner_count + 1U);
+    FakeProgram program;
+    for (std::size_t index = 0; index < owner_count; ++index) {
+        const std::uint32_t content = static_cast<std::uint32_t>(80U + index);
+        const ActiveRequest active =
+            start_active(manager, program, content, make_base(content), index + 1U);
+        (void)finish_active(manager, program, active);
+    }
+    program.required_pressure_actions = 1;
+    auto inspection = manager.inspect(program, FakePreparedPrompt{84}, make_base(84), 2);
+    require(inspection.choice.has_value(), "covered pressure target was unreachable");
+    require(program.pressure_target_assessments <= 12,
+            "covered target was expanded into the full choice space");
+    program.abort_start = true;
+    (void)manager.reserve_materialization(program, std::move(*inspection.choice),
+                                          FakePreparedPrompt{84}, {});
+    require(program.started_action_ids.size() == 1,
+            "covered target cost more than one pressure action");
+    require(std::none_of(program.started_action_ids.begin(), program.started_action_ids.end(),
+                         [](std::uint64_t id) { return id >= 2000U; }),
+            "covered target evicted an owner");
+}
+
+void test_greedy_seed_covers_pressure_with_minimal_eviction() {
+    // Two parked owners; the deficit needs two pressure units and only an
+    // eviction (two units) can supply them — the required action id forces
+    // the eviction cover.  The seed must evict exactly one owner, not both.
+    FakeManager manager = make_manager(1, 3);
+    FakeProgram program;
+    const std::uint32_t first_content  = 85;
+    const std::uint32_t second_content = 86;
+    const ActiveRequest first =
+        start_active(manager, program, first_content, make_base(first_content), 1);
+    (void)finish_active(manager, program, first);
+    const ActiveRequest second =
+        start_active(manager, program, second_content, make_base(second_content), 2);
+    (void)finish_active(manager, program, second);
+
+    program.required_pressure_actions      = 2;
+    program.eviction_pressure_action_units = 2;
+    program.required_action_id              = 2000U + first.sequence.id;
+    auto inspection = manager.inspect(program, FakePreparedPrompt{87}, make_base(87), 3);
+    require(inspection.choice.has_value(), "eviction cover was unreachable");
+
+    program.abort_start = true;
+    (void)manager.reserve_materialization(program, std::move(*inspection.choice),
+                                          FakePreparedPrompt{87}, {});
+    const std::vector<std::uint64_t> evictions{
+        2000U + first.sequence.id, 2000U + second.sequence.id};
+    const auto eviction_count = std::count_if(
+        program.started_action_ids.begin(), program.started_action_ids.end(),
+        [&](std::uint64_t id) {
+            return std::find(evictions.begin(), evictions.end(), id) != evictions.end();
+        });
+    require(eviction_count == 1, "seed evicted more owners than the cover requires");
+}
+
+void test_probe_kv_fit_delegates_to_program() {
+    // P1.5(d) Increment 2: the admission-side occupancy probe is a pure
+    // delegation to the program — the engine keeps an unfitted head in the
+    // visible queue (position/wait in /stats) instead of admitting it into a
+    // silent 120s fit-gate defer.
+    FakeManager manager = make_manager(1, 2);
+    FakeProgram program;
+    const ActiveRequest active = start_active(manager, program, 90, make_base(90), 1);
+    (void)finish_active(manager, program, active);
+    auto inspection = manager.inspect(program, FakePreparedPrompt{91}, make_base(91), 2);
+    require(inspection.choice.has_value(), "probe test has no inspection choice");
+
+    // No override: the fake program reports a fit (default).
+    const auto baseline = manager.probe_kv_fit(program, *inspection.choice);
+    require(baseline.fits, "default probe must report a fit");
+
+    // Overridden: the unfitted answer, demand, and skip indices pass through
+    // the RM untouched.
+    const FakeKvAdmissionFit unfitted{
+        /*fits*/ false,
+        /*need_text_pages*/ 4096,
+        /*need_backend_pages*/ 0,
+        /*source_index*/ std::optional<std::uint32_t>{3},
+        /*shared_source_index*/ std::nullopt};
+    program.kv_admission_override = unfitted;
+    const auto probe = manager.probe_kv_fit(program, *inspection.choice);
+    require(!probe.fits, "probe must surface the program's unfitted answer");
+    require(probe.need_text_pages == 4096, "probe must carry the text demand");
+    require(probe.source_index == std::optional<std::uint32_t>{3},
+            "probe must carry the source skip index");
+    require(!probe.shared_source_index.has_value(), "unexpected shared source");
+}
+
 void test_in_progress_adoption_and_private_capture() {
     FakeManager manager = make_manager(1, 2);
     FakeProgram program;
@@ -2606,6 +2839,59 @@ void test_shared_capture_combines_two_pressure_owners() {
             "shared capture publication did not retain the active owner reference");
     program.required_pressure_actions = 0;
     (void)finish_active(manager, program, active);
+}
+
+void test_stale_shared_catalog_entry_is_self_healed() {
+    FakeManager manager = make_manager(2, 4, 1);
+    FakeProgram program;
+    const ActiveRequest first = start_active(manager, program, 41, make_base(41), 1);
+    (void)finish_active(manager, program, first);
+    const ActiveRequest second = start_active(manager, program, 42, make_base(42), 2);
+    (void)finish_active(manager, program, second);
+
+    FakeRequestBasePlan shared_request = make_base(43);
+    shared_request.cache.opportunities.push_back(FakeContextCache::Opportunity{
+        .kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+        .evidence = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+        .frontier = 64,
+    });
+    const ActiveRequest active           = start_active(manager, program, 43, shared_request, 3);
+    program.required_pressure_actions    = 2;
+    program.pressure_action_immediate_ns = 0;
+    program.capture_assessment           = FakeCaptureAssessment{
+                  .shortlist_key          = FakeShortlistKey{.digest = 43, .frontier = 64},
+                  .shared_evidence        = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+                  .protected_rebuild_work = PrefillWork{.tokens = 64},
+                  .projected_recovery_ns  = 0,
+                  .publishes_shared       = true,
+                  .physically_feasible    = false,
+    };
+    const auto reserved =
+        manager.reserve_active_capture(program, active.lane, FakeCaptureOffer{.id = 7}, 0, {});
+    require(reserved == FakeManager::ActiveCaptureReserveResult::Reserved,
+            "shared capture did not reserve a multi-owner pressure target");
+    auto progress = manager.progress_context_transaction(program, {});
+    (void)std::get<FakeManager::ActiveCaptureOutcome>(std::move(progress));
+    require(manager.shared_catalog_state(0) == FakeManager::SharedCatalogState::Catalogued,
+            "shared capture publication did not catalogue the shared entry");
+
+    // The runtime has since recycled the prefix's slot (e.g. fit-gate stage-2
+    // relief released the idle shared prefix), but RM's catalog still holds the
+    // entry: the next capture planning must not throw on the stale handle —
+    // it must self-heal (clear) the entry and plan around it.
+    program.stale_shared_probe = true;
+    const ActiveRequest third = start_active(manager, program, 44, make_base(44), 4);
+    program.capture_assessment = FakeCaptureAssessment{
+        .shortlist_key     = FakeShortlistKey{.digest = 44, .frontier = 24},
+        .publishes_private = true,
+    };
+    program.capture_summary.endpoint = endpoint(44, 24);
+    const auto rereserved =
+        manager.reserve_active_capture(program, third.lane, FakeCaptureOffer{.id = 8}, true, {});
+    require(rereserved == FakeManager::ActiveCaptureReserveResult::Reserved,
+            "stale shared catalog entry aborted the next capture planning");
+    require(manager.shared_catalog_state(0) == FakeManager::SharedCatalogState::Vacant,
+            "stale shared catalog entry was not self-healed");
 }
 
 void test_terminal_fallback_releases_failed_retention() {
@@ -2759,6 +3045,11 @@ int main() {
              test_guided_pressure_reaches_deep_retention_before_maximal_fallback);
     run_test("combined target exact repricing",
              test_combined_target_reprices_cancelled_pressure_copy);
+    run_test("covered target is not expanded",
+             test_covered_pressure_target_is_not_expanded);
+    run_test("greedy seed minimal eviction cover",
+             test_greedy_seed_covers_pressure_with_minimal_eviction);
+    run_test("probe kv fit delegates to program", test_probe_kv_fit_delegates_to_program);
     run_test("in-progress and capture", test_in_progress_adoption_and_private_capture);
     run_test("projected shared marginal value",
              test_projected_nested_shared_candidates_use_marginal_value);
@@ -2768,6 +3059,8 @@ int main() {
              test_repeated_private_reuse_selects_zero_prefill_shared_promotion);
     run_test("shared capture multi-owner pressure",
              test_shared_capture_combines_two_pressure_owners);
+    run_test("stale shared catalog self-heal",
+             test_stale_shared_catalog_entry_is_self_healed);
     run_test("terminal fallback", test_terminal_fallback_releases_failed_retention);
     run_test("terminal waits for resource transaction",
              test_terminal_settlement_waits_for_open_resource_transaction);

@@ -690,6 +690,51 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->kv_dtype            = inputs.kv_dtype;
     impl->kv_quant_group      = inputs.kv_quant_group;
     impl->persistent          = persistent_layout(*impl);
+    if (inputs.context_cache.host_cache_mib > 0) {
+        // P2.6: one host cache budget (MiB) split into the checkpoint state pool
+        // (~20%, slot count derived from the model's state image size) and the
+        // host KV arena (the rest). A component set explicitly keeps its value
+        // and is subtracted from the total; with both explicit the total is
+        // informational only.
+        const std::size_t total_bytes =
+            checked_mul(inputs.context_cache.host_cache_mib, kMiB, "host cache budget");
+        const std::size_t image_bytes = impl->persistent.state_images.host.image_bytes;
+        if (image_bytes == 0) {
+            throw std::logic_error("host cache budget split: empty state image layout");
+        }
+        const bool slots_explicit = inputs.context_cache.host_state_slots_explicit;
+        const bool kv_explicit    = inputs.context_cache.host_kv_explicit;
+        if (!slots_explicit && !kv_explicit) {
+            const std::size_t state_budget = total_bytes / 5;
+            const std::size_t slots64      = state_budget / image_bytes;
+            if (slots64 > std::numeric_limits<std::uint32_t>::max()) {
+                throw std::overflow_error("derived host state slot count exceeds uint32");
+            }
+            const std::uint32_t slots = static_cast<std::uint32_t>(slots64);
+            impl->context_cache.host_state_slots = slots;
+            impl->context_cache.host_kv_capacity_bytes =
+                total_bytes - checked_mul(slots, image_bytes, "derived host state pool");
+        } else if (slots_explicit) {
+            const std::size_t state_bytes = checked_mul(
+                inputs.context_cache.host_state_slots, image_bytes, "host state pool");
+            if (state_bytes > total_bytes) {
+                throw std::logic_error(
+                    "host cache budget is smaller than the explicit host state pool");
+            }
+            impl->context_cache.host_kv_capacity_bytes = total_bytes - state_bytes;
+        } else {
+            if (inputs.context_cache.host_kv_capacity_bytes >= total_bytes) {
+                throw std::logic_error(
+                    "host cache budget is not larger than the explicit host KV arena");
+            }
+            const std::size_t slots64 =
+                (total_bytes - inputs.context_cache.host_kv_capacity_bytes) / image_bytes;
+            if (slots64 > std::numeric_limits<std::uint32_t>::max()) {
+                throw std::overflow_error("derived host state slot count exceeds uint32");
+            }
+            impl->context_cache.host_state_slots = static_cast<std::uint32_t>(slots64);
+        }
+    }
     impl->workspace           = build_workspace_plan(*impl);
     if (impl->use_cuda_graph) {
         // Definitions remain per execution profile, but only one executable is instantiated for

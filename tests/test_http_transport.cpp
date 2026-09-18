@@ -101,6 +101,34 @@ int test_sse_transport() {
     return failures;
 }
 
+int test_sse_heartbeat_payload() {
+    using namespace std::chrono_literals;
+    int failures = 0;
+    std::vector<std::string> writes;
+    httplib::DataSink sink;
+    sink.write = [&](const char* data, std::size_t size) {
+        writes.emplace_back(data, size);
+        return true;
+    };
+    sink.is_writable = [] { return true; };
+    std::atomic<bool> cancelled{false};
+    const SseTransport::Clock::time_point start{100s};
+    // The anthropic heartbeat carries the comment (TCP probe) AND a real
+    // `ping` event — comment-only keep-alives do not reset a client's
+    // "first event" timer, so a queued request gets abandoned by the client
+    // while the server believes it is keeping the connection alive.
+    SseTransport transport(sink, cancelled, 5s, start, SseTransport::kHeartbeatAnthropic);
+    failures += check(!transport.poll(start + 4999ms) && writes.empty(),
+                      "anthropic heartbeat fired before the quiet interval");
+    failures += check(!transport.poll(start + 5s) && writes.size() == 1 &&
+                          writes[0] == std::string(SseTransport::kHeartbeatAnthropic),
+                      "anthropic heartbeat did not emit comment + ping as one frame");
+    failures += check(writes[0].find("event: ping") != std::string::npos &&
+                          writes[0].find(": keep-alive") != std::string::npos,
+                      "anthropic heartbeat lost its comment or ping component");
+    return failures;
+}
+
 int test_sse_response_headers() {
     httplib::Response response;
     ninfer::serve::prepare_sse_response(response);
@@ -180,7 +208,7 @@ int test_inherited_socket_liveness() {
 } // namespace
 
 int main() {
-    int failures = test_sse_transport() + test_sse_response_headers();
+    int failures = test_sse_transport() + test_sse_heartbeat_payload() + test_sse_response_headers();
 #if defined(__linux__)
     failures += test_inherited_socket_liveness();
 #endif

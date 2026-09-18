@@ -188,6 +188,34 @@ int main() {
     failures += check(disabled_cache_capacity_rejected,
                       "root-only server mode accepted context-cache capacity options");
 
+    const ServeOptions host_cache =
+        parse({"ninfer-serve", "model.ninfer", "--host-cache-mib", "1024"});
+    failures += check(host_cache.context_cache.host_cache_mib == 1024 &&
+                          !host_cache.context_cache.host_state_slots_explicit &&
+                          !host_cache.context_cache.host_kv_explicit,
+                      "--host-cache-mib did not reach serving options");
+    const ServeOptions host_cache_split = parse(
+        {"ninfer-serve", "model.ninfer", "--host-cache-mib", "1024", "--host-state-slots", "8"});
+    failures += check(host_cache_split.context_cache.host_cache_mib == 1024 &&
+                          host_cache_split.context_cache.host_state_slots == 8 &&
+                          host_cache_split.context_cache.host_state_slots_explicit &&
+                          !host_cache_split.context_cache.host_kv_explicit,
+                      "--host-cache-mib with explicit --host-state-slots lost the split flags");
+    const ServeOptions host_cache_kv =
+        parse({"ninfer-serve", "model.ninfer", "--host-cache-mib", "1024", "--host-kv-mib", "64"});
+    failures += check(host_cache_kv.context_cache.host_cache_mib == 1024 &&
+                          host_cache_kv.context_cache.host_kv_capacity_bytes == (64ULL << 20) &&
+                          host_cache_kv.context_cache.host_kv_explicit &&
+                          !host_cache_kv.context_cache.host_state_slots_explicit,
+                      "--host-cache-mib with explicit --host-kv-mib lost the split flags");
+    bool host_cache_root_only_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--no-prefix-reuse", "--host-cache-mib",
+                     "1024"});
+    } catch (const std::invalid_argument&) { host_cache_root_only_rejected = true; }
+    failures += check(host_cache_root_only_rejected,
+                      "root-only server mode accepted --host-cache-mib");
+
     const ServeOptions response_store =
         parse({"ninfer-serve", "model.ninfer", "--response-store-max-records", "42",
                "--response-store-max-mib", "8"});
@@ -275,6 +303,9 @@ int main() {
               "serve help omits --no-prefix-reuse");
     failures += check(serve_usage_text("ninfer-serve").find("--host-kv-mib") != std::string::npos,
                       "serve help omits context-cache capacities");
+    failures += check(serve_usage_text("ninfer-serve").find("--host-cache-mib") !=
+                          std::string::npos,
+                      "serve help omits --host-cache-mib");
     failures += check(serve_usage_text("ninfer-serve").find("device-state=max-concurrency") !=
                           std::string::npos,
                       "serve help omits context-cache defaults");

@@ -1,0 +1,41 @@
+schema_version: 1
+targets:
+  qwen38_api:
+    protocol: openai_chat
+    base_url: http://127.0.0.1:18090/v1
+    model: qwen3.8-27b
+    max_concurrency: 2
+    request:
+      timeout_seconds: 86400
+      retries: 2
+      retry_interval_seconds: 10
+suites:
+  probe:
+    jobs:
+      - id: ifbench
+        backend: evalscope
+        dataset: ifbench
+        target: qwen38_api
+        max_concurrency: 2
+        limit: 12
+        generation:
+          temperature: 1.0
+          top_p: 0.95
+          top_k: 20
+          presence_penalty: 0.0
+          frequency_penalty: 0.0
+          max_tokens: 65536
+          seed: 42
+          extra_body:
+            enable_thinking: true
+            min_p: 0.0
+            post_thinking:
+              temperature: 0.2
+              top_p: 0.95
+              top_k: 20
+        backend_args: {few_shot_num: 0, judge_strategy: rule, dataset_hub: modelscope}
+runtime:
+  max_parallel_jobs: 1
+  runs_dir: eval/runs
+  progress: {enabled: true, refresh_seconds: 1, heartbeat_seconds: 900}
+  samples: {retention: all}

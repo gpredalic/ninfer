@@ -1,0 +1,105 @@
+schema_version: 1
+
+# TASK 2 - BFCL v4 tool-calling A/B for the post-thinking sampler.
+#
+# Artifact and server conditions match the Task 1 regression setup
+# (Ostfralla nvfp4 + froggeric template, kv-dtype nvfp4, 262144 context,
+# MTP draft 5, tolerant tool calls), and sampling matches the documented
+# production sampling for this artifact (temperature 0.7, top_p 0.8).
+# Running on the same validated base isolates the sampler change.
+#
+# Why BFCL answers the post-thinking question: the sampler is a pure positional
+# hash of (seed, position, params), so with an identical seed and identical
+# thinking parameters the thinking block is bit-identical between the two arms.
+# The arms diverge only after the reasoning block closes. BFCL is chosen
+# because the function call is emitted in exactly that post-thinking phase, so
+# the metric moves directly with the parameter. AIME cannot test this: its
+# post-thinking phase is only the short final answer.
+#
+# Thinking is enabled because the engine only resolves post-thinking sampling
+# for SamplingMode::Thinking.
+#
+#   bfcl_without_post_thinking - post_thinking mirrors the thinking sampler, so
+#                                one preset governs the whole generation.
+#   bfcl_with_post_thinking    - no post_thinking override, so the registered
+#                                preset (temperature 0.2, top_p 0.95, top_k 20)
+#                                governs the post-thinking phase.
+#
+# simple_python is excluded: single trivial calls saturate and carry no signal
+# for this question.
+
+targets:
+  qwen38_api:
+    protocol: openai_chat
+    base_url: http://127.0.0.1:18080/v1
+    model: qwen3.8-27b
+    max_concurrency: 2
+    request:
+      timeout_seconds: 86400
+      retries: 2
+      retry_interval_seconds: 10
+
+suites:
+  bfcl_without_post_thinking:
+    jobs:
+      - id: bfcl_v4
+        backend: evalscope
+        dataset: bfcl_v4
+        target: qwen38_api
+        max_concurrency: 2
+        generation: &bfcl_uniform_generation
+          temperature: 0.7
+          top_p: 0.80
+          top_k: 20
+          presence_penalty: 0.0
+          frequency_penalty: 0.0
+          max_tokens: 16384
+          seed: 42
+          extra_body:
+            enable_thinking: true
+            min_p: 0.0
+            post_thinking:
+              temperature: 0.7
+              top_p: 0.80
+              top_k: 20
+              presence_penalty: 0.0
+              frequency_penalty: 0.0
+        backend_args: &bfcl_backend
+          is_fc_model: true
+          underscore_to_dot: true
+          allow_network_downloads: true
+          subset_list:
+            - multiple
+            - parallel
+            - irrelevance
+            - multi_turn_base
+
+  bfcl_with_post_thinking:
+    jobs:
+      - id: bfcl_v4
+        backend: evalscope
+        dataset: bfcl_v4
+        target: qwen38_api
+        max_concurrency: 2
+        generation: &bfcl_postthinking_generation
+          temperature: 0.7
+          top_p: 0.80
+          top_k: 20
+          presence_penalty: 0.0
+          frequency_penalty: 0.0
+          max_tokens: 16384
+          seed: 42
+          extra_body:
+            enable_thinking: true
+            min_p: 0.0
+        backend_args: *bfcl_backend
+
+runtime:
+  max_parallel_jobs: 1
+  runs_dir: eval/runs
+  progress:
+    enabled: true
+    refresh_seconds: 1
+    heartbeat_seconds: 900
+  samples:
+    retention: all

@@ -223,6 +223,124 @@ int exercise_reservation_and_mapping(ninfer::DeviceContext& context) {
     return failures;
 }
 
+// Fit-gate invariant for the materialization KV-capacity defer: the gate's
+// predicate `pool.available_pages() >= demand` must agree with the pool's own
+// admission decision for the same demand — reserve() succeeds, and an
+// empty-reservation resize (the prepare_activation / safety-net restore path)
+// does not throw bad_alloc. That agreement is what lets the gate defer exactly
+// the reservations that would otherwise OOM the worker, and nothing else.
+int exercise_materialization_fit_gate(ninfer::DeviceContext& context) {
+    int failures = 0;
+    ninfer::KVPageGeometry geometry{
+        .planes = {{ninfer::DType::I8, 8, 2, 256}},
+    };
+    PlannedCache plan = plan_cache(8, 8, 1, geometry);
+    ninfer::DeviceArena arena(plan.bytes);
+    ninfer::DeviceKVPagePool pool({arena.base(), arena.capacity()}, plan.pages);
+    ninfer::KVExecutionTablePool tables({arena.base(), arena.capacity()}, plan.tables, pool);
+
+    const std::uint32_t capacity = pool.capacity_pages();
+    failures += expect_size(capacity, 8, "fit-gate pool capacity");
+    failures += expect_size(pool.available_pages(), capacity, "fit-gate fresh pool is fully available");
+
+    // Sweep every (allocated, reserved) occupancy state: the gate predicate must
+    // agree with the pool's admission decision for every non-zero demand up to
+    // available+1 (the first demand the pool would reject).
+    for (std::uint32_t allocated = 0; allocated <= capacity; ++allocated) {
+        for (std::uint32_t reserved = 0; reserved <= capacity - allocated; ++reserved) {
+            const std::uint32_t total = allocated + reserved;
+            std::vector<ninfer::DeviceKVPageLease> hold;
+            hold.reserve(total);
+            // reserve(0) returns nullopt by design; use an empty reservation instead.
+            std::optional<ninfer::DeviceKVPageReservation> hold_reservation;
+            if (total == 0) {
+                hold_reservation.emplace(pool.make_empty_reservation());
+            } else {
+                hold_reservation = pool.reserve(total);
+                if (!hold_reservation) {
+                    failures += expect(false, "fit-gate setup reservation failed");
+                    continue;
+                }
+            }
+            pool.materialize(*hold_reservation, allocated, hold);
+            failures += expect_size(pool.allocated_pages(), allocated, "fit-gate allocated occupancy");
+            failures += expect_size(pool.reserved_pages(), reserved, "fit-gate reserved occupancy");
+            const std::uint32_t free_pages = pool.available_pages();
+            failures += expect_size(free_pages, capacity - total, "fit-gate available accounting");
+            for (std::uint32_t demand = 1; demand <= free_pages + 1; ++demand) {
+                const bool gate_fits = free_pages >= demand;
+                const bool pool_admits = pool.reserve(demand).has_value();
+                failures += expect(gate_fits == pool_admits,
+                                   "fit-gate predicate disagrees with pool admission");
+            }
+        }
+    }
+
+    // The resize path (prepare_activation / safety-net restore): with the pool
+    // full, every non-zero demand must throw bad_alloc, the gate predicate must
+    // defer it, and the failed resize must leave the pool unchanged.
+    {
+        std::vector<ninfer::DeviceKVPageLease> hold;
+        hold.reserve(capacity);
+        std::optional<ninfer::DeviceKVPageReservation> full = pool.reserve(capacity);
+        failures += expect(full.has_value(), "fit-gate full-pool reservation failed");
+        pool.materialize(*full, capacity, hold);
+        failures += expect_size(pool.available_pages(), 0, "fit-gate full pool has no free pages");
+        const std::uint64_t failures_before = pool.reservation_failures();
+        for (std::uint32_t demand = 1; demand <= capacity; ++demand) {
+            bool threw = false;
+            {
+                auto probe = pool.make_empty_reservation();
+                try {
+                    pool.resize_reservation(probe, demand);
+                } catch (const std::bad_alloc&) {
+                    threw = true;
+                }
+            }
+            failures += expect(threw, "fit-gate resize_reservation did not throw on a full pool");
+            failures += expect(pool.available_pages() < demand,
+                               "fit-gate predicate should defer a non-fitting demand");
+        }
+        failures += expect(pool.reservation_failures() == failures_before + capacity,
+                           "fit-gate failed resizes did not count as reservation failures");
+        failures += expect_size(pool.allocated_pages(), capacity, "fit-gate failed resizes changed occupancy");
+        failures += expect_size(pool.reserved_pages(), 0, "fit-gate failed resizes leaked capacity");
+    }
+
+    // Two-pool (main + backend) structure: the gate checks each pool against its
+    // own demand, so a full main pool defers even when the backend pool is empty.
+    {
+        PlannedCache other_plan = plan_cache(4, 4, 1, geometry);
+        ninfer::DeviceArena other_arena(other_plan.bytes);
+        ninfer::DeviceKVPagePool other({other_arena.base(), other_arena.capacity()}, other_plan.pages);
+        std::vector<ninfer::DeviceKVPageLease> hold;
+        hold.reserve(capacity);
+        std::optional<ninfer::DeviceKVPageReservation> full = pool.reserve(capacity);
+        failures += expect(full.has_value(), "fit-gate second full-pool reservation failed");
+        pool.materialize(*full, capacity, hold);
+        const bool main_defers = pool.available_pages() < 1;
+        const bool backend_fits = other.available_pages() >= 2;
+        failures += expect(main_defers && backend_fits,
+                           "fit-gate per-pool predicate misread the two-pool state");
+        bool bundle_threw = false;
+        const std::uint64_t other_failures_before = other.reservation_failures();
+        const ninfer::DeviceKVPageReservationRequest requests[] = {
+            {.pool = &pool, .pages = 1},
+            {.pool = &other, .pages = 2},
+        };
+        try {
+            auto unused = ninfer::reserve_device_kv_page_bundle(requests);
+            (void)unused;
+        } catch (const std::bad_alloc&) { bundle_threw = true; }
+        failures += expect(bundle_threw, "fit-gate bundle across a full pool did not throw");
+        failures += expect_size(other.reserved_pages(), 0, "fit-gate failed bundle changed the other pool");
+        failures += expect(other.reservation_failures() == other_failures_before,
+                           "fit-gate failed bundle counted against the other pool");
+    }
+    (void)context;
+    return failures;
+}
+
 int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageGeometry geometry,
                                  const std::string& label) {
     int failures                  = 0;
@@ -417,6 +535,87 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
     return failures;
 }
 
+// Arena compaction: interleaved live blocks shard the free space into extents
+// that coalescing cannot merge. A single-extent allocation then fails despite
+// sufficient total free (the incident signature); compact() relocates the live
+// blocks so the free space becomes one contiguous extent.
+int exercise_compaction() {
+    int failures = 0;
+    const std::string label = "[compaction]";
+
+    const ninfer::KVPageGeometry geometry{
+        .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
+        .planes             = {{ninfer::DType::BF16, 1, 16, 256}},
+    };
+    const ninfer::HostKVPageLayout layout = ninfer::plan_host_kv_page_layout(geometry);
+    const std::size_t stride              = layout.page_stride;
+    constexpr std::uint32_t kPages        = 64;
+    const ninfer::HostKVPageLayout layouts[] = {layout};
+    ninfer::HostKVArena arena(stride * kPages,
+                              std::span<const ninfer::HostKVPageLayout>(layouts));
+
+    // Eight 8-page blocks fill the arena; freeing two interleaved blocks leaves
+    // two 8-page holes with live blocks on both sides.
+    std::vector<ninfer::HostKVAllocation> blocks;
+    for (std::uint32_t i = 0; i < 8; ++i) {
+        auto block = arena.allocate(layout, 8);
+        if (!block) {
+            failures += expect(false, label + " fixture allocation failed");
+            return failures;
+        }
+        blocks.push_back(std::move(*block));
+    }
+    const auto stamp = [&](std::size_t i, std::uint8_t tag) {
+        auto view = arena.writable_view(blocks[i]);
+        std::memset(view.data(), tag, stride * blocks[i].page_count());
+    };
+    for (std::size_t i = 0; i < blocks.size(); ++i) { stamp(i, static_cast<std::uint8_t>(0x10 + i)); }
+
+    blocks[1].release();
+    blocks[5].release();
+    failures += expect_size(arena.free_extent_count(), 2, label + " interleaved free extents");
+    failures += expect_size(arena.largest_free_extent_bytes(), stride * 8,
+                            label + " largest free extent");
+
+    // 12 pages fit the total free (16) but no single extent (8): the
+    // fragmentation signature.
+    const std::uint64_t failures_before = arena.single_alloc_failures();
+    auto probe                          = arena.allocate(layout, 12);
+    failures += expect(!probe.has_value(), label + " fragmented single allocation succeeded");
+    failures += expect_size(arena.single_alloc_failures(), failures_before + 1,
+                            label + " fragmentation counter");
+
+    // Compact: live blocks pack to the front, free space becomes one extent.
+    failures += expect(arena.compact(), label + " compact reported no work");
+    failures += expect_size(arena.free_extent_count(), 1, label + " post-compact extents");
+    failures += expect_size(arena.largest_free_extent_bytes(), arena.free_bytes(),
+                            label + " post-compact free space");
+    failures += expect_size(arena.compaction_count(), 1, label + " compaction counter");
+
+    // The data moved with the descriptors.
+    for (std::size_t i = 0; i < blocks.size(); ++i) {
+        if (i == 1 || i == 5) { continue; }  // released
+        auto view = arena.view(blocks[i]);
+        const auto* bytes = reinterpret_cast<const std::uint8_t*>(view.data());
+        bool ok = true;
+        for (std::size_t j = 0; j < stride * blocks[i].page_count() && ok; ++j) {
+            ok = bytes[j] == static_cast<std::uint8_t>(0x10 + i);
+        }
+        failures += expect(ok, label + " relocated block data");
+    }
+
+    // The allocation that failed now succeeds from the contiguous free space.
+    auto repaired = arena.allocate(layout, 12);
+    failures += expect(repaired.has_value(), label + " allocation failed after compaction");
+
+    // Full release returns the whole arena; a contiguous arena needs no work.
+    for (auto& block : blocks) { if (block.valid()) { block.release(); } }
+    if (repaired) { repaired->release(); }
+    failures += expect_size(arena.free_bytes(), stride * kPages, label + " full release");
+    failures += expect(!arena.compact(), label + " compact on contiguous arena did work");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -434,6 +633,7 @@ int main() {
     try {
         ninfer::DeviceContext context(0);
         int failures = exercise_reservation_and_mapping(context);
+        failures += exercise_materialization_fit_gate(context);
         failures += exercise_layout_and_transfer(
             context,
             ninfer::KVPageGeometry{
@@ -456,6 +656,7 @@ int main() {
                     },
             },
             "HeadMajor");
+        failures += exercise_compaction();
         if (failures != 0) {
             std::cerr << failures << " Paged KV physical-container checks failed\n";
             return 1;

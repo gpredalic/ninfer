@@ -2,6 +2,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cmath>
 #include <cstdint>
 #include <iostream>
 #include <string>
@@ -59,6 +60,11 @@ StatsSnapshot make_snapshot() {
     s.load.weights_id    = "nvfp4";
     s.load.load_seconds  = 3.9;
     s.load.tensor_count  = 721;
+    // P1.5(d): visible queue — 3 waiting, first 2 reported (depth > entries
+    // exercises the truncation: depth is the true count, entries is bounded).
+    s.scheduler.queue_report_count = 2;
+    s.scheduler.queue_report[0]    = {412, 1, 41.7};
+    s.scheduler.queue_report[1]    = {413, 2, 12.3};
     return s;
 }
 
@@ -74,6 +80,16 @@ void assert_common(const Json& doc) {
     check(doc["scheduler"]["materializing"] == 2, "scheduler.materializing");
     check(doc["scheduler"]["capture_pending"] == 1, "scheduler.capture_pending");
     check(doc["scheduler"]["terminal_pending"] == 0, "scheduler.terminal_pending");
+    // P1.5(d): visible queue
+    check(doc["queue"]["depth"] == 3, "queue.depth");
+    check(doc["queue"]["entries"].is_array(), "queue.entries is array");
+    check(doc["queue"]["entries"].size() == 2, "queue.entries size (bounded)");
+    check(doc["queue"]["entries"][0]["request_id"] == 412, "queue[0].request_id");
+    check(doc["queue"]["entries"][0]["position"] == 1, "queue[0].position");
+    check(std::abs(doc["queue"]["entries"][0]["wait_seconds"].get<double>() - 41.7) < 0.001,
+          "queue[0].wait_seconds");
+    check(doc["queue"]["entries"][1]["request_id"] == 413, "queue[1].request_id");
+    check(doc["queue"]["entries"][1]["position"] == 2, "queue[1].position");
     // counters
     check(doc["counters"]["computed_prefill_tokens"] == 123456789ULL, "counters.prefill");
     check(doc["counters"]["committed_decode_tokens"] == 2345678ULL, "counters.decode");
@@ -118,6 +134,9 @@ int main() {
         check(!doc.contains("kv_cache"), "no kv_cache key (upstream has no KvCacheStats)");
         check(doc["scheduler"]["running"] == 0, "default scheduler zero");
         check(doc["http"]["in_flight"] == 0, "default http zero");
+        check(doc["queue"]["depth"] == 0, "default queue depth zero");
+        check(doc["queue"]["entries"].is_array() && doc["queue"]["entries"].empty(),
+              "default queue entries empty");
     }
     if (failures == 0) {
         std::cout << "test_stats_json: all checks passed\n";

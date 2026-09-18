@@ -47,6 +47,13 @@ out/
 /core
 /core.*
 
+# CTest output (build/Testing is covered by build/; this is the root-level copy)
+/Testing/
+
+# Monitor sidecar runtime files (pid + rotated logs)
+tools/monitor/monitor.pid
+tools/monitor/monitor.log.*
+
 # Measurement raw corpora & intermediates (large; produced by offline tooling).
 # The small final frequency stats under fixtures/ranking/ ARE tracked; the rest is ignored.
 tools/freq_corpus/fixtures/*

@@ -212,4 +212,48 @@ struct GenerationRequest {
     }
 };
 
+// Derive a stable per-conversation session key for requests that do not carry one
+// (the anthropic Messages path never supplies a hint; only the OpenAI Responses path
+// does). The fingerprint is FNV-1a over the system prompt text + the FIRST user turn's
+// text — the same constants the host-KV safety net uses for prompt hashes. The system
+// prompt is constant within a deployment and the first user turn is fixed for the life
+// of the conversation, so the key is stable across turns. After a client compaction
+// the first user turn changes and so does the key — correct: the pre-compaction units
+// no longer match the post-compaction prompt. A conversation with no user text (e.g.
+// image-only first turn) gets no key and keeps the pre-fix behavior.
+[[nodiscard]] inline std::optional<std::string> derive_session_key(const GenerationRequest& request) {
+    const auto text_of = [](const ChatTurn& turn) {
+        std::string out;
+        for (const ContentPart& part : turn.content) {
+            if (part.kind == ContentKind::Text) { out += part.text; }
+        }
+        return out;
+    };
+    std::string preimage;
+    for (const ChatTurn& turn : request.messages) {
+        if (turn.role == ChatRole::System) {
+            preimage += text_of(turn);
+            preimage += '\x1f'; // unit separator: no system/user boundary ambiguity
+        }
+    }
+    std::string first_user;
+    for (const ChatTurn& turn : request.messages) {
+        if (turn.role == ChatRole::User) {
+            first_user = text_of(turn);
+            break;
+        }
+    }
+    if (first_user.empty()) { return std::nullopt; }
+    preimage += first_user;
+    std::uint64_t hash = 1469598103934665603ULL; // FNV-1a, same as the safety net
+    for (const char c : preimage) {
+        hash ^= static_cast<std::uint64_t>(static_cast<unsigned char>(c));
+        hash *= 1099511628211ULL;
+    }
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string key = "cs-";
+    for (int shift = 60; shift >= 0; shift -= 4) { key += kHex[(hash >> shift) & 0xF]; }
+    return key;
+}
+
 } // namespace ninfer::serve
