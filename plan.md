@@ -1107,7 +1107,10 @@ shared meter.
           ttft delta).
         - Keep the brute-force recovery as the last-resort backstop (do not
           remove it).
-        *Status:* **Path A implemented + verified (2026-09-18).**
+        *Status:* **Path A implemented + e2e-verified (2026-09-18); the
+        state-saturation stall it targets is fixed, but the prod soak
+        (2026-09-18) showed the dominant prod bottleneck is host-net
+        overcommit, not the device→host planner — see P2.5 Increment 3.**
         Implementation (uncommitted): `shared_prefix_demotes()` helper
         (env `NINFER_SHARED_PREFIX_DEMOTES`, default ON) re-enables the
         demote option for shared-prefix owners only (private units stay
@@ -1217,6 +1220,114 @@ shared meter.
       Unit tests: `test_session_protection` (protected tier exhausted last,
       dead tier precedes protection, active unit survives idle evictions in
       the state-pool loop, exhaustion displaces it only when alone).
+      **Increment 3 — host-net overcommit under concurrent sessions (DESIGN,
+      2026-09-18; the finding that frontier-collapse + per-session protection
+      are NOT the bottleneck — the aggregate working set is).**
+      *Finding (live journal, 2026-09-18 11:40–11:47, one prod, PID 75435,
+      `host-kv-mib 30720` = 30 GiB shared budget, `host-state-slots 112`):*
+      With several concurrent Claude Code sessions the host net's working set
+      exceeds the 30 GiB budget and the net sits at its ceiling, evicting one
+      unit per capture (an eviction every 60–90 s in the observed window):
+      - **Supersede is working and is not the bottleneck.** Each conversation's
+        growing chain collapses to its current frontier (`[safety-net]
+        supersede: dropping frontier=45271 (prefix of 48377)`, `54749 (prefix of
+        55331)`, `59579 (prefix of 60308)`, …). The 18–22 entries are the
+        *current frontiers of distinct concurrent conversations* (one growing
+        48k→55k→56k→60k→63k→68k→75k, one steady ~36k always `miss`, plus dead
+        remnants / short-lived requests) — NOT redundant same-conversation
+        duplicates. So the overcommit is the **aggregate multi-conversation
+        working set**, exactly the steady state predicted for several
+        concurrent sessions (rare today only because one session is running).
+      - **The meter is a shared budget, not a double-count.**
+        `shared_occupied_bytes() = shared_arena_->occupied_bytes() +
+        state_retained_bytes_` (host_kv_safety_net.h:600) against
+        `state_budget_bytes_ = 30 GiB`. KV arena (27–29 GiB) + state images
+        (3.7–4.9 GiB) = 32–34 GiB > 30 GiB. `retain_state_capture` (736) evicts
+        until `shared + incoming ≤ budget`; the net oscillates at the ceiling
+        (30.09 → 29.87 → 30.13 → 31.03 GiB over 4 min).
+      - **Each entry carries a fixed ~150–307 MB state image** (a HostStatePool
+        slot) plus frontier-scaled KV. `112 slots × ~307 MB ≈ 34 GiB` of state
+        capacity alone — the state images are a large fixed fraction of the
+        budget, independent of frontier length.
+      - **Consequence:** under pressure the three-tier eviction (dead-largest,
+        live-smallest, active-session-last) exhausts dead + idle, then evicts
+        *live* sessions' frontiers (smallest = cheapest re-prefill), forcing
+        full re-prefills of active conversations — the degradation class that
+        becomes the norm under several concurrent sessions.
+      *This is a capacity / retention-ceiling problem, not a retention-logic
+      bug: supersede (collapse) and the per-session guarantee (protect) are
+      both shipped and working; the working set simply exceeds the budget.*
+      *Options:*
+      - **O0 — observability census (additive, zero-risk).** Surface the net
+        composition: entry count, per-entry {frontier, state_bytes, kv_pages,
+        liveness tier (dead / live / protected-live)}, and the
+        shared-vs-budget delta — in `/stats` (host_kv block) and a rate-limited
+        log line. Lets the operator confirm what is consuming the budget
+        (concurrent sessions vs dead remnants vs short-lived requests) and size
+        the budget from evidence instead of guessing.
+      - **O1 — budget headroom (primary lever, config).** The budget must fit
+        the working set: `N_concurrent × (avg_frontier_KV + ~307 MB state) +
+        headroom`. Sizing rule of thumb: budget ≈ 4 × (largest expected
+        single-session unit) for 2 sessions, +1× per additional expected
+        concurrent session. Bounded by host RAM (53 GB total).
+      - **O2 — soft-ceiling dead reaper (guardrail, kill-switch-able).** Dead
+        entries (unmatched > `dead_ttl`) are reaped only *under* budget
+        pressure (the dead-largest tier of the eviction loop). A bounded idle
+        reaper — evict ONLY dead entries, never live, when the net is over a
+        soft ceiling (e.g. 85% of budget) — keeps the baseline lean so pressure
+        episodes don't reach the live tier. `NINFER_NET_DEAD_REAP` (default on).
+        Low-risk: zero re-prefill cost, zero UX impact. *Caveat:* under the
+        observed continuous pressure the net is rarely idle, so this mainly
+        trims the steady-state baseline (dead remnants), not the pressure
+        episodes themselves.
+      - **O3 — eviction cost model = true re-prefill cost (refinement).** Rank
+        live victims by frontier length (the actual re-prefill cost) weighted by
+        session recency, not nominal KV pages. The current live-smallest already
+        approximates this; a refinement only changes *which* live session is
+        sacrificed, not *whether* one is.
+      - **O4 — per-conversation frontier cap.** Bound entries per conversation to
+        {current frontier + checkpoint}. Supersede already collapses the chain
+        to the current frontier, so marginal value is low.
+      - **O5 — cheaper state images / KV-only frontier entries.** Cutting the
+        fixed ~307 MB state image (or retaining KV-only for frontier entries
+        that will never be rewound to) would cut per-entry cost, but breaks the
+        unit invariant (P2.3) — a state image is required for an exact GDN/SSM
+        restore. Not recommended without a correctness redesign.
+      *Recommended increment:* **O0 (census) + O2 (soft-ceiling dead reaper)**
+      as the first ship — additive/low-risk, kill-switch-able, directly reduces
+      the overcommit baseline and the frequency of live-tier evictions — plus
+      **O1 sizing guidance** in the config docs. O3 as a follow-up if
+      live-eviction frequency stays high after O2.
+      **Implemented (2026-09-18) — the sharper answer to "which session is
+      active vs old copies": tier the eviction Active > Catalogued > dead.**
+      The root cause of the active session being displaced was that
+      `session_is_live` (the per-session guarantee's predicate) lumps **Active
+      and Catalogued** continuations together as "protected," so idle "old
+      copy" units (Catalogued — retained for reuse, not being served) got the
+      same last-resort protection as the session actually being driven. Fix:
+      add a `session_is_active` predicate (Active role only) and split the
+      protected tier into **idle-catalogued** (Catalogued = old copy) and
+      **active** (Active = being served). Eviction order is now
+      dead-largest → unprotected-live-smallest → **idle-catalogued-smallest →
+      active-smallest**, so a single driven session's frontier survives while
+      stale idle copies are reaped first. When `session_is_active` is unset the
+      behavior falls back to the pre-fix lumped tier (safe default).
+      *Files:* `host_kv_safety_net.h` (`session_is_active_` member +
+      `set_session_is_active`, `select_eviction_victim` four-tier split,
+      `select_victim` wiring); `program_impl.h` (`set_session_is_active` wired
+      to the Active-role continuation predicate); test
+      `test_host_kv_safety_net.cpp` (`test_active_vs_idle_tiering`).
+      *Status:* unit-tested (idle evicted before active; active last resort;
+      dead tier still precedes; fallback intact) + `ninfer-serve` builds.
+      **Deployed 2026-09-18 12:06** (e2e swap: 4/4 PASS — zero bad_alloc,
+      restore fired, cache reuse > 0, safety-net H2D restore; prod restored
+      on the fixed binary, sentinel re-armed). Early soak: 0 evictions in the
+      first minutes post-deploy (pre-deploy cadence was one every 45–90 s),
+      one healthy `[safety-spill] OK` (unit retained complete at its
+      checkpoint frontier). The tiering's real test is as old copies
+      accumulate: evictions should drain dead → idle (Catalogued) first, with
+      the active session's frontier last. O0 census + O2 reaper remain as
+      follow-ups if the tiering alone doesn't clear the thrash.
 - [x] **P2.6 — config.** `--host-state-slots` derived from (or replaced by) the
       shared budget; document the single `--host-cache-mib`. **Shipped
       (2026-09-17, with the P4.1 relief-fix deploy):** `host_cache_mib` +
