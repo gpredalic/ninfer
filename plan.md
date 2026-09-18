@@ -473,15 +473,22 @@ development. Each is verified with the P0 e2e gate + the live journal.
       - **Both cold-root and reuse turns produce dumps** (req 36 today: 11.9k
         @312k, cold ROOT, no cache) — so the restore/reuse path is not the
         sole trigger.
-      *Remaining hypotheses (ranked):*
-      - **H-A — intrinsic long-context degradation** (the model's utilization
-        of its own context degrades with length; the 3.4%-at->350k gradient +
-        chronic presence fit this). Baseline explanation.
-      - **H-B — template rendering of long histories** (the 09-11 template
-        change improved dumps overall, but may mishandle long
-        assistant/tool/thinking histories — e.g. truncating or misrendering
-        the model's own recent turns, which would produce exactly the
-        "re-establishes context every turn" pattern).
+      *Remaining hypotheses (ranked; H-B ruled out 2026-09-18 → H-A is the
+      lead):*
+      - **H-A — intrinsic long-context degradation (LEAD)** (the model's
+        utilization of its own context degrades with length; the 3.4%-at->350k
+        gradient + chronic presence fit this). Baseline explanation.
+      - **H-B — template rendering of long histories — RULED OUT (2026-09-18,
+        template inspection).** froggeric_v225 renders the FULL conversation
+        (`messages[head.count:]` = every non-system turn, no truncation;
+        `head.count` only re-splits leading system/developer messages). The
+        only length-dependent behavior is the thinking-preservation threshold
+        (`last_query_index = _last_idx` when `_last_idx > 50` in an all-tool-
+        response agentic loop) — already saturated at ~700+ messages, far
+        below the 350k onset, so it is not a new effect there.
+        `max_tool_arg_chars`/`max_tool_response_chars` default 0 (no
+        truncation) and are not exposed in serve options. The template renders
+        long histories faithfully.
       - **H-C — attention quality over cached prefixes at 300k+** (weaker now
         that cold-root dumps exist, but a restore-path position/attention bug
         could still add to it).
@@ -495,10 +502,11 @@ development. Each is verified with the P0 e2e gate + the live journal.
          prompt with needles planted at 10k/110k/210k/290k, run (a) cold and
          (b) on a warm cache. Deep-position recall failing on BOTH → H-A
          (intrinsic/scaling quality); failing only warm → H-C (restore path).
-      3. **(cheap)** Diff froggeric_v225 against the pre-09-11 template
-         (`git show cb535944^:...`) for how it renders long assistant/tool/
-         thinking histories; A/B the two templates on a 300k+ conversation in
-         a stopped window.
+      3. **(DONE 2026-09-18)** Inspect froggeric_v225 for long-history
+         handling: no truncation, no length-dependent rendering beyond the
+         already-saturated 50-message thinking threshold → H-B ruled out.
+         (The pre-09-11 diff would only explain the 09-11 *improvement*, not
+         the 350k onset — not needed.)
       4. Track the macro-stuck pattern itself: count consecutive no-progress
          turns per session from the client transcripts (the request log has no
          content, so this must come from the .jsonl transcripts) — establish
