@@ -364,8 +364,11 @@ development. Each is verified with the P0 e2e gate + the live journal.
       e2e-swap's expected stop/start). The full 24h predates journald
       retention, but there have been no unplanned restarts — the only
       restarts today were the three directed e2e swaps. (a) the 15:15–15:32
-      stall class remains uninvestigated (its journal rotated out; the
-      request logs for that window are in `~/ninfer-requests.jsonl.2`).
+      stall class is **DIAGNOSED (2026-09-18): not a wedge** — the 09-15
+      request log shows 0 true wedges, 80 active + 98 transient
+      materialization snapshots; the engine was actively serving (large-unit
+      restores + between-turn idle gaps), misread as a stall from sparse
+      snapshots. See the standalone item for the full analysis.
 - [ ] **P1.8 — client abandons queued requests (serve-layer, new 2026-09-16).**
       The user's session showed `finish=cancelled` at queue=29.37s (0 tokens)
       with the client re-sending the same turn 0.5s later (that copy
@@ -1664,9 +1667,22 @@ unit model; building the unit first makes this cheaper.
       4→12 GiB (~/ninfer-e2e, outside repo): the converged planner retains
       ~3× more units on host (the intended P2.4 behavior), which starved the
       old 4 GiB arena (thinking spills + state-saturation relief).
-- [ ] **15:15–15:32 stall (pre-deploy, uninvestigated).** ~15 min at
-      `waiting=1, materializing=1`. May be error-loop fallout — recheck the
-      post-deploy journal before chasing.
+- [x] **15:15–15:32 stall (pre-deploy) — DIAGNOSED 2026-09-18: not a wedge.**
+      Re-examined the 09-15 request-log snapshots for 15:14–15:35 (271 rows):
+      **0 true wedges** (running=prefilling=decode_ready=0 with waiting≥1),
+      80 active snapshots (run/prefill/decode > 0) and 98 transient
+      `materializing=1` snapshots. The engine was actively serving — a stream
+      of short requests (the user's agentic loop) interleaved with large-unit
+      materializations (safety-net H2D / checkpoint restores; prefill spikes
+      of 4096/5473 tok/s). The "materializing=1 for ~15 min" impression was a
+      misread: the snapshots are sparse (recorded on state change), so a
+      single `mat=1` row followed by an idle gap looked like a sustained
+      materialization, but the gap was the user between turns, not a stuck
+      engine. The "ticker degraded to 25–30s" detail was from the (now-rotated)
+      journal throughput-interval lines, likely the restore's D2H/H2D transfer
+      time. *No fix needed for this instance* — it was active processing, not
+      a wedge. (The underlying cost — a large-unit restore is slow — is the
+      expected cold/restore-prefill cost, not a defect.)
 - [ ] **jinja carries** (not on the serving path): qwen3.8 artifact embedded
       template rebuild (needs BF16 source); frontend flag exposure
       (`tool_call_format`, `auto_disable_thinking_with_tools`,
