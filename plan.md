@@ -97,7 +97,7 @@ net), or torn apart mid-eviction:
       `tools/e2e/ninfer-e2e.py`. `8530a45b`. *Exit:* two consecutive full e2e
       runs with 0 `rewrite_checkpoint_invalid` flaps. **This makes e2e a
       trustworthy gate for the P1 fixes.**
-- [ ] **P0.2 — retry detection** (old #4c). **Re-scoped 00:15:** the 23:10
+- [x] **P0.2 — retry detection** (old #4c). **Re-scoped 00:15:** the 23:10
       episode showed the content-keyed shortlist already serves an
       identical re-sent prompt (`[shortlist] HIT reuse_tokens=295509` on
       req 22, the retry after req 21's abort) — no full re-prefill. The
@@ -106,6 +106,13 @@ net), or torn apart mid-eviction:
       a live window on the fixed binary, check the request log for genuine
       same-prompt re-prefills (`reuse=root` within ~60s of an identical
       prompt); build the hash-ring detector only if the data shows them.
+      **Exit MET (2026-09-18, request log since the fixed binary):** 3,673
+      request_done events, 362 repeated (message_count, prompt_tokens)
+      shapes; exactly ONE shape has a root re-prefill within 60s of a
+      cached same-shape request (14.4s gap, sandwiched between two
+      normally-cached requests — a shape-level coincidence, not a content-
+      verified retry). No systematic same-prompt re-prefill class → no
+      hash-ring detector needed.
 - [x] **P0.3 — state-pool stopgap** (old #1b-lite). `--host-state-slots 24→48`
       in `~/.config/ninfer.conf` (147 MiB/slot → ~7 GiB RAM). Applied 23:55,
       verified `host_state_capacity_slots: 48`. Justified by the 23:09
