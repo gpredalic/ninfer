@@ -896,6 +896,56 @@ public:
         return freed;
     }
 
+    // P2.5 Increment 3 (O2): soft-ceiling dead reaper. When the shared occupancy
+    // sits above the soft ceiling (a fraction of the byte budget), proactively
+    // reap STALE entries so pressure episodes reach the live/idle/active tiers
+    // less often. Called from add() after each capture, so it runs exactly when
+    // the net grows.
+    //
+    // Conservative by design (unlike select_victim, which is the reactive
+    // under-pressure evictor and treats never-matched as immediately dead):
+    //   - only DEAD-tier entries are touched (classify_tier == Dead) — live,
+    //     idle (Catalogued old copies), and active units are never reaped, so
+    //     there is zero UX impact;
+    //   - a FRESH entry (created within the dead TTL) is left alone, so a just
+    //     spilled unit is not immediately reaped (it is "never matched" and
+    //     therefore Dead-tier, but not yet stale).
+    // Reaps the largest stale entry first (the dead-largest policy). Returns
+    // the number reaped.
+    [[nodiscard]] std::uint32_t reap_stale_above_ceiling() noexcept {
+        if (!soft_ceiling_reap_enabled_ || state_budget_bytes_ == 0) { return 0; }
+        const std::size_t ceiling = state_budget_bytes_ * kSoftCeilingPct / 100;
+        if (shared_occupied_bytes() <= ceiling) { return 0; }
+        const auto now = std::chrono::steady_clock::now();
+        std::uint32_t reaped = 0;
+        while (shared_occupied_bytes() > ceiling) {
+            std::optional<std::size_t> victim;
+            std::size_t best_size = 0;
+            for (std::size_t i = 0; i < entries_.size(); ++i) {
+                const HostKVSafetyNetEntry& e = entries_[i];
+                if (e.pinned || !is_complete_unit(e)) { continue; }
+                if (classify_tier(e, now) != EvictionTier::Dead) { continue; }
+                if (now - e.created <= dead_ttl_) { continue; }  // fresh: leave it
+                const std::size_t sz = unit_context_pages(e);
+                if (!victim || sz > best_size) { victim = i; best_size = sz; }
+            }
+            if (!victim) { break; }  // no stale entries left to reap
+            std::fprintf(stderr,
+                         "[host-state-pool] reap=stale idx=%zu ctx_pages=%zu shared=%zu "
+                         "ceiling=%zu budget=%zu (O2 soft-ceiling dead reaper)\n",
+                         *victim, unit_context_pages(entries_[*victim]),
+                         shared_occupied_bytes(), ceiling, state_budget_bytes_);
+            remove(*victim);
+            ++reaped;
+        }
+        return reaped;
+    }
+
+    // P2.5 Increment 3 (O2): enable/disable the soft-ceiling dead reaper.
+    // Default ON; the program sets it from NINFER_NET_DEAD_REAP (=0 disables).
+    void set_soft_ceiling_reap(bool enabled) noexcept { soft_ceiling_reap_enabled_ = enabled; }
+    [[nodiscard]] bool soft_ceiling_reap_enabled() const noexcept { return soft_ceiling_reap_enabled_; }
+
     // P2.4 Increment 1 (spill-before-loss): is a unit with this identity still
     // retained in the net — i.e. can a future request for this unit be
     // restored from it? A frontier F is covered by an entry with the same
@@ -1013,6 +1063,9 @@ public:
         entry.pinned = false;  // re-added entries are unpinned
 
         entries_.push_back(std::move(entry));
+        // P2.5 Increment 3 (O2): keep the net under the soft ceiling by reaping
+        // stale (dead) entries — the just-added entry is fresh, so it is safe.
+        reap_stale_above_ceiling();
         return true;
     }
 
@@ -1157,6 +1210,12 @@ private:
     // Retained state-image bytes and their budget (0 = unbounded).
     std::size_t state_budget_bytes_    = 0;
     std::size_t state_retained_bytes_  = 0;
+    // P2.5 Increment 3 (O2): soft-ceiling dead reaper — when the shared
+    // occupancy exceeds this fraction of the byte budget, reap stale (dead)
+    // entries proactively. 85%: leaves headroom so a pressure spike doesn't
+    // immediately hit the hard budget.
+    static constexpr std::uint32_t kSoftCeilingPct = 85;
+    bool soft_ceiling_reap_enabled_ = true;
     // Live view of the other tenant of the shared host budget (KV pages).
     const HostKVArena* shared_arena_ = nullptr;
     std::atomic<std::uint64_t> evictions_{0};

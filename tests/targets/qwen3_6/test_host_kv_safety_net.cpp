@@ -619,6 +619,59 @@ void test_tier_census() {
     check(c.active_bytes == 5000 * stride + sb, "active tier bytes");
 }
 
+// P2.5 Increment 3 (O2): the soft-ceiling dead reaper reaps STALE (dead)
+// entries when the net sits above the soft ceiling, but never touches fresh
+// live entries — and is a no-op when disabled.
+void test_soft_ceiling_reaper() {
+    const auto now = std::chrono::steady_clock::now();
+    const std::size_t sb = 1024;
+
+    auto add_fresh_live = [&](HostKVSafetyNet& net, std::size_t base) {
+        auto e = make_entry(1000, static_cast<std::uint32_t>(base), sb);
+        e.ever_matched = true;
+        e.last_matched = now;  // matched now -> live, and created now -> fresh
+        net.add(std::move(e));
+    };
+
+    // Budget 100 sb -> soft ceiling 85 sb. No shared_arena, so shared_occupied
+    // == retained state bytes.
+    {
+        HostKVSafetyNet net;
+        net.set_dead_ttl(std::chrono::minutes(15));
+        net.set_state_budget_bytes(100 * sb);
+
+        // 86 fresh live entries (86 sb, just above the 85 sb ceiling). The
+        // reaper fires on each add but finds no dead entry -> no-op.
+        for (std::size_t i = 0; i < 86; ++i) { add_fresh_live(net, i * 1000000); }
+        check(net.size() == 86, "fresh live entries are never reaped");
+
+        // A STALE dead entry (matched 2h ago, created 2h ago) pushes the net
+        // above the ceiling. It is the only dead entry, so it is the one reaped.
+        auto stale = make_entry(5000, 9999999, sb);
+        stale.ever_matched = true;
+        stale.last_matched = now - std::chrono::hours(2);
+        stale.created      = now - std::chrono::hours(2);  // not fresh
+        net.add(std::move(stale));
+        check(net.size() == 86, "the stale dead entry was reaped above the ceiling");
+    }
+
+    // Kill-switch: with the reaper disabled, the stale entry is retained even
+    // though the net is above the ceiling.
+    {
+        HostKVSafetyNet net;
+        net.set_dead_ttl(std::chrono::minutes(15));
+        net.set_state_budget_bytes(100 * sb);
+        net.set_soft_ceiling_reap(false);
+        for (std::size_t i = 0; i < 86; ++i) { add_fresh_live(net, i * 1000000); }
+        auto stale = make_entry(5000, 9999999, sb);
+        stale.ever_matched = true;
+        stale.last_matched = now - std::chrono::hours(2);
+        stale.created      = now - std::chrono::hours(2);
+        net.add(std::move(stale));
+        check(net.size() == 87, "reaper disabled -> stale entry retained");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -628,6 +681,7 @@ int main() {
     test_session_protection();
     test_active_vs_idle_tiering();
     test_tier_census();
+    test_soft_ceiling_reaper();
     test_retains();
     test_state_slot_lifecycle();
     test_make_room_for_state_slots();

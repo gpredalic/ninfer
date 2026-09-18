@@ -299,6 +299,19 @@ static bool shared_prefix_demotes() noexcept {
     return demote;
 }
 
+// P2.5 Increment 3 (O2, 2026-09-18): soft-ceiling dead reaper. When the host
+// net's shared occupancy sits above a soft ceiling (85% of the byte budget),
+// stale (dead) entries are reaped proactively on each capture, so pressure
+// episodes reach the live/idle/active tiers less often. Default ON;
+// NINFER_NET_DEAD_REAP=0 disables (rollback).
+static bool net_dead_reap_enabled() noexcept {
+    static const bool enabled = [] {
+        const char* v = std::getenv("NINFER_NET_DEAD_REAP");
+        return v == nullptr || v[0] == '\0' || std::string(v) != "0";
+    }();
+    return enabled;
+}
+
 std::optional<StateImageHandle> pressure_state_source(qwen3_6::detail::PressureStateDecision change,
                                                       const SequenceState* sequence,
                                                       const SharedPrefixState* shared) {
@@ -985,6 +998,8 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         // footprint of the context cache.
         host_kv_safety_net.set_shared_arena(host_kv_arena.get());
         host_kv_safety_net.set_state_budget_bytes(plan.context_cache.host_kv_capacity_bytes);
+        // P2.5 Increment 3 (O2): soft-ceiling dead reaper (NINFER_NET_DEAD_REAP).
+        host_kv_safety_net.set_soft_ceiling_reap(net_dead_reap_enabled());
         // P2.4 Increment 2 (net as the unit's host home): net entries hold
         // their state images in HostStatePool slots — the same pool the store
         // uses for host replicas — so host-state residency is the pool's

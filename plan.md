@@ -1339,10 +1339,26 @@ shared meter.
       `api_impl.h` / `resource_manager.h` / `stats_json.cpp`. Unit test
       `test_tier_census` (one entry per tier, per-tier byte sums) passes;
       `ninfer-serve` builds; stats_json test all-pass; resource_manager test
-      at its 5 baseline FAILs (no new). Rides the next deploy — it is the
-      tool for judging, from `/stats`, whether the budget is held by dead
+      at its 5 baseline FAILs (no new). **Deployed 2026-09-18 12:41** (e2e
+      swap 4/4 PASS). First live snapshot: the fresh post-restart entries
+      classify as `dead` (unmatched until their first hit) — correct. It is
+      the tool for judging, from `/stats`, whether the budget is held by dead
       remnants, idle old copies, or live sessions (i.e. whether the tiering
       alone clears the thrash or O1/O2 are still needed).
+      **O2 soft-ceiling dead reaper IMPLEMENTED (2026-09-18, uncommitted):**
+      when the net's shared occupancy sits above a soft ceiling (85% of the
+      byte budget), stale (dead) entries are reaped proactively on each
+      capture (`add()`), so pressure episodes reach the live/idle/active tiers
+      less often. Conservative by design: only DEAD-tier entries are touched
+      (live/idle/active are never reaped — zero UX impact), and a FRESH entry
+      (created within the dead TTL) is left alone so a just-spilled unit is
+      not immediately reaped. `HostKVSafetyNet::reap_stale_above_ceiling()`
+      (largest-stale-first, called from `add()`), `set_soft_ceiling_reap()`
+      + `kSoftCeilingPct=85`; kill-switch `NINFER_NET_DEAD_REAP=0` (default
+      ON) wired in `program_impl.h`. Unit test `test_soft_ceiling_reaper`
+      (reaps the stale dead entry above the ceiling, never touches fresh live
+      entries, no-op when disabled) passes; `ninfer-serve` builds. Rides the
+      next deploy.
 - [x] **P2.6 — config.** `--host-state-slots` derived from (or replaced by) the
       shared budget; document the single `--host-cache-mib`. **Shipped
       (2026-09-17, with the P4.1 relief-fix deploy):** `host_cache_mib` +
