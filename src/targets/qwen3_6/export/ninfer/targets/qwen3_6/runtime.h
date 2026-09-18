@@ -744,6 +744,11 @@ public:
     [[nodiscard]] std::uint64_t relief_kv_releases() const noexcept;
     [[nodiscard]] std::uint64_t relief_kv_not_retained() const noexcept;
     [[nodiscard]] std::uint64_t relief_kv_pages_freed() const noexcept;
+    // P2.4 follow-ups: units destroyed (not retained) at a continuation-slot
+    // release, and the spill path's state-image D2H transfers (for /stats).
+    [[nodiscard]] std::uint64_t slot_release_destroys() const noexcept;
+    [[nodiscard]] std::uint64_t spill_state_d2h_count() const noexcept;
+    [[nodiscard]] std::uint64_t spill_state_d2h_bytes() const noexcept;
     // Materialization allocation failures by resource (for /stats): state-slot
     // exhaustion (device state pool full) is the parallel-large-session bad_alloc
     // signature; KV-page exhaustion rules the page pool in or out.

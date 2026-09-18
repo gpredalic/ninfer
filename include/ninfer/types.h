@@ -954,6 +954,13 @@ struct RuntimeStats {
     std::uint64_t relief_kv_releases     = 0;
     std::uint64_t relief_kv_not_retained = 0;
     std::uint64_t relief_kv_pages_freed  = 0;
+    // P2.4 follow-ups: units destroyed (not retained in the net) at a
+    // continuation-slot release, and the spill path's state-image D2H
+    // transfers (the state half of a unit's move — the planner-driven
+    // state-transfer counters do not see the spill path).
+    std::uint64_t slot_release_destroys = 0;
+    std::uint64_t spill_state_d2h_count = 0;
+    std::uint64_t spill_state_d2h_bytes = 0;
     // Materialization allocation failures by resource (monotonic): the plan
     // projected feasibility, but the physical reservation ran out. State-slot
     // exhaustion (device state pool full) is the 2026-09 parallel-large-session

@@ -296,6 +296,21 @@ std::uint64_t Program<Variant>::relief_kv_pages_freed() const noexcept {
 }
 
 template <>
+std::uint64_t Program<Variant>::slot_release_destroys() const noexcept {
+    return impl_ ? impl_->slot_release_destroys() : 0;
+}
+
+template <>
+std::uint64_t Program<Variant>::spill_state_d2h_count() const noexcept {
+    return impl_ ? impl_->spill_state_d2h_count() : 0;
+}
+
+template <>
+std::uint64_t Program<Variant>::spill_state_d2h_bytes() const noexcept {
+    return impl_ ? impl_->spill_state_d2h_bytes() : 0;
+}
+
+template <>
 std::uint64_t Program<Variant>::materialize_state_slot_alloc_failures() const noexcept {
     return impl_ ? impl_->materialize_state_slot_alloc_failures() : 0;
 }

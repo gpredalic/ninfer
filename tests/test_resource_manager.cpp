@@ -579,6 +579,9 @@ public:
     [[nodiscard]] std::uint64_t relief_kv_releases() const noexcept { return 0; }
     [[nodiscard]] std::uint64_t relief_kv_not_retained() const noexcept { return 0; }
     [[nodiscard]] std::uint64_t relief_kv_pages_freed() const noexcept { return 0; }
+    [[nodiscard]] std::uint64_t slot_release_destroys() const noexcept { return 0; }
+    [[nodiscard]] std::uint64_t spill_state_d2h_count() const noexcept { return 0; }
+    [[nodiscard]] std::uint64_t spill_state_d2h_bytes() const noexcept { return 0; }
     [[nodiscard]] std::uint64_t materialize_state_slot_alloc_failures() const noexcept {
         return 0;
     }

@@ -6962,6 +6962,11 @@ bool ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index,
                             .data = host_state_images->writable_view(*new_slot).data,
                             .layout = &state_images->host_layout()};
                         state_images->copy_to_host(device_slot, state_view, device.transfer_stream);
+                        // P2.4 follow-up: the spill's state D2H is invisible to the
+                        // planner-driven state-transfer counters — count it here so
+                        // the state half of a unit's move shows in /stats.
+                        ++spill_state_d2h_count_;
+                        spill_state_d2h_bytes_ += state_bytes;
                         state_slot = std::move(new_slot);
                     }
                 }
@@ -7034,6 +7039,10 @@ bool ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index,
                             .layout = &state_images->host_layout()};
                         state_images->copy_to_host(checkpoint_slot, checkpoint_view,
                                                    device.transfer_stream);
+                        // P2.4 follow-up: count the checkpoint image's D2H too
+                        // (the state half of the unit's move).
+                        ++spill_state_d2h_count_;
+                        spill_state_d2h_bytes_ += checkpoint_state_bytes;
                         checkpoint_state_slot = std::move(new_slot);
                         checkpoint_valid = true;
                         checkpoint_frontier = sequence.rewrite_checkpoint.frontier;
@@ -7320,6 +7329,16 @@ std::uint64_t ProgramImplCore::relief_kv_not_retained() const noexcept {
 }
 std::uint64_t ProgramImplCore::relief_kv_pages_freed() const noexcept {
     return relief_kv_pages_freed_.load(std::memory_order_relaxed);
+}
+
+std::uint64_t ProgramImplCore::slot_release_destroys() const noexcept {
+    return slot_release_destroys_.load(std::memory_order_relaxed);
+}
+std::uint64_t ProgramImplCore::spill_state_d2h_count() const noexcept {
+    return spill_state_d2h_count_.load(std::memory_order_relaxed);
+}
+std::uint64_t ProgramImplCore::spill_state_d2h_bytes() const noexcept {
+    return spill_state_d2h_bytes_.load(std::memory_order_relaxed);
 }
 
 std::uint64_t ProgramImplCore::materialize_state_slot_alloc_failures() const noexcept {
@@ -8423,15 +8442,15 @@ std::optional<std::uint32_t> ProgramImplCore::allocate_continuation_slot() noexc
     return std::nullopt;
 }
 
-void ProgramImplCore::retain_unit_before_state_loss(std::uint32_t index) noexcept {
-    if (index >= continuation_capacity) { return; }
+bool ProgramImplCore::retain_unit_before_state_loss(std::uint32_t index) noexcept {
+    if (index >= continuation_capacity) { return true; }
     const SequenceState& sequence = continuation_states[index];
     // A live unit: KV retained, an identity, and a frontier. A slot mid-
     // materialization (reserved destination, nothing committed yet) has
     // text_kv_valid == 0 and holds no unit content — nothing to retain.
     if (!sequence.kv || sequence.text_kv_valid == 0 || sequence.prefix_identity.size() == 0 ||
         sequence.execution_frontier == 0) {
-        return;
+        return true;
     }
     const std::uint32_t checkpoint_frontier =
         sequence.rewrite_checkpoint.valid ? sequence.rewrite_checkpoint.frontier : 0;
@@ -8441,13 +8460,13 @@ void ProgramImplCore::retain_unit_before_state_loss(std::uint32_t index) noexcep
     if (host_kv_safety_net.retains(std::span<const TokenId>(sequence.ledger),
                                    sequence.prefix_identity, sequence.session_key,
                                    sequence.execution_frontier, checkpoint_frontier)) {
-        return;
+        return true;
     }
     std::fprintf(stderr,
                  "[spill-before-loss] index=%u frontier=%u ckpt=%u — unit not in net and its "
                  "state is about to lose its last copy; spilling the complete unit\n",
                  index, sequence.execution_frontier, checkpoint_frontier);
-    spill_victim_to_host_kv_safety_net(index);
+    return spill_victim_to_host_kv_safety_net(index);
 }
 
 void ProgramImplCore::release_continuation_slot(std::uint32_t index) noexcept {
@@ -8459,8 +8478,10 @@ void ProgramImplCore::release_continuation_slot(std::uint32_t index) noexcept {
     // before releasing their victims; this covers every other caller (cancel/
     // abort teardown, capacity pressure, transaction failure) and the case
     // where a prior spill was refused by the net's host budget. If the net
-    // retains the unit this is a cheap no-op.
-    retain_unit_before_state_loss(index);
+    // retains the unit this is a cheap no-op. A false return means the unit
+    // (a live {KV + state} unit) is destroyed by this release — capacity
+    // eviction or client cancellation — and is counted for /stats.
+    if (!retain_unit_before_state_loss(index)) { ++slot_release_destroys_; }
     SequenceState& sequence = continuation_states[index];
     release_active_shared_references(sequence);
     release_sequence_kv(sequence);

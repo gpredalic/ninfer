@@ -1153,6 +1153,9 @@ public:
         out.relief_kv_releases            = program.relief_kv_releases();
         out.relief_kv_not_retained        = program.relief_kv_not_retained();
         out.relief_kv_pages_freed         = program.relief_kv_pages_freed();
+        out.slot_release_destroys         = program.slot_release_destroys();
+        out.spill_state_d2h_count         = program.spill_state_d2h_count();
+        out.spill_state_d2h_bytes         = program.spill_state_d2h_bytes();
         out.materialize_state_slot_alloc_failures = program.materialize_state_slot_alloc_failures();
         out.materialize_dual_device_replica_drops = program.materialize_dual_device_replica_drops();
         out.materialize_kv_page_alloc_failures    = program.materialize_kv_page_alloc_failures();

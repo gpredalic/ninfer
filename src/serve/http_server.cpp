@@ -107,6 +107,9 @@ bool report_has_activity(const ThroughputReport& report) {
            report.current.relief_kv_releases != report.previous.relief_kv_releases ||
            report.current.relief_kv_not_retained != report.previous.relief_kv_not_retained ||
            report.current.relief_kv_pages_freed != report.previous.relief_kv_pages_freed ||
+           report.current.slot_release_destroys != report.previous.slot_release_destroys ||
+           report.current.spill_state_d2h_count != report.previous.spill_state_d2h_count ||
+           report.current.spill_state_d2h_bytes != report.previous.spill_state_d2h_bytes ||
            report.current.historical_fork_hits != report.previous.historical_fork_hits ||
            report.current.device_state_occupied_slots !=
                report.previous.device_state_occupied_slots ||

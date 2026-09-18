@@ -585,8 +585,10 @@ public:
     // P2.4 Increment 1 (spill-before-loss): before a continuation slot is
     // released, ensure the unit's complete {KV + state} is retained in the
     // host safety net — the unit invariant forbids the state half losing its
-    // last restorable copy while the KV half is still retained.
-    void retain_unit_before_state_loss(std::uint32_t index) noexcept;
+    // last restorable copy while the KV half is still retained. Returns
+    // whether the unit is retained after the call (already in the net, or
+    // spilled and retained); false means the slot release destroys the unit.
+    bool retain_unit_before_state_loss(std::uint32_t index) noexcept;
     [[nodiscard]] std::uint64_t safety_net_restore_count() const noexcept;
     // Host-KV arena fragmentation counters and safety-net evictions (for /stats).
     [[nodiscard]] std::uint64_t host_kv_single_alloc_failures() const noexcept;
@@ -598,6 +600,14 @@ public:
     [[nodiscard]] std::uint64_t relief_kv_releases() const noexcept;
     [[nodiscard]] std::uint64_t relief_kv_not_retained() const noexcept;
     [[nodiscard]] std::uint64_t relief_kv_pages_freed() const noexcept;
+    // P2.4 follow-ups: units destroyed (not retained in the net) at a
+    // continuation-slot release — capacity eviction or client cancellation —
+    // and the spill path's state-image D2H transfers (the state half of a
+    // unit's move, which the planner-driven state-transfer counters do not
+    // see).
+    [[nodiscard]] std::uint64_t slot_release_destroys() const noexcept;
+    [[nodiscard]] std::uint64_t spill_state_d2h_count() const noexcept;
+    [[nodiscard]] std::uint64_t spill_state_d2h_bytes() const noexcept;
     // Materialization allocation failures by resource (for /stats).
     [[nodiscard]] std::uint64_t materialize_state_slot_alloc_failures() const noexcept;
     [[nodiscard]] std::uint64_t materialize_dual_device_replica_drops() const noexcept;
@@ -804,6 +814,9 @@ public:
     std::atomic<std::uint64_t> relief_kv_releases_{0};
     std::atomic<std::uint64_t> relief_kv_not_retained_{0};
     std::atomic<std::uint64_t> relief_kv_pages_freed_{0};
+    std::atomic<std::uint64_t> slot_release_destroys_{0};
+    std::atomic<std::uint64_t> spill_state_d2h_count_{0};
+    std::atomic<std::uint64_t> spill_state_d2h_bytes_{0};
 
     // Checkpoint state is retained only inside a complete {attention KV + GDN state}
     // unit held by the safety net; there is no state-only capture. The old
