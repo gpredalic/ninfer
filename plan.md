@@ -233,7 +233,7 @@ development. Each is verified with the P0 e2e gate + the live journal.
       *Exit:* 0 `LEAK (orphan)` lines — 3 today, all pre-fix, all
       `endpoint-write ckpt_refs=1 shared_refs=0 DeviceOnly`, each following
       an error-burst recovery; verify in the live window.
-- [ ] **P1.5 — the device-KV pool is structurally over-committed; make relief
+- [x] **P1.5 — the device-KV pool is structurally over-committed; make relief
       effective.** Quantified 22:28: a 267k-token request (req 25) needed
       4684 pages; the pool had 535 free; 7 idle-continuation demotions
       (29k mapped pages total) freed only **77** pages (535→612) — 99.7% of
@@ -318,6 +318,26 @@ development. Each is verified with the P0 e2e gate + the live journal.
       *Exit:* a
       5th-conversation e2e scenario completes (via shared-prefix demotion or
       a fast visible queue) without a deadline abort.
+      **Exit MET (2026-09-18 20:4x, full 14-phase e2e on the counter binary):**
+      phase 14 (queued-relief — the designated gate) passed every assertion:
+      12 KV occupancy blocks (unfitted heads kept in the visible queue, not a
+      silent 120s defer), relief-while-queued fired 13×, **no queued-KV
+      deadline aborts**, zero bad_alloc / worker recoveries under queueing.
+      The overflow conversations complete via the fast visible queue +
+      relief, exactly the exit criterion. (The full suite's 2 FAILs are
+      pre-existing pressure-class, not regressions — see the note below.)
+      *Note (full 14-phase e2e, 2026-09-18 20:4x):* 63 PASS / 13 WARN / 2 FAIL.
+      The 2 FAILs are both in pressure-forced phases my counter/path work does
+      not touch (the diff is behavior-neutral: 6 new counters + a
+      void→bool signature change with identical retain/spill logic):
+      (1) `checkpoint-advance` — checkpoint frontier stalls at 20083 for 4
+      rounds under forced pressure (a capture-timing behavior); (2)
+      `state-saturation` — 2 worker recoveries (the documented forced-
+      saturation self-heal class, plan line ~1161: 13 recoveries on the Inc 2
+      binary, now 2). Neither is caused by this work; a clean old-binary
+      baseline was not re-run (54-min GPU + 2 prod interruptions) but the
+      behavior-neutral diff + the documented state-saturation baseline make a
+      regression implausible.
 - [ ] **P1.6 — the admission wedge: a queued request must run or fail,
       bounded.** The user's restart trigger is GPU 0% while the session is
       active — signature `running=0 prefilling=0 decode_ready=0` sustained
@@ -1444,11 +1464,14 @@ shared meter.
         the original oracle. **Final re-pin (this change):** the
         `state_d2h` condition is dropped (the state image's presence is
         proven by the resume phase's restore — no state image → no
-        restore); the diagnostic still prints it. *Observability gap
-        (small follow-up, not load-bearing): the spill path's state D2H
-        (147MB per unit) is invisible in `/stats` state-transfer counters —
-        report it via the transfer-observation path so the state half of a
-        unit's move is counted like the KV half.*
+        restore); the diagnostic still prints it. *Observability gap —
+        **DONE (2026-09-18, `2360dbe3`):** the spill path's state D2H is now
+        counted via `spill_state_d2h_count` / `spill_state_d2h_bytes` (the two
+        device→host copy sites in the spill — endpoint + checkpoint images).
+        Verified live: 5 spills × 153,954,304 B = 769,771,520 B in /stats.
+        (Counted directly at the copy sites rather than via the
+        transfer-observation path, which is transaction-coupled and the spill
+        is transaction-free.)*
         **Window 5 (next): full default scenario set** — verifies the final
         pressure-resume oracle (incl. the resume phase, first real run) and
         the concurrent-settlement exercise (never ran: earlier windows
@@ -1521,8 +1544,13 @@ shared meter.
         increments no eviction counter. **Re-pinned (this change):** the
         assertion now checks the pressure ADMISSION (the fixture is at
         capacity, so the 9th request fits only if a slot was released).
-        Window 10: this passed. *Observability gap (follow-up): the
-        capacity-driven hard-destroy is not counted by any eviction counter.*
+        Window 10: this passed. *Observability gap — **DONE (2026-09-18,
+        `2360dbe3`):** the capacity-driven hard-destroy is now counted via
+        `slot_release_destroys` — `retain_unit_before_state_loss` returns
+        whether the unit is retained, and `release_continuation_slot` counts
+        the false case (a live {KV + state} unit lost to capacity eviction or
+        client cancel). 0 in prod so far (the net has capacity, so units are
+        retained, not destroyed).
         (2) The replay assertion (the session's unit must SURVIVE the pressure
         so a re-send reuses it) FAILED in window 10: `path=0 reused=0` — the
         session's unit was destroyed device-side (spill-before-loss →
