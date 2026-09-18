@@ -619,6 +619,65 @@ void test_tier_census() {
     check(c.active_bytes == 5000 * stride + sb, "active tier bytes");
 }
 
+// P2.5 Increment 3 (O0+): top_units() returns the net's largest units (by
+// bytes) with their tier + active-session flag — the per-entry view behind
+// the tier census.
+void test_top_units() {
+    const auto now = std::chrono::steady_clock::now();
+    const std::size_t sb = 1024;
+    const std::uint64_t stride = 2;
+
+    auto make_key = [](const char* name) {
+        PreparedSessionKey key;
+        const std::size_t n = std::strlen(name);
+        std::memcpy(key.bytes.data(), name, n);
+        key.size = static_cast<std::uint16_t>(n);
+        return key;
+    };
+    const PreparedSessionKey key_active = make_key("active-session");
+
+    const auto is_live = [&key_active](const std::optional<PreparedSessionKey>& k) {
+        return k.has_value() && *k == key_active;
+    };
+    const auto is_active = [&key_active](const std::optional<PreparedSessionKey>& k) {
+        return k.has_value() && *k == key_active;
+    };
+
+    HostKVSafetyNet net;
+    net.set_dead_ttl(std::chrono::minutes(15));
+    net.set_state_budget_bytes(0);  // unbounded: add() never evicts
+    net.set_session_is_live(is_live);
+    net.set_session_is_active(is_active);
+
+    auto small = make_entry(1000, 0, sb);
+    small.ever_matched = true;
+    small.last_matched = now;
+    net.add(std::move(small));
+
+    auto big = make_entry(9000, 1000000, sb);  // largest
+    big.ever_matched = true;
+    big.last_matched = now;
+    big.session_key = key_active;
+    net.add(std::move(big));
+
+    auto mid = make_entry(4000, 2000000, sb);
+    mid.ever_matched = true;
+    mid.last_matched = now;
+    net.add(std::move(mid));
+
+    const auto top = net.top_units(stride, stride, 3);
+    check(top.size() == 3, "three units returned");
+    // Largest first: big (9000) > mid (4000) > small (1000).
+    check(top[0].frontier == 9000 && top[0].active_session, "largest is the active unit");
+    check(top[0].bytes == 9000 * stride + sb, "largest unit bytes");
+    check(top[1].frontier == 4000 && !top[1].active_session, "second is the unkeyed mid unit");
+    check(top[2].frontier == 1000, "smallest last");
+
+    // Bounded: asking for fewer than the entry count returns the top-n.
+    const auto top1 = net.top_units(stride, stride, 1);
+    check(top1.size() == 1 && top1[0].frontier == 9000, "bounded to top-1");
+}
+
 // P2.5 Increment 3 (O2): the soft-ceiling dead reaper reaps STALE (dead)
 // entries when the net sits above the soft ceiling, but never touches fresh
 // live entries — and is a no-op when disabled.
@@ -681,6 +740,7 @@ int main() {
     test_session_protection();
     test_active_vs_idle_tiering();
     test_tier_census();
+    test_top_units();
     test_soft_ceiling_reaper();
     test_retains();
     test_state_slot_lifecycle();
