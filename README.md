@@ -30,6 +30,7 @@ This fork targets **reliable 555k-context inference with 3 concurrent agentic se
 ### Monitoring and tooling
 
 - **/stats endpoint**: runtime gauges, KV transfer counters, pressure metrics, cache reuse paths.
+- **Dedicated stats port** (`--stats-port`): a single-thread server for `/stats` + `/health` on a second port, so pollers (dashboards, health checks) never queue behind streaming handlers during long prefills.
 - **Monitoring dashboard** (`tools/monitor/`): live GPU/util/decode/prefill/TTFT graphs, KV cache occupancy, request log, 12VHPWR sensor.
 - **E2E test suite** (`tools/e2e/`): multi-phase KV eviction, device-KV pressure, slot pressure, trash mode.
 - **Request-log rotation** (`--request-log-max-mib`, `--request-log-keep`): size-based JSONL rotation.
