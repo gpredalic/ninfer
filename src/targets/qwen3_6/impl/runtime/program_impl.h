@@ -6638,8 +6638,10 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index,
             }
             const bool was_pinned = host_kv_safety_net.at(*victim).pinned;
             std::fprintf(stderr,
-                         "[safety-spill] evict: index=%zu pages=%lu pinned=%d remaining=%zu free=%zu\n",
+                         "[safety-spill] evict: index=%zu tier=%s pages=%lu pinned=%d remaining=%zu free=%zu\n",
                          *victim,
+                         host_kv_safety_net.classify_tier(
+                             host_kv_safety_net.at(*victim), std::chrono::steady_clock::now()),
                          static_cast<unsigned long>(
                              host_kv_safety_net.at(*victim).text_page_count +
                              host_kv_safety_net.at(*victim).backend_page_count),

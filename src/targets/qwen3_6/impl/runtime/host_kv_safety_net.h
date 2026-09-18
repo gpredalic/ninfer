@@ -601,6 +601,23 @@ public:
                                       /*protect_live_sessions=*/true, session_is_active_);
     }
 
+    // P2.5 Increment 3: which eviction tier an entry falls into under the
+    // current predicates — mirrors select_eviction_victim's classification
+    // (dead > unprotected-live > idle-catalogued > active). For logging: the
+    // evict lines report tier= so the journal shows whether a victim was a
+    // dead remnant, an unprotected live unit, an idle (Catalogued) old copy,
+    // or the actively-serving session's unit.
+    [[nodiscard]] const char* classify_tier(const HostKVSafetyNetEntry& entry,
+                                            std::chrono::steady_clock::time_point now) const noexcept {
+        if (!entry.ever_matched || (now - entry.last_matched) > dead_ttl_) { return "dead"; }
+        if (!session_is_live_ || !entry.session_key ||
+            !session_is_live_(*entry.session_key)) { return "live"; }
+        const bool active = session_is_active_
+            ? session_is_active_(*entry.session_key)
+            : session_is_live_(*entry.session_key);  // fallback: old lumped tier
+        return active ? "active" : "idle";
+    }
+
     // Host KV pages and retained state images share ONE host memory budget. The
     // arena is the other tenant, so it is queried live instead of duplicating the
     // limit: neither pool may consume the other's headroom.
@@ -779,9 +796,10 @@ public:
             const std::optional<std::size_t> victim = select_victim(/*allow_pinned=*/false);
             if (!victim) { return false; }
             std::fprintf(stderr,
-                         "[host-state-pool] evict=%zu ctx_pages=%zu state_bytes=%zu retained=%zu "
-                         "shared=%zu budget=%zu (dead-largest, live-smallest, active-session-last)\n",
-                         *victim, unit_context_pages(entries_[*victim]),
+                         "[host-state-pool] evict=%zu tier=%s ctx_pages=%zu state_bytes=%zu retained=%zu "
+                         "shared=%zu budget=%zu (dead->live->idle->active)\n",
+                         *victim, classify_tier(entries_[*victim], std::chrono::steady_clock::now()),
+                         unit_context_pages(entries_[*victim]),
                          entry_state_bytes(entries_[*victim]),
                          state_retained_bytes_, shared_occupied_bytes(), state_budget_bytes_);
             remove(*victim);
@@ -806,9 +824,10 @@ public:
             const std::uint32_t entry_slots =
                 (entry.state_slot ? 1U : 0U) + (entry.checkpoint_state_slot ? 1U : 0U);
             std::fprintf(stderr,
-                         "[host-state-pool] make-room: evict=%zu ctx_pages=%zu state_slots=%u "
-                         "(dead-largest, live-smallest, active-session-last)\n",
-                         *victim, unit_context_pages(entry), entry_slots);
+                         "[host-state-pool] make-room: evict=%zu tier=%s ctx_pages=%zu state_slots=%u "
+                         "(dead->live->idle->active)\n",
+                         *victim, classify_tier(entry, std::chrono::steady_clock::now()),
+                         unit_context_pages(entry), entry_slots);
             remove(*victim);
             freed += entry_slots;
         }
