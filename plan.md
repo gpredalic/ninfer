@@ -498,10 +498,17 @@ development. Each is verified with the P0 e2e gate + the live journal.
          the client transcript's content at the same point; inspect what the
          model actually sees of its own last N turns (a template drop/misrender
          would show as a token-count gap or missing recent turns).
-      2. **(needs a prod-stopped window)** Long-context recall probe: a 300k+
-         prompt with needles planted at 10k/110k/210k/290k, run (a) cold and
-         (b) on a warm cache. Deep-position recall failing on BOTH → H-A
-         (intrinsic/scaling quality); failing only warm → H-C (restore path).
+      2. **(READY — `tools/longctx_recall_probe.py`, needs a prod-stopped
+         window)** Long-context recall probe: a ~300k-token prompt with
+         unique recall codes planted at ~10k/110k/210k/290k (spanning below
+         and above the 262144 YaRN ramp), run (a) COLD (fresh prefill) and
+         (b) WARM (identical prompt, prefix from cache). Deep-position
+         recall failing on BOTH → H-A (intrinsic/scaling quality); failing
+         only warm → H-C (restore path); passing both → the attention
+         machinery is intact and the macro-stuck symptom is behavioral
+         (task-state tracking), not attention recall. ~2 min per run
+         (~2-min prefill each); run via
+         `python3 tools/longctx_recall_probe.py --json out.json`.
       3. **(DONE 2026-09-18)** Inspect froggeric_v225 for long-history
          handling: no truncation, no length-dependent rendering beyond the
          already-saturated 50-message thinking threshold → H-B ruled out.
@@ -1610,6 +1617,24 @@ shared meter.
       protected tier. All three gaps closed; the per-session tiering engages
       on every admission path. If the census stays 100% dead from here on,
       it is a real bug, not a key gap.**
+      **Census interpretation (15:08, post-deploy): the all-dead census is
+      EXPECTED, not a tiering failure.** `classify_tier` (host_kv_safety_net.
+      h:621) anchors the dead tier on MATCH RECENCY: `!ever_matched ||
+      last_matched > 15min TTL` → dead, regardless of session key. Right
+      after a restart every unit is a fresh, never-matched backup of a
+      device-resident unit (requests serve from the catalog, 78 shortlist
+      HITs, 0 net restores) → all dead by construction. Units flip to
+      live/idle/active on their first net match (a restore). Two
+      same-key units (290839 + 263313, both `cs-c089…`) are the main
+      session + a sub-agent fork (same first user turn → same key,
+      divergent content — correctly not superseded). The 3 post-deploy
+      RECOVERs (15:03/15:04/15:08) are NOT net evictions (0 `evict=` lines
+      since deploy) — they are engine admission stalls (device KV/state
+      pool), i.e. the O1/RAM wall + the P2.4 device→host paths, not the net
+      tiering. A reaped fresh net backup is re-creatable via
+      spill-before-loss at the point of device loss, so reaping it early
+      costs a re-spill, not a re-prefill. *Watch:* if the census stays
+      100%-dead 30+ min after warmup (units never matching), that IS a bug.
 - [x] **P2.6 — config.** `--host-state-slots` derived from (or replaced by) the
       shared budget; document the single `--host-cache-mib`. **Shipped
       (2026-09-17, with the P4.1 relief-fix deploy):** `host_cache_mib` +
