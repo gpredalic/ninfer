@@ -1584,6 +1584,29 @@ shared meter.
       matches them — that is the next soak signal, alongside the WORKER
       RECOVER cadence (12 today pre-deploy, each a catalog-clear + 45–100s
       root re-prefill).
+      **GAP 2 — birth-site stamp `bcd9c0bf` (deployed via the user's manual
+      restart 14:34:53, PID 119014):** the key only reached the net via the
+      end-of-turn catalogue (11291), which runs only on the ACTIVE sequence —
+      a continuation slot evicted before its own turn catalogues (the at-ckpt
+      checkpoint-retain path) spilled keyless. Fix: stamp
+      `sequence.session_key = request.session_key` at the materialization-bind
+      site (where the sequence gets its prefix identity). Live-verified
+      14:36–14:40: 34 `has_sk=1` entries; the subagent's root-admitted unit
+      (86743) carries its key.
+      **GAP 3 — RM shared-prefix candidate `819ee058` (committed, PENDING
+      DEPLOY):** the RM has FIVE `inspect_admission` sites but only three set
+      the session key — the shared-prefix candidate path (resource_manager.h:
+      390) left the plan keyless, so a request admitted via a shared prefix
+      carried an empty key, and the end-of-turn catalogue (11291) then
+      OVERWROTE the sequence's birth-stamped key with nullopt. Live-verified
+      14:40: the main session's 210k–228k units (all
+      `shared_stable_prefix` requests) were keyless while the subagent's
+      root-admitted unit was keyed — the exact split. Also fixed: the RM
+      test's FakeProgram was missing the O0/O0+ census methods (the test
+      target had not built since e995bbad). After deploy, ALL admission
+      paths carry the key and the main session's units should classify
+      live/idle/active — the census leaving 100% dead would then be a real
+      bug, not a key gap.
 - [x] **P2.6 — config.** `--host-state-slots` derived from (or replaced by) the
       shared budget; document the single `--host-cache-mib`. **Shipped
       (2026-09-17, with the P4.1 relief-fix deploy):** `host_cache_mib` +
