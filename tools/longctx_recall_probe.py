@@ -25,8 +25,11 @@ prod-stopped window (or against the e2e server with a large --host-kv-mib).
 
 Usage:
   python3 tools/longctx_recall_probe.py [--target-tokens 300000]
-      [--host 127.0.0.1] [--port 8080] [--max-tokens 512] [--timeout 600]
-      [--json out.json]
+      [--host 127.0.0.1] [--port 8080] [--model qwen3.8-27b]
+      [--max-tokens 512] [--timeout 600] [--json out.json]
+
+The server validates the model id (404 model_not_found on mismatch), so
+--model must match the server's public model id (GET /v1/models).
 """
 
 import argparse
@@ -36,7 +39,7 @@ import sys
 import time
 import urllib.request
 
-CHARS_PER_TOKEN = 4.2  # calibration from the e2e filler
+CHARS_PER_TOKEN = 5.9  # calibrated 2026-09-18: 1.26M-char filler -> 213498 tokens
 ZONES = (0.033, 0.367, 0.700, 0.967)  # ~10k / 110k / 210k / 290k at 300k
 
 
@@ -83,9 +86,9 @@ def build_prompt(target_tokens: int, codes, rng: random.Random):
     return doc + question, markers
 
 
-def run_once(host: str, port: int, prompt: str, max_tokens: int, timeout: int):
+def run_once(host: str, port: int, model: str, prompt: str, max_tokens: int, timeout: int):
     payload = {
-        "model": "probe",
+        "model": model,
         "input": [{"role": "user",
                    "content": [{"type": "input_text", "text": prompt}]}],
         "instructions": "You are a precise recall assistant.",
@@ -122,6 +125,8 @@ def main():
     p.add_argument("--target-tokens", type=int, default=300000)
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8080)
+    p.add_argument("--model", default="qwen3.8-27b",
+                   help="server public model id (validated; 404 on mismatch)")
     p.add_argument("--max-tokens", type=int, default=512)
     p.add_argument("--timeout", type=int, default=600)
     p.add_argument("--json", dest="json_out", default=None)
@@ -137,7 +142,7 @@ def main():
     results = {}
     for mode in ("cold", "warm"):
         text, usage, wall = run_once(
-            args.host, args.port, prompt, args.max_tokens, args.timeout)
+            args.host, args.port, args.model, prompt, args.max_tokens, args.timeout)
         got = score(text, codes)
         prompt_tokens = usage.get("input_tokens")
         # Calibrate the estimated zone positions against the real count.
