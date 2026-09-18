@@ -409,8 +409,9 @@ development. Each is verified with the P0 e2e gate + the live journal.
       known user-ESC non-defect). Root driver of the long queue waits is the
       device-side overcommit (the RECOVER/re-prefill cycle), so reducing the
       overcommit (P2.4) should reduce these too.
-- [ ] **P1.9 — generation loops at ~350k context (YaRN position-scaling
-      suspect; new 2026-09-18).** The user's live session, at ~350k tokens of
+- [x] **P1.9 — generation loops at ~350k context (CLOSED 2026-09-18:
+      BEHAVIORAL, not attention/cache — see verdict below).** The user's
+      live session, at ~350k tokens of
       context, repeatedly stops making progress: the model emits the same
       statements over and over until Claude Code compaction (which truncates +
       re-prefills the context and clears it). Recurred several times in the
@@ -525,6 +526,51 @@ development. Each is verified with the P0 e2e gate + the live journal.
          (task-state tracking), not attention recall. ~2 min per run
          (~2-min prefill each); run via
          `python3 tools/longctx_recall_probe.py --json out.json`.
+         *Window-1 run (2026-09-18 16:2x): 404 before any prefill — the
+         probe sent `"model": "probe"`, but the server VALIDATES the model
+         id (`validate_openai_model` → 404 `model_not_found` on anything but
+         the public id `qwen3.8-27b`; the e2e suite's default is the same).
+         Fixed: `--model` flag, default `qwen3.8-27b`. Re-run is a window-2
+         item (batched with the P2.4 test re-run).*
+         *Window-2 run (2026-09-18 16:5x): **PASS both — 4/4 cold AND 4/4
+         warm** (cold 110.1s prefill, warm 29.8s — the cached-prefix path is
+         ~3.7× faster and correct). BUT the real prompt was **213,498
+         tokens**, not the 300k estimate (CHARS_PER_TOKEN 4.2 was wrong; the
+         filler is ~5.9 chars/token — now calibrated in the tool). Deepest
+         zone ~206k — **below the 262144 YaRN ramp**, so this run proves
+         attention recall intact BELOW the ramp (H-C ruled out there; H-A
+         attention ruled out there) but does NOT yet cover the 350k symptom
+         region. Window 3 re-runs at `--target-tokens 330000` (~330k real:
+         zone 4 ~319k above the ramp, zone 3 ~231k below — brackets it).*
+         *Window-3 run (2026-09-18 17:0x): **PASS both at 329,815 real
+         tokens** — COLD 4/4 (141.5s), WARM 4/4 (50.5s). Zone 4 at
+         ~318.8k is ABOVE the 262144 YaRN ramp; zone 3 ~230.8k below it.
+         **Verdict: attention recall is intact across the ramp, on BOTH
+         the cold prefill and the cached/restore path.** H-C (restore-path
+         position/attention bug) is RULED OUT — the warm path recalled the
+         deepest zone perfectly. H-A (attention-recall degradation) is
+         ruled out at 330k. The ~350k macro-stuck symptom sits ~30k beyond
+         the deepest probe zone: the leading explanation is now BEHAVIORAL
+         (task-state tracking over a very long agentic history), not
+         attention recall. A ~380k probe would fully exclude a 350k-onset
+         attention effect, but the clean ramp crossing makes that unlikely.*
+         *Window-4 run (2026-09-18 17:1x): **PASS both at 379,913 real
+         tokens** — COLD 4/4 (235.1s), WARM 4/4 (195.0s). Zone 4 at
+         ~367.3k is PAST the ~350k symptom onset; zone 3 ~265.9k just
+         above the ramp. **P1.9 attention question CLOSED:** across three
+         runs (213k / 330k / 380k) recall is 4/4 on BOTH cold prefill and
+         the cached/restore path, spanning below and above the 262144 YaRN
+         ramp. H-A (attention-recall degradation) and H-C (restore-path
+         position/attention bug) are both RULED OUT at and beyond the
+         symptom onset. The ~350k macro-stuckness is BEHAVIORAL — task-
+         state tracking over a very long agentic history (the user-
+         clarified symptom: re-announcing state/next-step without
+         completing the task) — not an NInfer attention/cache defect.
+         (The 380k warm run is host-restore-bound: the device pool cannot
+         hold a 380k prefix, so the warm path pays H2D from the net —
+         still 1.2× faster than cold.) Optional follow-up (model-side,
+         not NInfer): an agentic-shaped (tool-loop history) probe at
+         350–360k to reproduce the macro-stuckness itself.*
       3. **(DONE 2026-09-18)** Inspect froggeric_v225 for long-history
          handling: no truncation, no length-dependent rendering beyond the
          already-saturated 50-message thinking threshold → H-B ruled out.
@@ -1312,6 +1358,190 @@ shared meter.
         real multi-session test); (d) commit + deploy. The
         `[planner-no-plan]` diagnostic stays in the binary for the soak
         (observability), removed with the final cleanup.
+        **Window-1 e2e (2026-09-18 16:2x, prod-stopped batched window):
+        the `source-pressure-protection` exercise FAILED on a stale oracle,
+        not a relief failure.** The relief did its job — the branch fit
+        (`path=2` PrivateTurnClosure, `reused=7676/7784`, source protected,
+        `stop=no_pressure`) and `[relief-kv]` honestly reported
+        `demoted idle continuation 1 (scored 6 unique, freed 6 pages)`.
+        But the oracle read `main_kv_d2h_pages` /
+        `pressure_private_owners_{degraded,evicted}` — RM-owned counters
+        that only advance for PLANNER-selected pressure actions
+        (`apply_private_action`), which the fit-gate/queued-relief path
+        bypasses entirely. Two real gaps surfaced:
+        1. **Honesty gap:** when the spill ABORTs (host state pool full →
+           no state image), `relieve_kv_fit` still released the
+           continuation, so the log claimed "demoted … to the host safety
+           net" while the unit was actually destroyed (KV freed, state
+           lost). The fixture (`host_state_slots=0`) hits this on every
+           spill.
+        2. **Accounting gap:** no counter recorded the relief's actual
+           effect, so neither the test nor /stats could see it.
+        **Fix (this change):** `spill_victim_to_host_kv_safety_net` now
+        returns whether the net RETAINED the unit (every skip/abort →
+        false; both `host_kv_safety_net.add` sites → true). `relieve_kv_fit`
+        logs `demoted` vs `EVICTED … spill not retained; unit lost` and
+        advances three new monotonic counters — `relief_kv_releases`,
+        `relief_kv_not_retained`, `relief_kv_pages_freed` (the measured
+        `available_pages()` delta) — surfaced in `/stats` under
+        `scheduler.pressure` and in the stats change-detection gate. The
+        test oracle is re-pointed at `relief_kv_releases` /
+        `relief_kv_pages_freed` (≥1 release, ≥2 pages — the branch needed
+        3 with 1 free). Behavior is unchanged (a not-retained release was
+        always a hard eviction; now it is counted and logged as one).
+        CPU tests: safety-net PASS, RM test = the 5 documented baseline
+        FAILs (no new). P2.4 test re-run + P1.9 probe re-run are the
+        window-2 items (the probe 404'd in window 1 — see P1.9).
+        **Window-2 e2e (2026-09-18 16:5x): source-pressure + checkpoint
+        pressure now PASS (oracle fix verified). The test advanced to
+        `pressure-resume`, which fails with ALL-ZERO planner counters
+        (`main=0 spill=0 drops=0 degraded=0 evicted=0`) and device
+        occupancy 127→12 — the long unit was DESTROYED, not spilled.**
+        Root cause (code-verified): the fixture
+        (`pressure_resume_engine_options`) sets `host_state_slots=0`, so
+        under the unity invariant every whole-unit spill aborts
+        (`no_state_image` — no state image can be captured without a host
+        state slot) and the unit is hard-destroyed. The oracle's expected
+        action ("endpoint-drop plus four-page spill") is a PRE-UNITY
+        partial KV-only pressure action — that action class no longer
+        exists (unity: the unit moves whole or not at all). Same
+        stale-oracle class as source-pressure, one level deeper.
+        **Fix (in progress):** fixture `host_state_slots 0→2` (the spill
+        can now retain the unit); the oracle's diagnostic now prints the
+        relief counters (`relief_kv_releases/not_retained/pages_freed`) so
+        the window-3 run captures the ground truth (which mechanism —
+        planner vs fit-gate/queued relief — frees the pages, and how many
+        pages the resume restores). The oracle CONDITIONS are deliberately
+        left as-is for the observation run; they get re-pinned to the
+        observed post-unity behavior (expect: unit retained, not
+        not-retained; resume restores the ~120-page closure via H2D, not
+        the old 4-page partial) after window 3.
+        **Window-3 observation (2026-09-18 17:0x, `host_state_slots=2`
+        fixture): ground truth captured.** The page arrives via the
+        fit-gate/queued-relief path: `[relief-kv] demoted idle
+        continuation 0 (scored 121 unique, freed 121 pages)` — the WHOLE
+        121-page long unit, retained in the net (`[safety-spill] OK
+        frontier=7713 ckpt_valid=1`, state image D2H 153.9 MB), device
+        occupancy 127→12. New counters confirmed live:
+        `relief_releases=1 relief_not_retained=0 relief_pages_freed=121`.
+        Planner counters all 0 (the fit-gate path bypasses planner action
+        application — as designed). **Oracle re-pinned (this change):**
+        pressure phase now asserts the relief mechanism (`relief_releases
+        ≥1`, `not_retained == 0`, `pages_freed ≥ 6` = the demand, device
+        occupancy == 12, state D2H advanced); resume phase asserts the
+        whole-unit restore (`PrivateTurnClosure`, `reused_pages ≥ 119`,
+        `restored_pages ≥ 100` H2D — the full closure, not the old
+        4-page partial). The resume phase did not execute in window 3
+        (early return on the pressure oracle), so the re-pinned resume
+        bounds are verified by the next scenario run.
+        **Window-4 (2026-09-18 17:1x): the re-pin was one condition short.**
+        The relief mechanism matched the pin exactly (`relief_releases=1
+        relief_not_retained=0 relief_pages_freed=121 device_pages=127/12`),
+        but the oracle failed on `state_d2h=0`: the whole-unit spill's
+        state-image capture (net entry `state_bytes=147MB`, `ckpt_valid=1`)
+        does NOT report into the state-transfer counters — those advance
+        only for planner-driven state demotes. Same pre-unity staleness as
+        the original oracle. **Final re-pin (this change):** the
+        `state_d2h` condition is dropped (the state image's presence is
+        proven by the resume phase's restore — no state image → no
+        restore); the diagnostic still prints it. *Observability gap
+        (small follow-up, not load-bearing): the spill path's state D2H
+        (147MB per unit) is invisible in `/stats` state-transfer counters —
+        report it via the transfer-observation path so the state half of a
+        unit's move is counted like the KV half.*
+        **Window 5 (next): full default scenario set** — verifies the final
+        pressure-resume oracle (incl. the resume phase, first real run) and
+        the concurrent-settlement exercise (never ran: earlier windows
+        early-returned at pressure-resume). Its fixture has
+        `host_kv_capacity=0`/`host_state_slots=0`, so its "canonical
+        eviction" is a TRUE catalog eviction (unit destroyed, no net to
+        spill into) — `pressure_private_owners_evicted` still increments
+        under unity; that oracle needs no re-pin.
+        **Windows 5–7 (2026-09-18 17:2x–17:4x): the pressure phase held
+        every window** (`relief_releases=1 not_retained=0 pages_freed=121`,
+        device 127→12, the whole 121-page unit retained in the net with its
+        state image) **but the resume phase kept failing**
+        (`path=0 reused=0 restored=0`) — three distinct root causes, each
+        unmasked by fixing the previous one:
+        (w5) `host_state_slots=2` was too small: the state pool's make-room
+        evicted the long unit's state image when the short unit captured,
+        destroying the net entry (a KV without its state image is unrestorable
+        — unity). Fixture raised to 8 (provisioned non-binding: make-room can
+        no longer reach the long unit's image).
+        (w6) The resume re-sent the IDENTICAL 7683-token prompt →
+        `reuse == max_count` → the zero-suffix reuse rejection
+        (host_kv_safety_net.h:467 — a strict-prefix retry leaves no tail to
+        prefill and is deliberately rejected to root-prefill; the guard has
+        existed since the net's foundation commit `d00e5f0b`, so this is a
+        test-scenario bug, not a product regression).
+        (w7) Appending the tail INSIDE the user message still missed:
+        `[prefix-match] TOKEN MISMATCH count=7683/7676 mismatch_at=7674` —
+        the stored prompt ends with a 9-token terminator suffix (im_end …
+        assistant-start marker) that an in-message tail pushes back, so the
+        stored prefix is NOT a true token-prefix of the new prompt. `find()`
+        only matches at the entry's OWN frontiers (full compact_prefix or the
+        checkpoint frontier), never at arbitrary interior prefixes — so any
+        prompt that alters the first message's content can only match at the
+        checkpoint frontier if the first 7676 tokens are unchanged.
+        **Fix (window 8):** the resume is a genuine continuation — a
+        TWO-MESSAGE prompt (original turn + a new short user turn, helper
+        `pressure_turn_with_tail`). The single-message rendering is a true
+        token-prefix of the two-message rendering only up to the first
+        message's im_end; the match lands on the checkpoint frontier (7676,
+        the turn boundary — `find()`'s checkpoint path, the same mechanism a
+        real agentic continuation uses), reuse=7676, and the whole retained
+        unit restores H2D. Demand stays 121 pages (7689/64→121).
+        **Window 8 result:** the checkpoint match worked
+        (`match=hit frontier=7676 checkpoint=1`, `reused=7676 reused_pages=120
+        restored=120`, `[restore] KV+state copied`) — but the oracle still
+        failed on `path=0`. Root cause: `prefix_reuse_path` is the PLAN-level
+        path (device shortlist), which misses (the unit is on host, not
+        device) → Root; the safety-net re-find restores it without
+        reclassifying the plan path. So a host-net turn-closure restore
+        reports `path=Root` with `reused_prompt_tokens>0` — an inconsistent
+        report. **Oracle re-pinned (this change):** the resume phase now
+        proves the whole-unit restore by the page counts (`reused_pages≥119`,
+        `restored_pages≥100`), not the path. *Observability gap (follow-up):
+        a host-net turn-closure restore should report a non-Root path (or a
+        dedicated safety-net path) so `reused_prompt_tokens>0` is consistent
+        with `prefix_reuse_path`.*
+        **Window 9: pressure-resume PASSED** (the re-pin held). The test
+        advanced to the 4th exercise, `concurrent-settlement` (first real run:
+        earlier windows early-returned at pressure-resume), which failed on a
+        stale oracle.
+        **Concurrent-settlement (windows 9–10): two stale oracles, both
+        because the exercise tests post-unity + P2.5 behavior.**
+        (1) The "canonical eviction" assertion checked
+        `pressure_private_owners_evicted` (the PLANNER's counter), but the
+        full catalog (8/8 continuations) makes room for the 9th (pressure)
+        request via a capacity-driven continuation-slot release —
+        `release_continuation_slot` → spill-before-loss → hard-destroy (this
+        fixture has `host_state_slots=0`/`host_kv_capacity=0`, so the net
+        can't retain) — a THIRD path (not planner, not fit-gate relief) that
+        increments no eviction counter. **Re-pinned (this change):** the
+        assertion now checks the pressure ADMISSION (the fixture is at
+        capacity, so the 9th request fits only if a slot was released).
+        Window 10: this passed. *Observability gap (follow-up): the
+        capacity-driven hard-destroy is not counted by any eviction counter.*
+        (2) The replay assertion (the session's unit must SURVIVE the pressure
+        so a re-send reuses it) FAILED in window 10: `path=0 reused=0` — the
+        session's unit was destroyed device-side (spill-before-loss →
+        hard-destroy) because the fixture had NO net capacity
+        (`host_state_slots=0`/`host_kv_capacity=0`), so there was nowhere to
+        retain it. **Correction:** P2.5's per-session net-eviction protection
+        (Increment 2, `ae416669`, deployed 2026-09-15) is ALREADY implemented
+        — the gap was the fixture, not a missing feature. **Fix (this
+        change):** (a) give the fixture net capacity (`host_state_slots=16`,
+        `host_kv_capacity=8 GiB`, matching prod) so the session's unit is
+        retained in the net under pressure (the P2.5 guarantee); (b) re-pin
+        the replay assertion to check `reused_prompt_tokens>0` (the unit
+        survived and was reused) and DROP the `path != Root` check — a
+        host-net restore reports `path=Root` at the plan level (same finding
+        as pressure-resume), while a device restore reports PrivateTurnClosure;
+        the path is non-deterministic (depends on which unit the pressure
+        displaced), so reuse is the honest evidence. **Window 11: ALL 4
+        SCENARIOS PASS (rc=0)** — the P2.4 test suite is green (the slice's
+        prod-soak verification remains open).
 - [x] **P2.5 — Slice 4: unit LRU/retention + per-session guarantee.** One LRU
       over the shared budget, evicting whole units cost-aware smallest-first
       (kills the 19s class: state can no longer outlive its KV's retention
