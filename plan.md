@@ -1373,7 +1373,7 @@ shared meter.
       the tool for judging, from `/stats`, whether the budget is held by dead
       remnants, idle old copies, or live sessions (i.e. whether the tiering
       alone clears the thrash or O1/O2 are still needed).
-      **O2 soft-ceiling dead reaper IMPLEMENTED (2026-09-18, uncommitted):**
+      **O2 soft-ceiling dead reaper DEPLOYED (2026-09-18 13:04, `552dbeba`):**
       when the net's shared occupancy sits above a soft ceiling (85% of the
       byte budget), stale (dead) entries are reaped proactively on each
       capture (`add()`), so pressure episodes reach the live/idle/active tiers
@@ -1385,8 +1385,21 @@ shared meter.
       + `kSoftCeilingPct=85`; kill-switch `NINFER_NET_DEAD_REAP=0` (default
       ON) wired in `program_impl.h`. Unit test `test_soft_ceiling_reaper`
       (reaps the stale dead entry above the ceiling, never touches fresh live
-      entries, no-op when disabled) passes; `ninfer-serve` builds. Rides the
-      next deploy.
+      entries, no-op when disabled) passes; `ninfer-serve` builds.
+      *Soak finding (13:18):* the reaper FIRES (mechanism works — first
+      `reap=stale` at 13:18:50) but is **under-powered for the active
+      session's overcommit**: it reaped a single 2-page stale entry and left
+      the net at ~29.5 GiB (above the 25.5 GiB ceiling). The net is dominated
+      by FRESH working-set entries (the active session's current forks +
+      checkpoints, host-mirrored while device-resident, all created in the
+      last ~14 min post-restart) — the reaper's 15-min stale gate can't touch
+      them. So O2 trims aging-out weight (old forks, dead conversations) on a
+      15-min+ timescale, but does NOT reduce the steady-state working set of
+      an active session. **The active-session overcommit is a capacity
+      problem → O1 (budget) or per-session retention is the real lever.**
+      Watch +15 min: as the 13:04 entries age past the TTL, the reaper should
+      start trimming the dead-tier ones; if the net stays ~29 GiB, O1 is
+      needed.
 - [x] **P2.6 — config.** `--host-state-slots` derived from (or replaced by) the
       shared budget; document the single `--host-cache-mib`. **Shipped
       (2026-09-17, with the P4.1 relief-fix deploy):** `host_cache_mib` +
