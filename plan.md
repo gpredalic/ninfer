@@ -1542,6 +1542,22 @@ shared meter.
         displaced), so reuse is the honest evidence. **Window 11: ALL 4
         SCENARIOS PASS (rc=0)** — the P2.4 test suite is green (the slice's
         prod-soak verification remains open).
+        **Prod soak (2026-09-18 18:51–19:01, counter-instrumented binary
+        already live — no restart needed):** relief accounting verified in
+        prod. Baseline→now: `relief_kv_releases` 5→8, `relief_kv_pages_freed`
+        6,774→10,208 (+3,434), `relief_kv_not_retained` 0→0. The counter
+        delta EXACTLY matches the journal's `[relief-kv]` freed lines
+        (864+858+1712 = 3,434) — honest deltas confirmed live. All three
+        new relief events fit their demand in ONE fire (no 15s churn loop,
+        no 120s aborts) — the 2026-09-17 incident signature (claimed 7,300
+        freed / +10 actual, 3 wedge restarts) did not recur; 0 wedges, 0
+        crash classes in the window. Net: 11 units / 18.1 GiB, all dead
+        tier (expected — fresh unmatched backups); unit_bytes 18.0→22.8
+        GiB. Notable: `state_bytes=0 ... at-ckpt=1 — unit retained complete
+        at its checkpoint frontier` — the P2.5 Inc 1 checkpoint-frontier
+        retain is working in prod (endpoint state lost, checkpoint state
+        keeps the unit whole). Soak continues; exit signal = 0 wedge
+        restarts over a full working day with plausible relief counts.
 - [x] **P2.5 — Slice 4: unit LRU/retention + per-session guarantee.** One LRU
       over the shared budget, evicting whole units cost-aware smallest-first
       (kills the 19s class: state can no longer outlive its KV's retention
