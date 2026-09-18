@@ -23,6 +23,7 @@
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <unordered_map>
 #include <cstdint>
@@ -466,6 +467,13 @@ struct SequenceState {
     bool tail_hidden_valid        = false;
     bool state_source_retained    = false;
     bool endpoint_valid           = false;
+    // Restored-recycled write state: the handle of a state image restored via
+    // restore_recycled_checkpoint() (the publish-abort path) whose refs=1 was
+    // set directly, not by a retain_checkpoint_reference() call — so no other
+    // path releases it. release_sequence_state releases it exactly once, and
+    // only while state.write still matches (a replaced write hands the image
+    // to the checkpoint/claim lifecycle, like state.read).
+    std::optional<StateImageHandle> recycled_write_state;
     RewriteCheckpoint rewrite_checkpoint;
     std::vector<LongAnchorCheckpoint> long_anchors;
     std::vector<std::uint32_t> shared_prefix_references;
@@ -486,6 +494,14 @@ struct SequenceState {
     // follow-ups (preserve_thinking=off) can find the continuation.
     // Device KV operations use the full ledger (unchanged).
     std::vector<TokenId> compact_prefix;
+
+    // P2.3: this unit's KV + state can fit the shared host budget (arena +
+    // state pool) as a whole. Set at admission (root: the new unit;
+    // continuation: re-validated on the source unit as it grows) and
+    // checked by the safety-net spill, which SKIPs ineligible units instead
+    // of attempting a spill that can never complete. One-way: the unit's
+    // cost only grows, so eligibility only downgrades.
+    bool retention_eligible = true;
 };
 
 struct SharedPrefixState {
@@ -560,9 +576,87 @@ public:
         const ContinuationHandle* source, const SharedPrefixHandle* shared_source,
         std::optional<runtime::CheckpointRef> checkpoint, bool must_retain_private_source,
         const runtime::ContextMachineCostModel& machine_cost);
-    // Copy a victim continuation's device KV to host RAM before eviction.
-    void spill_victim_to_host_kv_safety_net(std::uint32_t index) noexcept;
+    // Spill a victim continuation's complete {KV + state} unit to the host
+    // safety net before eviction. Returns whether the net retained the unit
+    // (false: skipped/aborted — a subsequent slot release destroys the unit,
+    // so the caller must account for the loss).
+    bool spill_victim_to_host_kv_safety_net(std::uint32_t index,
+                                            bool relinquish_store_state = true) noexcept;
+    // P2.4 Increment 1 (spill-before-loss): before a continuation slot is
+    // released, ensure the unit's complete {KV + state} is retained in the
+    // host safety net — the unit invariant forbids the state half losing its
+    // last restorable copy while the KV half is still retained. Returns
+    // whether the unit is retained after the call (already in the net, or
+    // spilled and retained); false means the slot release destroys the unit.
+    bool retain_unit_before_state_loss(std::uint32_t index) noexcept;
     [[nodiscard]] std::uint64_t safety_net_restore_count() const noexcept;
+    // Host-KV arena fragmentation counters and safety-net evictions (for /stats).
+    [[nodiscard]] std::uint64_t host_kv_single_alloc_failures() const noexcept;
+    [[nodiscard]] std::uint64_t host_kv_compaction_count() const noexcept;
+    [[nodiscard]] std::uint64_t host_kv_eviction_count() const noexcept;
+    // P2.4 Inc 3: fit-gate/queued KV relief ([relief-kv]) — releases of idle
+    // continuations / shared prefixes, the not-retained (unit lost) subset,
+    // and the device pages actually freed (for /stats).
+    [[nodiscard]] std::uint64_t relief_kv_releases() const noexcept;
+    [[nodiscard]] std::uint64_t relief_kv_not_retained() const noexcept;
+    [[nodiscard]] std::uint64_t relief_kv_pages_freed() const noexcept;
+    // P2.4 follow-ups: units destroyed (not retained in the net) at a
+    // continuation-slot release — capacity eviction or client cancellation —
+    // and the spill path's state-image D2H transfers (the state half of a
+    // unit's move, which the planner-driven state-transfer counters do not
+    // see).
+    [[nodiscard]] std::uint64_t slot_release_destroys() const noexcept;
+    [[nodiscard]] std::uint64_t spill_state_d2h_count() const noexcept;
+    [[nodiscard]] std::uint64_t spill_state_d2h_bytes() const noexcept;
+    // Materialization allocation failures by resource (for /stats).
+    [[nodiscard]] std::uint64_t materialize_state_slot_alloc_failures() const noexcept;
+    [[nodiscard]] std::uint64_t materialize_dual_device_replica_drops() const noexcept;
+    [[nodiscard]] std::uint64_t materialize_kv_page_alloc_failures() const noexcept;
+    // Per-pool KV reservation failures: main (attention) vs backend (MTP/DFlash)
+    // — the summed counter cannot say which pool is binding.
+    [[nodiscard]] std::uint64_t materialize_kv_page_alloc_failures_main() const noexcept;
+    [[nodiscard]] std::uint64_t materialize_kv_page_alloc_failures_backend() const noexcept;
+    // Materializations deferred to a later engine tick because their device-KV reservation
+    // demand did not fit the current pool occupancy (monotonic; for /stats).
+    [[nodiscard]] std::uint64_t materialize_kv_defers() const noexcept;
+    // P2.4 Increment 1: materializations whose post-admission relief left a
+    // plan-optional state image unrealized; the plan was re-baselined to the
+    // materialized unit instead of 500ing (monotonic; for /stats).
+    [[nodiscard]] std::uint64_t materialize_state_replans() const noexcept;
+    [[nodiscard]] StateImageStore::CheckpointResidency checkpoint_residency() const noexcept;
+    // Full state-slot residency census (for /stats): explains host-pool occupancy
+    // including the classes checkpoint_residency() cannot see.
+    [[nodiscard]] StateImageStore::ResidencyHistogram residency_histogram() const noexcept;
+    // Host-KV safety-net gauges (for /stats): entry count and retained state-image
+    // bytes (the net's heap state images, distinct from the host state pool).
+    [[nodiscard]] std::uint32_t host_kv_net_entries() const noexcept;
+    [[nodiscard]] std::uint64_t host_kv_net_state_bytes() const noexcept;
+    // P2.5 Increment 3 (O0 census): per-eviction-tier composition of the net
+    // (dead / live / idle-catalogued / active — entry counts + unit bytes).
+    [[nodiscard]] ninfer::NetTierCensus host_kv_net_tier_census() const noexcept;
+    // P2.5 Increment 3 (O0+): the net's largest retained units (top-n by
+    // bytes) — the per-entry view behind the tier census.
+    [[nodiscard]] std::vector<ninfer::NetUnitInfo> host_kv_net_top_units(std::size_t n) const noexcept;
+    // P2.2 (#7 Slice 1): shared meter over host unit occupancy — the sum of each
+    // retained unit's cost (KV page bytes + state image bytes) across the safety
+    // net, plus the host state pool's demoted-checkpoint bytes. One number across
+    // the two pools that were accounted separately.
+    [[nodiscard]] std::uint64_t host_unit_occupied_bytes() const noexcept;
+    [[nodiscard]] std::uint32_t host_unit_count() const noexcept;
+    // Cumulative entries dropped by supersede-on-add (for /stats).
+    [[nodiscard]] std::uint64_t host_kv_superseded_count() const noexcept;
+    // release() refusals in noexcept teardown paths (for /stats): each one
+    // orphans the object and its slots.
+    [[nodiscard]] std::uint64_t host_slot_release_failures() const noexcept;
+    // release() with leak accounting: the noexcept teardown paths drop the
+    // handle regardless, so a refusal orphans the object — count and log it.
+    void try_release_state_image(StateImageHandle handle, const char* context) noexcept;
+    // Overcommit guard: demote coldest demotable checkpoints to host until the
+    // device state pool can satisfy `needed_device_slots`. Returns the number
+    // demoted. Called at the materialization reservation point, where the
+    // pressure planner's modeled (but uncommitted) demotions would otherwise
+    // leave the pool full.
+    [[nodiscard]] std::uint32_t demote_checkpoints_to_make_room(std::uint32_t needed_device_slots);
 
     [[nodiscard]] std::optional<AdmissionCandidate> seal_materialization(
         const AdmissionCandidate& admission, const PreparedPromptData& prompt,
@@ -608,6 +702,8 @@ public:
     [[nodiscard]] std::uint64_t
     checkpoint_recovery_ns(const SharedPrefixHandle& owner, runtime::CheckpointRef checkpoint,
                            const runtime::ContextMachineCostModel& machine_cost) const;
+    [[nodiscard]] bool valid_continuation(const ContinuationHandle& handle) const noexcept;
+    [[nodiscard]] bool valid_shared_prefix(const SharedPrefixHandle& handle) const noexcept;
     [[nodiscard]] bool shared_capture_matches(const CaptureOffer& offer,
                                               const SharedPrefixHandle& shared) const;
     void skip_capture(CaptureOffer&& offer);
@@ -652,6 +748,17 @@ public:
 
     [[nodiscard]] qwen3_6::PhysicalUsageSnapshot physical_usage() const noexcept;
 
+    // P1.5(d) Increment 2: admission-side occupancy probe + queued-KV block
+    // (see the QueuedKvBlock state below).
+    [[nodiscard]] qwen3_6::KvAdmissionFit
+    kv_admission_fit(const AdmissionCandidateImpl& candidate) const noexcept;
+    void queue_kv_block(const qwen3_6::KvAdmissionFit& fit, std::uint64_t request_id) noexcept;
+    void clear_queued_kv_block() noexcept;
+    [[nodiscard]] bool has_queued_kv_block() const noexcept;
+    [[nodiscard]] std::uint64_t queued_kv_block_request_id() const noexcept;
+    [[nodiscard]] qwen3_6::QueuedKvBlockProgress
+    progress_queued_kv_block(bool relief_suppressed) noexcept;
+
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
 
     void reset_memory_peaks() noexcept;
@@ -693,6 +800,23 @@ public:
     std::unique_ptr<HostKVExtentStore> host_kv_extents;
     HostKVSafetyNet host_kv_safety_net;
     std::uint64_t safety_net_restore_count_ = 0;
+    // Materializations whose device-KV reservation demand did not fit the current pool
+    // occupancy and were deferred to a later engine tick instead of throwing bad_alloc
+    // (monotonic; read by /stats from the serve thread).
+    std::atomic<std::uint64_t> materialize_kv_defers_{0};
+    // P2.4 Increment 1: entitlement re-plans (plan re-baselined to the
+    // materialized unit after relief left a plan-optional state image
+    // unrealized; read by /stats from the serve thread).
+    std::atomic<std::uint64_t> materialize_state_replans_{0};
+    // P2.4 Inc 3: fit-gate/queued KV relief ([relief-kv]) — releases of idle
+    // continuations / shared prefixes, the not-retained (unit lost) subset,
+    // and the device pages actually freed (monotonic; read by /stats).
+    std::atomic<std::uint64_t> relief_kv_releases_{0};
+    std::atomic<std::uint64_t> relief_kv_not_retained_{0};
+    std::atomic<std::uint64_t> relief_kv_pages_freed_{0};
+    std::atomic<std::uint64_t> slot_release_destroys_{0};
+    std::atomic<std::uint64_t> spill_state_d2h_count_{0};
+    std::atomic<std::uint64_t> spill_state_d2h_bytes_{0};
 
     // Checkpoint state is retained only inside a complete {attention KV + GDN state}
     // unit held by the safety net; there is no state-only capture. The old
@@ -747,6 +871,11 @@ private:
     std::uint64_t resource_revision_            = 1;
     std::uint32_t pressure_planning_generation_ = 0;
     bool pressure_planning_active_              = false;
+    // release() refusals in the noexcept teardown paths: each one orphans the
+    // object (and its device/host slots) because the handle is dropped anyway.
+    // Counted so the leak surfaces in /stats instead of being silently
+    // swallowed.
+    std::atomic<std::uint64_t> host_slot_release_failures_{0};
 
     struct PressurePageScratchSlot {
         std::uint32_t generation     = 0;
@@ -926,12 +1055,97 @@ private:
         // start_sequence must restore the checkpoint state image, not the
         // endpoint state (they differ).
         bool host_kv_restore_checkpoint = false;
+        // The reuse path the restore reports (PrivateEndpoint at the
+        // execution frontier; restore_path(kind) at the checkpoint frontier) —
+        // the same path a device-side restore of the same unit would report.
+        // Valid only when host_kv_restore_frontier > 0.
+        ReusePath host_kv_restore_reuse = ReusePath::Root;
+        // P1.7(b): pages the safety-net restore adopted from still-resident
+        // frozen shared pages instead of re-materializing. resident_resources
+        // excludes shared pages from an owner's exact transition effect, so
+        // the post-materialization entitlement check adds these back.
+        std::uint32_t restore_adopted_main_pages     = 0;
+        std::uint32_t restore_adopted_backend_pages  = 0;
         bool prefix_forks_ready             = false;
         bool source_prepared                = false;
         bool cancel_pending                 = false;
         bool prepared                       = false;
         bool terminal                       = false;
+        // Set by the root-prefill fallback (source evicted before restore): the
+        // source's physical state is gone and its continuation slot was recycled
+        // as the root destination, so no source summary can be populated. The
+        // terminal (publish or abort) then reports the source as Retained
+        // WITHOUT a final summary — the adopt side keeps the logical entry
+        // (restorable from the safety net) without adding an active reference.
+        bool source_fallback_retained       = false;
+        // Device-KV fit-gate defer bookkeeping (set by prepare_materialization's
+        // capacity gate, cleared when a prepare passes the gate). kv_defer_first
+        // bounds the defer: once it is older than kKVDeferDeadline the progress
+        // tick aborts the request instead of retrying forever — an unbounded
+        // defer livelocked the engine under sustained pool saturation (a
+        // single in-flight materialization cannot free pages itself, so a
+        // demand that never fits deferred on every ~1ms tick indefinitely).
+        // The last_logged fields rate-limit the defer log to free-page
+        // progress plus a 5-second heartbeat (a 1ms-tick engine otherwise
+        // turns one unfitted demand into ~1000 log lines/second).
+        std::optional<std::chrono::steady_clock::time_point> kv_defer_first;
+        std::uint32_t kv_defer_last_logged_pool = 0;
+        std::uint32_t kv_defer_last_logged_free = 0;
+        std::chrono::steady_clock::time_point kv_defer_last_logged{};
+        // Fit-gate stall relief: while a defer is in flight, free pages only
+        // grow when other in-flight work drains. If they have not grown for
+        // kKVReliefDelay, nothing is draining (no running requests, and the
+        // context transaction is single — no other materialization can be in
+        // flight), so the gate demotes the largest idle continuation to the
+        // host safety net instead of deferring to the 120s deadline.
+        std::chrono::steady_clock::time_point kv_defer_flat_since{};
+        std::uint32_t kv_defer_last_free      = 0;
     };
+
+    // Fit-gate stall relief: demote the largest idle (Catalogued, not bound to a
+    // decode lane, not this transaction's source/destination) continuation to
+    // the host safety net — the same {KV + state} unit operation as the
+    // catalog-rotation and pressure-victim paths — freeing device KV pages for
+    // a stalled fit gate. Returns the text pages freed (0 if no idle victim).
+    [[nodiscard]] std::uint32_t relieve_stalled_fit_gate(
+        const MaterializationTransaction& transaction) noexcept;
+
+    // P1.5(d) Increment 2: relief victim-skip set. The in-flight-transaction
+    // path skips its own source/root/shared source; the queued path skips the
+    // blocked head's sources (evicting what the queued request needs would
+    // loop on stale admission candidates).
+    struct KvReliefSkip {
+        std::optional<std::uint32_t> source;
+        std::optional<std::uint32_t> root;
+        std::optional<std::uint32_t> shared_source;
+    };
+    [[nodiscard]] std::uint32_t relieve_kv_fit(const KvReliefSkip& skip) noexcept;
+
+    // P1.5(d) Increment 2: queued-KV block — a FIFO head whose device-KV
+    // demand cannot fit the pools at admission time. The engine records it
+    // instead of admitting the request into a silent 120s fit-gate defer;
+    // the request stays in the visible queue (position/wait in /stats) while
+    // progress_queued_kv_block() runs the 15s stall relief toward its demand
+    // and enforces the 120s deadline (Expired => the engine aborts it — the
+    // same bound as the prepare-time fit-gate defer).
+    struct QueuedKvBlock {
+        bool active = false;
+        std::uint64_t request_id = 0;
+        std::uint32_t need_text    = 0;
+        std::uint32_t need_backend = 0;
+        std::optional<std::uint32_t> skip_source;
+        std::optional<std::uint32_t> skip_shared;
+        std::chrono::steady_clock::time_point blocked_since{};
+        std::chrono::steady_clock::time_point flat_since{};
+        std::uint32_t last_free_text    = 0;
+        std::uint32_t last_free_backend = 0;
+        // Log rate-limit (a 1ms-tick engine otherwise turns one blocked head
+        // into ~1000 log lines/second — same rationale as kv_defer_last_*).
+        std::uint32_t last_logged_free_text    = 0;
+        std::uint32_t last_logged_free_backend = 0;
+        std::chrono::steady_clock::time_point last_logged{};
+    };
+    QueuedKvBlock queued_kv_block_;
 
     std::uint64_t next_materialization_id_ = 1;
     CudaCompletionEvent context_source_ready_;
@@ -948,6 +1162,11 @@ private:
         bool publish_private = false;
         bool publish_shared  = false;
         bool replaces_shared = false;
+        // Set once publish_active_capture has retained the shared source's
+        // checkpoint reference (for the new shared entry). If the publish is
+        // aborted after that point, abort_active_capture must release the
+        // reference — the shared slot is rolled back, so nothing else would.
+        bool shared_reference_retained = false;
         std::optional<runtime::CheckpointRef> private_replacement;
         std::optional<std::uint32_t> shared_index;
         std::uint64_t replacement_generation = 0;
@@ -1019,7 +1238,10 @@ private:
                  const SequenceState* source, const SharedPrefixState* shared_source,
                  std::optional<runtime::CheckpointRef> checkpoint, bool must_retain_private_source);
     [[nodiscard]] StartResult start_request(MaterializationTransaction& transaction);
-    void prepare_materialization(MaterializationTransaction& transaction);
+    // Returns false (deferring, with the transaction unmutated) when the transaction's
+    // device-KV reservation demand does not fit the current pool occupancy; the caller
+    // then returns InProgress and retries on a later engine tick.
+    [[nodiscard]] bool prepare_materialization(MaterializationTransaction& transaction);
     void enqueue_materialization_transfers(MaterializationTransaction& transaction);
     void record_materialization_transfer_observations(MaterializationTransaction& transaction);
     void publish_materialization_transfers(MaterializationTransaction& transaction);
@@ -1061,8 +1283,6 @@ private:
         std::span<const std::uint8_t> terminal, std::span<const std::uint8_t> cancelled,
         runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] bool valid_sequence(SequenceHandle handle) const noexcept;
-    [[nodiscard]] bool valid_continuation(const ContinuationHandle& handle) const noexcept;
-    [[nodiscard]] bool valid_shared_prefix(const SharedPrefixHandle& handle) const noexcept;
     [[nodiscard]] bool valid_capture_offer(const CaptureOffer& offer) const noexcept;
     [[nodiscard]] bool materialization_pins(std::uint32_t index,
                                             std::uint64_t generation) const noexcept;
@@ -1074,6 +1294,14 @@ private:
     resident_resources(const SharedPrefixState& shared) const noexcept;
     [[nodiscard]] detail::PhysicalResources physical_occupancy() const noexcept;
     [[nodiscard]] bool physical_peak_fits(detail::PhysicalResources peak) const noexcept;
+    // P2.3: true when a unit whose KV spans `text_pages` + `backend_pages`
+    // (plus its endpoint + rewrite-checkpoint state images) fits the TOTAL
+    // shared host budget (KV arena + host state pool). A unit that cannot
+    // fit an empty budget can never be retained, so admission marks it
+    // retention-ineligible (the spill SKIPs it). Occupancy-independent by
+    // design — occupancy-aware fitting is P2.5's unit LRU.
+    [[nodiscard]] bool retention_eligible(std::uint32_t text_pages,
+                                         std::uint32_t backend_pages) const noexcept;
     [[nodiscard]] StateImageHandle
     selected_state(const SequenceState& sequence, ReusePath reuse,
                    std::optional<runtime::CheckpointRef> checkpoint) const;
@@ -1344,6 +1572,8 @@ struct PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT> {
     [[nodiscard]] std::optional<qwen3_6::PressureTargetHandle>
     guided_closure_target(const AdmissionCandidate& candidate,
                           std::span<const std::uint32_t> preferred_owner_ordinals);
+    [[nodiscard]] std::optional<qwen3_6::PressureTargetHandle>
+    greedy_cover_target(const AdmissionCandidate& candidate);
     [[nodiscard]] runtime::PressureTargetGuidance guidance(qwen3_6::PressureTargetHandle target);
     [[nodiscard]] runtime::PressureTargetAssessment assess(qwen3_6::PressureTargetHandle target);
     void retain_assessment(qwen3_6::PressureTargetHandle target);

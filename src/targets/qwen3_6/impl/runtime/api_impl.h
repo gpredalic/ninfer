@@ -163,6 +163,13 @@ std::optional<PressureTargetHandle> PressurePlanningSession<Variant>::guided_clo
 }
 
 template <>
+std::optional<PressureTargetHandle> PressurePlanningSession<Variant>::greedy_cover_target(
+    const AdmissionCandidate<Variant>& candidate) {
+    if (impl_ == nullptr) { throw std::logic_error("pressure planning session is empty"); }
+    return impl_->greedy_cover_target(candidate);
+}
+
+template <>
 runtime::PressureTargetGuidance
 PressurePlanningSession<Variant>::guidance(PressureTargetHandle target) {
     if (impl_ == nullptr) { throw std::logic_error("pressure planning session is empty"); }
@@ -258,6 +265,154 @@ std::uint64_t Program<Variant>::safety_net_restore_count() const noexcept {
     return impl_ ? impl_->safety_net_restore_count_ : 0;
 }
 
+template <>
+std::uint64_t Program<Variant>::host_kv_single_alloc_failures() const noexcept {
+    return impl_ ? impl_->host_kv_single_alloc_failures() : 0;
+}
+
+template <>
+std::uint64_t Program<Variant>::host_kv_compaction_count() const noexcept {
+    return impl_ ? impl_->host_kv_compaction_count() : 0;
+}
+
+template <>
+std::uint64_t Program<Variant>::host_kv_eviction_count() const noexcept {
+    return impl_ ? impl_->host_kv_eviction_count() : 0;
+}
+
+template <>
+std::uint64_t Program<Variant>::relief_kv_releases() const noexcept {
+    return impl_ ? impl_->relief_kv_releases() : 0;
+}
+
+template <>
+std::uint64_t Program<Variant>::relief_kv_not_retained() const noexcept {
+    return impl_ ? impl_->relief_kv_not_retained() : 0;
+}
+
+template <>
+std::uint64_t Program<Variant>::relief_kv_pages_freed() const noexcept {
+    return impl_ ? impl_->relief_kv_pages_freed() : 0;
+}
+
+template <>
+std::uint64_t Program<Variant>::slot_release_destroys() const noexcept {
+    return impl_ ? impl_->slot_release_destroys() : 0;
+}
+
+template <>
+std::uint64_t Program<Variant>::spill_state_d2h_count() const noexcept {
+    return impl_ ? impl_->spill_state_d2h_count() : 0;
+}
+
+template <>
+std::uint64_t Program<Variant>::spill_state_d2h_bytes() const noexcept {
+    return impl_ ? impl_->spill_state_d2h_bytes() : 0;
+}
+
+template <>
+std::uint64_t Program<Variant>::materialize_state_slot_alloc_failures() const noexcept {
+    return impl_ ? impl_->materialize_state_slot_alloc_failures() : 0;
+}
+template <>
+std::uint64_t Program<Variant>::materialize_dual_device_replica_drops() const noexcept {
+    return impl_ ? impl_->materialize_dual_device_replica_drops() : 0;
+}
+
+template <>
+std::uint64_t Program<Variant>::materialize_kv_page_alloc_failures() const noexcept {
+    return impl_ ? impl_->materialize_kv_page_alloc_failures() : 0;
+}
+
+template <>
+std::uint64_t Program<Variant>::materialize_kv_page_alloc_failures_main() const noexcept {
+    return impl_ ? impl_->materialize_kv_page_alloc_failures_main() : 0;
+}
+
+template <>
+std::uint64_t Program<Variant>::materialize_kv_page_alloc_failures_backend() const noexcept {
+    return impl_ ? impl_->materialize_kv_page_alloc_failures_backend() : 0;
+}
+
+template <>
+std::uint64_t Program<Variant>::materialize_kv_defers() const noexcept {
+    return impl_ ? impl_->materialize_kv_defers() : 0;
+}
+template <>
+std::uint64_t Program<Variant>::materialize_state_replans() const noexcept {
+    return impl_ ? impl_->materialize_state_replans() : 0;
+}
+
+template <>
+std::uint32_t Program<Variant>::checkpoint_device_count() const noexcept {
+    return impl_ ? impl_->checkpoint_residency().device_count : 0;
+}
+
+template <>
+std::uint32_t Program<Variant>::checkpoint_host_only_count() const noexcept {
+    return impl_ ? impl_->checkpoint_residency().host_only_count : 0;
+}
+
+template <>
+std::uint32_t Program<Variant>::checkpoint_device_state_slots() const noexcept {
+    return impl_ ? impl_->checkpoint_residency().device_state_slots : 0;
+}
+
+template <>
+std::uint32_t Program<Variant>::state_dual_resident_count() const noexcept {
+    return impl_ ? impl_->residency_histogram().dual_resident : 0;
+}
+
+template <>
+std::uint32_t Program<Variant>::state_active_with_host_count() const noexcept {
+    return impl_ ? impl_->residency_histogram().active_with_host : 0;
+}
+
+template <>
+std::uint32_t Program<Variant>::state_pending_host_slots() const noexcept {
+    return impl_ ? impl_->residency_histogram().pending_host_slots : 0;
+}
+
+template <>
+std::uint32_t Program<Variant>::host_kv_net_entries() const noexcept {
+    return impl_ ? impl_->host_kv_net_entries() : 0;
+}
+
+template <>
+std::uint64_t Program<Variant>::host_kv_net_state_bytes() const noexcept {
+    return impl_ ? impl_->host_kv_net_state_bytes() : 0;
+}
+
+template <>
+NetTierCensus Program<Variant>::host_kv_net_tier_census() const noexcept {
+    return impl_ ? impl_->host_kv_net_tier_census() : NetTierCensus{};
+}
+
+template <>
+std::vector<NetUnitInfo> Program<Variant>::host_kv_net_top_units(std::size_t n) const noexcept {
+    return impl_ ? impl_->host_kv_net_top_units(n) : std::vector<NetUnitInfo>{};
+}
+
+template <>
+std::uint64_t Program<Variant>::host_unit_occupied_bytes() const noexcept {
+    return impl_ ? impl_->host_unit_occupied_bytes() : 0;
+}
+
+template <>
+std::uint32_t Program<Variant>::host_unit_count() const noexcept {
+    return impl_ ? impl_->host_unit_count() : 0;
+}
+
+template <>
+std::uint64_t Program<Variant>::host_kv_superseded_count() const noexcept {
+    return impl_ ? impl_->host_kv_superseded_count() : 0;
+}
+
+template <>
+std::uint64_t Program<Variant>::host_slot_release_failures() const noexcept {
+    return impl_ ? impl_->host_slot_release_failures() : 0;
+}
+
 
 template <>
 std::optional<ResourcePlan<Variant>>
@@ -344,6 +499,41 @@ bool Program<Variant>::has_context_transaction() const noexcept {
 }
 
 template <>
+qwen3_6::KvAdmissionFit
+Program<Variant>::kv_admission_fit(const ResourcePlan<Variant>& plan) const noexcept {
+    if (plan.revision_ == 0 || plan.revision_ != impl_->resource_revision() ||
+        plan.admission_.impl_ == nullptr) {
+        return {};  // stale/empty plan — treat as "no probe" (the engine re-inspects)
+    }
+    return impl_->kv_admission_fit(*plan.admission_.impl_);
+}
+
+template <>
+void Program<Variant>::queue_kv_block(const qwen3_6::KvAdmissionFit& fit,
+                                      std::uint64_t request_id) noexcept {
+    impl_->queue_kv_block(fit, request_id);
+}
+
+template <>
+void Program<Variant>::clear_queued_kv_block() noexcept { impl_->clear_queued_kv_block(); }
+
+template <>
+bool Program<Variant>::has_queued_kv_block() const noexcept {
+    return impl_->has_queued_kv_block();
+}
+
+template <>
+std::uint64_t Program<Variant>::queued_kv_block_request_id() const noexcept {
+    return impl_->queued_kv_block_request_id();
+}
+
+template <>
+qwen3_6::QueuedKvBlockProgress
+Program<Variant>::progress_queued_kv_block(bool relief_suppressed) noexcept {
+    return impl_->progress_queued_kv_block(relief_suppressed);
+}
+
+template <>
 PrefillProgress<Variant>
 Program<Variant>::advance_prefill(SequenceHandle<Variant> sequence,
                                   runtime::ExecutionTiming* failed_timing) {
@@ -379,6 +569,16 @@ std::uint64_t Program<Variant>::checkpoint_recovery_ns(
     const SharedPrefixHandle<Variant>& owner, runtime::CheckpointRef checkpoint,
     const runtime::ContextMachineCostModel& machine_cost) const {
     return impl_->checkpoint_recovery_ns(owner, checkpoint, machine_cost);
+}
+
+template <>
+bool Program<Variant>::valid_continuation(const ContinuationHandle<Variant>& handle) const noexcept {
+    return impl_->valid_continuation(handle);
+}
+
+template <>
+bool Program<Variant>::valid_shared_prefix(const SharedPrefixHandle<Variant>& handle) const noexcept {
+    return impl_->valid_shared_prefix(handle);
 }
 
 template <>

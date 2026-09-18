@@ -1,0 +1,62 @@
+schema_version: 1
+targets:
+  qwen38_api:
+    protocol: openai_chat
+    base_url: http://127.0.0.1:18080/v1
+    model: qwen3.8-27b
+    max_concurrency: 2
+    request:
+      timeout_seconds: 86400
+      retries: 2
+      retry_interval_seconds: 10
+suites:
+  probe:
+    jobs:
+      - id: simple_python
+        backend: evalscope
+        dataset: bfcl_v4
+        target: qwen38_api
+        limit: 8
+        generation: &gen
+          temperature: 1.0
+          top_p: 0.95
+          top_k: 20
+          presence_penalty: 0.0
+          frequency_penalty: 0.0
+          max_tokens: 16384
+          seed: 42
+          extra_body: {enable_thinking: true, min_p: 0.0}
+        backend_args: &ba {is_fc_model: true, underscore_to_dot: true, subset_list: [simple_python]}
+      - id: multiple
+        backend: evalscope
+        dataset: bfcl_v4
+        target: qwen38_api
+        limit: 8
+        generation: *gen
+        backend_args: {is_fc_model: true, underscore_to_dot: true, subset_list: [multiple]}
+      - id: parallel
+        backend: evalscope
+        dataset: bfcl_v4
+        target: qwen38_api
+        limit: 8
+        generation: *gen
+        backend_args: {is_fc_model: true, underscore_to_dot: true, subset_list: [parallel]}
+      - id: irrelevance
+        backend: evalscope
+        dataset: bfcl_v4
+        target: qwen38_api
+        limit: 8
+        generation: *gen
+        backend_args: {is_fc_model: true, underscore_to_dot: true, subset_list: [irrelevance]}
+      - id: multi_turn_base
+        backend: evalscope
+        dataset: bfcl_v4
+        target: qwen38_api
+        limit: 8
+        generation: *gen
+        backend_args: {is_fc_model: true, underscore_to_dot: true, subset_list: [multi_turn_base]}
+runtime:
+  max_parallel_jobs: 1
+  runs_dir: eval/runs
+  progress: {enabled: true, refresh_seconds: 1, heartbeat_seconds: 900}
+  samples: {retention: all}

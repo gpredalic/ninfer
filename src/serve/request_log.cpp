@@ -324,6 +324,8 @@ Json materialization_json(const ninfer::MaterializationDiagnostics& diagnostics)
         {"relative_bound_gap", diagnostics.relative_bound_gap},
         {"selected_degradation_units", diagnostics.selected_degradation_units},
         {"selected_maximal_fallback", diagnostics.selected_maximal_fallback},
+        {"seed_type", ninfer::materialization_seed_type_name(diagnostics.seed_type)},
+        {"owner_count", diagnostics.owner_count},
     };
 }
 

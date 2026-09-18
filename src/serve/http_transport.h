@@ -35,10 +35,20 @@ public:
 
     static constexpr std::chrono::seconds kHeartbeatInterval{5};
     static constexpr std::string_view kHeartbeatComment = ": keep-alive\n\n";
+    // The Anthropic SSE spec defines a `ping` event: a REAL stream event (not a
+    // comment) that client stream parsers recognize and ignore. Comment
+    // keep-alives do not reset a client's "first event" timer — a queued
+    // request whose prefill takes longer than that budget gets abandoned by
+    // the client (observed 2026-09-16: cancels at ~29s of queue wait despite
+    // comment heartbeats flowing). The anthropic handler heartbeats with the
+    // comment (TCP_USER_TIMEOUT probe) plus the ping (client-visible progress).
+    static constexpr std::string_view kHeartbeatAnthropic =
+        ": keep-alive\n\nevent: ping\ndata: {\"type\": \"ping\"}\n\n";
 
     explicit SseTransport(httplib::DataSink& sink, std::atomic<bool>& cancelled,
                           Clock::duration heartbeat_interval = kHeartbeatInterval,
-                          Clock::time_point now              = Clock::now());
+                          Clock::time_point now              = Clock::now(),
+                          std::string_view heartbeat_payload = kHeartbeatComment);
 
     void write(std::string_view item, Clock::time_point now = Clock::now());
     void write(const std::vector<std::string>& items, Clock::time_point now = Clock::now());
@@ -54,6 +64,7 @@ private:
     httplib::DataSink& sink_;
     std::atomic<bool>& cancelled_;
     Clock::duration heartbeat_interval_;
+    std::string_view heartbeat_payload_;
     Clock::time_point last_write_;
 };
 

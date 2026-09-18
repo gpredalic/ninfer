@@ -1,0 +1,45 @@
+schema_version: 1
+targets:
+  qwen38_api:
+    protocol: openai_chat
+    base_url: http://127.0.0.1:18080/v1
+    model: qwen3.8-27b
+    max_concurrency: 2
+    request:
+      timeout_seconds: 3600
+      retries: 1
+      retry_interval_seconds: 5
+suites:
+  bfcl_smoke:
+    jobs:
+      - id: bfcl_v4
+        backend: evalscope
+        dataset: bfcl_v4
+        target: qwen38_api
+        max_concurrency: 2
+        limit: 30
+        generation:
+          temperature: 0.7
+          top_p: 0.80
+          top_k: 20
+          max_tokens: 16384
+          seed: 42
+          extra_body:
+            enable_thinking: true
+            min_p: 0.0
+        backend_args:
+          is_fc_model: true
+          underscore_to_dot: true
+          allow_network_downloads: true
+          subset_list:
+            - multiple
+            - multi_turn_base
+runtime:
+  max_parallel_jobs: 1
+  runs_dir: eval/runs
+  progress:
+    enabled: true
+    refresh_seconds: 1
+    heartbeat_seconds: 900
+  samples:
+    retention: all

@@ -77,6 +77,7 @@ ninfer_add_test(ninfer_admission_policy_test SOURCES test_admission_policy.cpp)
 ninfer_add_test(ninfer_context_cost_test SOURCES test_context_cost.cpp)
 ninfer_add_test(ninfer_resource_manager_test SOURCES test_resource_manager.cpp)
 ninfer_add_test(ninfer_kv_capacity_test SOURCES test_kv_capacity.cpp)
+ninfer_add_test(ninfer_cache_unit_test  SOURCES test_cache_unit.cpp)
 ninfer_add_test(ninfer_sampling_defaults_test
   SOURCES test_sampling_defaults.cpp
   LIBRARIES ninfer_engine ninfer_core)
@@ -144,11 +145,27 @@ ninfer_add_test(ninfer_qwen3_6_jinja_vision_mapping_test
 target_include_directories(ninfer_qwen3_6_jinja_vision_mapping_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/impl)
+# Asserts the rendered prompt is prefix-stable across turns: rendering the
+# conversation without its last message yields a byte-prefix of the full render,
+# which is what the context cache needs to re-use the prefix.
+ninfer_add_test(ninfer_qwen3_6_jinja_prefix_stability_test
+  SOURCES targets/qwen3_6/test_jinja_prefix_stability.cpp
+  NEEDS_SOURCE_DIR
+  LIBRARIES ninfer_engine ninfer_core)
+target_include_directories(ninfer_qwen3_6_jinja_prefix_stability_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/impl)
 ninfer_add_test(ninfer_qwen3_6_runtime_mechanisms_test
   SOURCES targets/qwen3_6/test_runtime_mechanisms.cpp
   LIBRARIES ninfer_engine ninfer_core)
 target_include_directories(ninfer_qwen3_6_runtime_mechanisms_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
+ninfer_add_test(ninfer_qwen3_6_host_kv_safety_net_test
+  SOURCES targets/qwen3_6/test_host_kv_safety_net.cpp
+  LIBRARIES ninfer_engine ninfer_core)
+target_include_directories(ninfer_qwen3_6_host_kv_safety_net_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/impl)
 ninfer_add_test(ninfer_qwen3_6_state_image_test
   SOURCES targets/qwen3_6/test_state_image.cpp
   LIBRARIES ninfer_engine ninfer_core)
@@ -223,6 +240,9 @@ ninfer_add_test(ninfer_serve_options_test
   LIBRARIES ninfer_serve)
 ninfer_add_test(ninfer_request_log_test
   SOURCES test_request_log.cpp
+  LIBRARIES ninfer_serve)
+ninfer_add_test(ninfer_serve_session_key_test
+  SOURCES test_serve_session_key.cpp
   LIBRARIES ninfer_serve)
 ninfer_add_test(ninfer_stats_json_test
   SOURCES test_stats_json.cpp

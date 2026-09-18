@@ -115,6 +115,8 @@ struct Package {
     using AbortResult                = qwen3_6::AbortResult<detail::Variant>;
     using ReleaseResult              = qwen3_6::ReleaseResult<detail::Variant>;
     using Program                    = qwen3_6::Program<detail::Variant>;
+    using KvAdmissionFit             = qwen3_6::KvAdmissionFit;
+    using QueuedKvBlockProgress      = qwen3_6::QueuedKvBlockProgress;
 
     [[nodiscard]] static ModelSamplingDefaults sampling_defaults(std::string_view model);
     [[nodiscard]] static WeightsProfile resolve_weights(const artifact::ArtifactIdentity& identity);

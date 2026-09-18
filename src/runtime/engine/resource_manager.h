@@ -62,6 +62,7 @@ template <class Package>
 class ResourceManager {
 public:
     using Program                 = typename Package::Program;
+    using KvAdmissionFit          = typename Package::KvAdmissionFit;
     using PreparedPrompt          = typename Package::PreparedPrompt;
     using RequestBasePlan         = typename Package::RequestBasePlan;
     using AdmissionCandidate      = typename Package::AdmissionCandidate;
@@ -389,6 +390,12 @@ public:
                     program.inspect_admission(prompt, base, *destination, nullptr, &*entry.handle,
                                               index.checkpoint, false, cost_model_);
                 if (!plan) { continue; }
+                // P2.5 Inc 3 (session-key gap): the shared-prefix candidate must
+                // carry the session key like the other admission paths — a
+                // keyless plan writes an empty session_key at the end-of-turn
+                // catalogue, clearing the sequence's key and leaving its next
+                // spill dead-tier forever.
+                plan->set_session_key(base.context_cache().session_key);
                 if (plan->summary().reusable_prompt_tokens == 0 ||
                     plan->identity_assessment().source_disposition != ClaimDisposition::Retained) {
                     throw std::logic_error("Program returned an invalid shared candidate");
@@ -517,6 +524,16 @@ public:
         }
         return program.prove_persistent_backfill(blocked_head, *candidate.plan_,
                                                  persistent_borrowers);
+    }
+
+    // P1.5(d) Increment 2: admission-side occupancy probe — answers the
+    // prepare-time fit gate's question for the choice's plan without
+    // reserving. A "no" keeps the request in the visible queue (the engine
+    // records a queued-KV block on the program) instead of admitting it into
+    // a silent 120s fit-gate defer.
+    [[nodiscard]] KvAdmissionFit probe_kv_fit(Program& program, const Choice& choice) const {
+        if (!choice.plan_) { return {}; }
+        return program.kv_admission_fit(*choice.plan_);
     }
 
     [[nodiscard]] MaterializationReserveResult
@@ -712,6 +729,10 @@ public:
                         entry.transaction_pins != 0 || entry.summary.active_references != 0) {
                         continue;
                     }
+                    if (!program.valid_shared_prefix(*entry.handle)) {
+                        clear_shared_entry(entry);
+                        continue;
+                    }
                     CaptureAssessment assessment = program.inspect_capture(
                         offer, nullptr, &*entry.handle, private_replacement, true, cost_model_);
                     if (!assessment.publishes_shared) { continue; }
@@ -742,9 +763,13 @@ public:
                 });
             };
             for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
-                const CatalogEntry& entry = catalog_[slot];
+                CatalogEntry& entry = catalog_[slot];
                 if (entry.state != CatalogState::Catalogued || !entry.handle ||
                     entry.active_references != 0) {
+                    continue;
+                }
+                if (!program.valid_continuation(*entry.handle)) {
+                    clear_catalog_entry(entry);
                     continue;
                 }
                 owner_policies.push_back(typename CapturePlanner::OwnerPolicy{
@@ -762,8 +787,12 @@ public:
                 }
             }
             for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
-                const SharedCatalogEntry& entry = shared_catalog_[slot];
+                SharedCatalogEntry& entry = shared_catalog_[slot];
                 if (entry.state != SharedCatalogState::Catalogued || !entry.handle) { continue; }
+                if (!program.valid_shared_prefix(*entry.handle)) {
+                    clear_shared_entry(entry);
+                    continue;
+                }
                 const std::uint32_t ordinal = catalog_count_ + slot;
                 owner_policies.push_back(typename CapturePlanner::OwnerPolicy{
                     .ordinal                  = ordinal,
@@ -1118,6 +1147,38 @@ public:
             context_stats_.pressure_maximal_fallback_selections;
         out.admission_catalog_hits        = context_stats_.admission_catalog_hits;
         out.admission_safety_net_restores = program.safety_net_restore_count();
+        out.host_kv_single_alloc_failures = program.host_kv_single_alloc_failures();
+        out.host_kv_compactions           = program.host_kv_compaction_count();
+        out.host_kv_evictions             = program.host_kv_eviction_count();
+        out.relief_kv_releases            = program.relief_kv_releases();
+        out.relief_kv_not_retained        = program.relief_kv_not_retained();
+        out.relief_kv_pages_freed         = program.relief_kv_pages_freed();
+        out.slot_release_destroys         = program.slot_release_destroys();
+        out.spill_state_d2h_count         = program.spill_state_d2h_count();
+        out.spill_state_d2h_bytes         = program.spill_state_d2h_bytes();
+        out.materialize_state_slot_alloc_failures = program.materialize_state_slot_alloc_failures();
+        out.materialize_dual_device_replica_drops = program.materialize_dual_device_replica_drops();
+        out.materialize_kv_page_alloc_failures    = program.materialize_kv_page_alloc_failures();
+        out.materialize_kv_page_alloc_failures_main    = program.materialize_kv_page_alloc_failures_main();
+        out.materialize_kv_page_alloc_failures_backend = program.materialize_kv_page_alloc_failures_backend();
+        out.materialize_kv_defers                      = program.materialize_kv_defers();
+        out.materialize_state_replans                   = program.materialize_state_replans();
+        out.checkpoint_device_count               = program.checkpoint_device_count();
+        out.checkpoint_host_only_count            = program.checkpoint_host_only_count();
+        out.checkpoint_device_state_slots         = program.checkpoint_device_state_slots();
+        out.state_dual_resident_count             = program.state_dual_resident_count();
+        out.state_active_with_host_count          = program.state_active_with_host_count();
+        out.state_pending_host_slots              = program.state_pending_host_slots();
+        out.host_kv_net_entries                   = program.host_kv_net_entries();
+        out.host_kv_net_state_bytes               = program.host_kv_net_state_bytes();
+        out.host_kv_tier_census                   = program.host_kv_net_tier_census();
+        // P2.5 Increment 3 (O0+): the net's largest retained units (top-12 by
+        // bytes) — the per-entry view behind the tier census.
+        out.host_kv_top_units                     = program.host_kv_net_top_units(12);
+        out.host_unit_occupied_bytes              = program.host_unit_occupied_bytes();
+        out.host_unit_count                        = program.host_unit_count();
+        out.host_kv_superseded                    = program.host_kv_superseded_count();
+        out.host_slot_release_failures            = program.host_slot_release_failures();
         out.historical_fork_hits            = context_stats_.historical_fork_hits;
         out.actual_context_transfer_seconds = context_stats_.actual_context_transfer_seconds;
 
@@ -1140,6 +1201,11 @@ public:
 
     [[nodiscard]] CatalogState catalog_state(std::uint32_t slot) const noexcept {
         return slot < catalog_count_ ? catalog_[slot].state : CatalogState::Vacant;
+    }
+
+    [[nodiscard]] SharedCatalogState shared_catalog_state(std::uint32_t slot) const noexcept {
+        return slot < shared_catalog_count_ ? shared_catalog_[slot].state
+                                            : SharedCatalogState::Vacant;
     }
 
     [[nodiscard]] LogicalLaneState lane_state(LaneId lane) const noexcept {
@@ -1669,9 +1735,13 @@ private:
             checkpoint_policies.reserve(prefix_index_.size());
 
             for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
-                const CatalogEntry& entry = catalog_[slot];
+                CatalogEntry& entry = catalog_[slot];
                 if (entry.state != CatalogState::Catalogued || !entry.handle ||
                     entry.active_references != 0) {
+                    continue;
+                }
+                if (!program.valid_continuation(*entry.handle)) {
+                    clear_catalog_entry(entry);
                     continue;
                 }
                 private_owners.push_back(&*entry.handle);
@@ -1711,9 +1781,13 @@ private:
                 });
             }
             for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
-                const SharedCatalogEntry& entry = shared_catalog_[slot];
+                SharedCatalogEntry& entry = shared_catalog_[slot];
                 if (entry.state != SharedCatalogState::Catalogued || !entry.handle ||
                     entry.transaction_pins != 0 || entry.summary.active_references != 0) {
+                    continue;
+                }
+                if (!program.valid_shared_prefix(*entry.handle)) {
+                    clear_shared_entry(entry);
                     continue;
                 }
                 const std::uint32_t ordinal = catalog_count_ + slot;
@@ -1919,9 +1993,13 @@ private:
             });
         };
         for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
-            const CatalogEntry& entry = catalog_[slot];
+            CatalogEntry& entry = catalog_[slot];
             if (entry.state != CatalogState::Catalogued || !entry.handle ||
                 entry.active_references != 0 || slot == candidate.source_slot) {
+                continue;
+            }
+            if (!program.valid_continuation(*entry.handle)) {
+                clear_catalog_entry(entry);
                 continue;
             }
             projected_owners.push_back(ContextPortfolioOwnerPolicy{
@@ -1939,8 +2017,12 @@ private:
             }
         }
         for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
-            const SharedCatalogEntry& entry = shared_catalog_[slot];
+            SharedCatalogEntry& entry = shared_catalog_[slot];
             if (entry.state != SharedCatalogState::Catalogued || !entry.handle) { continue; }
+            if (!program.valid_shared_prefix(*entry.handle)) {
+                clear_shared_entry(entry);
+                continue;
+            }
             const std::uint32_t ordinal = catalog_count_ + slot;
             projected_owners.push_back(ContextPortfolioOwnerPolicy{
                 .ordinal                = ordinal,
@@ -2482,40 +2564,68 @@ private:
         bool retained_private_source = false;
         if (record->source_slot != kInvalidCatalogSlot) {
             CatalogEntry& source = catalog_[record->source_slot];
-            if (!result.source || source.state != CatalogState::Claimed ||
+            if (source.state != CatalogState::Claimed ||
                 source.id != record->source_id || source.revision != record->source_revision) {
                 throw std::logic_error("materialization private source result is missing");
             }
-            if (result.status == ContextTransactionStatus::Published &&
-                result.source->disposition != record->source_disposition) {
-                throw std::logic_error("private source outcome differs from the selected target");
-            }
-            if (result.source->disposition == ClaimDisposition::Retained) {
-                if (result.source->final_summary) {
-                    if (!valid_continuation_summary(*result.source->final_summary)) {
-                        throw std::logic_error("materialization source summary is invalid");
-                    }
-                    assign_continuation_summary(source.summary, *result.source->final_summary);
-                    migrate_observations(source, *result.source->final_summary, source.retention);
-                    advance_revision(source.revision);
-                    refresh_session_owner_revision(record->source_id, record->source_slot,
-                                                   source.revision);
-                }
-                source.state            = CatalogState::Catalogued;
-                retained_private_source = result.status == ContextTransactionStatus::Published;
-                if (retained_private_source) { ++source.active_references; }
-            } else if (result.source->disposition == ClaimDisposition::ConsumedToActive) {
-                erase_session_if_owner(source.id);
-                source.handle.reset();
-                source.summary.endpoint.reset();
-                source.summary.rewrite.reset();
-                source.summary.long_anchors.clear();
-                source.observations.clear();
-                source.session.reset();
-                source.active_references = 0;
+            if (!result.source) {
+                // Root-fallback acknowledgement: the source's physical state was
+                // evicted before restore, so the program fell back to root prefill
+                // (or was aborted after a deferred one) and reports no source.
+                // The logical continuation survives (restorable from the safety
+                // net) — release the claim back to Catalogued without a summary
+                // update and without an active reference.
+                source.state = CatalogState::Catalogued;
             } else {
-                throw std::logic_error("materialization source returned an invalid disposition");
+                // A root-fallback acknowledgement carries no final summary (the
+                // program could not populate one — the source state is gone), so
+                // the planned disposition was not honored and must not be checked.
+                if (result.status == ContextTransactionStatus::Published &&
+                    result.source->final_summary &&
+                    result.source->disposition != record->source_disposition) {
+                    throw std::logic_error("private source outcome differs from the selected target");
+                }
+                if (result.source->disposition == ClaimDisposition::Retained) {
+                    if (result.source->final_summary) {
+                        if (!valid_continuation_summary(*result.source->final_summary)) {
+                            throw std::logic_error("materialization source summary is invalid");
+                        }
+                        assign_continuation_summary(source.summary, *result.source->final_summary);
+                        migrate_observations(source, *result.source->final_summary, source.retention);
+                        advance_revision(source.revision);
+                        refresh_session_owner_revision(record->source_id, record->source_slot,
+                                               source.revision);
+                        source.state            = CatalogState::Catalogued;
+                        retained_private_source = result.status == ContextTransactionStatus::Published;
+                        if (retained_private_source) { ++source.active_references; }
+                    } else {
+                        // Root-fallback acknowledgement (summary-less Retained):
+                        // the source's physical state was evicted before restore
+                        // and the program released its continuation slot (recycled
+                        // as the root destination), so the entry no longer holds a
+                        // live capability. Retire it: the publication slot IS this
+                        // slot (ConsumedToActive was planned), and a stale handle
+                        // would fail the publication check ("active publication
+                        // cell retained an inactive capability"). Restorability
+                        // lives in the host-KV safety net, which is separate and
+                        // survives.
+                        erase_session_if_owner(source.id);
+                        clear_catalog_entry(source);
+                    }
+                } else if (result.source->disposition == ClaimDisposition::ConsumedToActive) {
+                    erase_session_if_owner(source.id);
+                    source.handle.reset();
+                    source.summary.endpoint.reset();
+                    source.summary.rewrite.reset();
+                    source.summary.long_anchors.clear();
+                    source.observations.clear();
+                    source.session.reset();
+                    source.active_references = 0;
+                } else {
+                    throw std::logic_error("materialization source returned an invalid disposition");
+                }
             }
+
         } else if (result.source) {
             throw std::logic_error("root materialization returned a private source result");
         }
@@ -2874,7 +2984,10 @@ private:
     void observe_transfer(const ContextTransferObservation& observation) noexcept {
         const double seconds = static_cast<double>(observation.elapsed_ns) * 1.0e-9;
         context_stats_.actual_context_transfer_seconds += seconds;
-        const std::uint64_t bytes = observation.units;
+        // State observations carry units as an image COUNT; units_bytes (when set)
+        // is the true byte size. Typed-KV observations carry units as bytes.
+        const std::uint64_t bytes =
+            observation.units_bytes != 0 ? observation.units_bytes : observation.units;
         switch (observation.resource) {
         case ContextResourceClass::State:
             switch (observation.direction) {

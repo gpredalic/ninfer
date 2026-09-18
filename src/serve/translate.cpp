@@ -86,11 +86,15 @@ ninfer::SamplingOverrides resolve_sampling_overrides(const SamplingParams& reque
     return sampling;
 }
 
-// Post-thinking overrides have no server default: only the request's own fields apply, and
-// omitted fields fall back to the model's post-thinking preset at the Engine boundary.
+// Post-thinking overrides: the --post-thinking-temperature flag (when set) is
+// the server base; the request's own fields win; omitted fields fall back to
+// the model's post-thinking preset at the Engine boundary.
 ninfer::SamplingOverrides resolve_post_thinking_overrides(const SamplingParams& request,
                                                           const ServeOptions& server) {
     ninfer::SamplingOverrides sampling;
+    if (server.post_thinking_temperature) {
+        sampling.temperature = *server.post_thinking_temperature;
+    }
     if (request.temperature) { sampling.temperature = static_cast<float>(*request.temperature); }
     if (request.top_p) { sampling.top_p = static_cast<float>(*request.top_p); }
     if (request.min_p) { sampling.min_p = static_cast<float>(*request.min_p); }

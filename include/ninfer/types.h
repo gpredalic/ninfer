@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -92,6 +93,15 @@ struct ContextCacheOptions {
     // Host StateImages and Host KV bytes are independently configured pinned-memory capacities.
     std::uint32_t host_state_slots     = kDefaultHostStateSlots;
     std::size_t host_kv_capacity_bytes = kDefaultHostKvCapacityBytes;
+    // P2.6: single-knob host cache budget (MiB). When > 0, the total is split ~20%
+    // checkpoint state pool (slots derived from the model's state image size) /
+    // ~80% host KV arena, per component below unless that component was set
+    // explicitly (its explicit bytes/slots are subtracted from the total).
+    std::uint64_t host_cache_mib = 0;
+    // P2.6: set by the CLI when --host-state-slots / --host-kv-mib were given, so the
+    // host_cache_mib split leaves the explicit component untouched.
+    bool host_state_slots_explicit = false;
+    bool host_kv_explicit          = false;
     // Bounded private/shared logical catalogs and per-continuation long-anchor count.
     std::optional<std::uint32_t> max_private_continuations;
     std::optional<std::uint32_t> max_shared_prefixes;
@@ -623,6 +633,26 @@ enum class PrefixReusePath : std::uint8_t {
     SharedStablePrefix,
 };
 
+// Which seed started the pressure search for one materialization plan.
+enum class MaterializationSeedType : std::uint8_t {
+    Identity,      // the candidate fit without pressure
+    GuidedClosure, // the demote-first greedy closure covered the deficit
+    GreedyCover,   // the eviction cover (cheapest victims first) covered the deficit
+};
+
+[[nodiscard]] inline constexpr const char*
+materialization_seed_type_name(MaterializationSeedType seed) noexcept {
+    switch (seed) {
+    case MaterializationSeedType::Identity:
+        return "identity";
+    case MaterializationSeedType::GuidedClosure:
+        return "guided_closure";
+    case MaterializationSeedType::GreedyCover:
+        return "greedy_cover";
+    }
+    return "identity";
+}
+
 // Why pressure planning stopped for the materialization decision committed to one request.
 // "ModelOptimal" is relative to the configured target graph, canonical transaction order, and
 // numerical cost model; it is not a claim about globally optimal observed TTFT.
@@ -673,6 +703,8 @@ struct MaterializationDiagnostics {
     double relative_bound_gap                   = 0.0;
     std::uint32_t selected_degradation_units    = 0;
     bool selected_maximal_fallback              = false;
+    MaterializationSeedType seed_type           = MaterializationSeedType::Identity;
+    std::uint32_t owner_count                    = 0;
 
     [[nodiscard]] friend constexpr bool
     operator==(const MaterializationDiagnostics&,
@@ -742,6 +774,13 @@ struct MemorySummary {
     std::uint32_t host_state_occupied_slots       = 0;
     std::size_t host_kv_capacity_bytes            = 0;
     std::size_t host_kv_occupied_bytes            = 0;
+    // Host-KV arena fragmentation (instantaneous): free space is a set of
+    // non-adjacent extents; the ratio is largest extent / total free
+    // (1.0 = one contiguous extent, lower = more shredded).
+    std::size_t host_kv_free_bytes                  = 0;
+    std::size_t host_kv_largest_free_extent_bytes   = 0;
+    std::size_t host_kv_free_extent_count           = 0;
+    double host_kv_fragmentation_ratio              = 0.0;
 };
 
 // Worker-owned monotonic nanosecond counters. Top-level Host phases are mutually exclusive;
@@ -772,9 +811,53 @@ struct RuntimeHostWorkStats {
     std::uint64_t stats_publication_invocations = 0;
 };
 
+// P2.5 Increment 3 (O0 census): the host safety net's composition per eviction
+// tier. The tiers mirror select_eviction_victim's ordering (dead-largest,
+// unprotected-live-smallest, idle-catalogued-smallest, active-smallest):
+//   dead   — never matched, or unmatched past the dead TTL (re-prefill free)
+//   live   — live, no session key (unprotected)
+//   idle   — live, session Catalogued (retained for reuse — an "old copy")
+//   active — live, session Active (currently being served)
+// Bytes are each unit's retained cost (KV page bytes + state image bytes).
+struct NetTierCensus {
+    std::uint32_t dead_entries   = 0;
+    std::uint64_t dead_bytes     = 0;
+    std::uint32_t live_entries   = 0;
+    std::uint64_t live_bytes     = 0;
+    std::uint32_t idle_entries   = 0;
+    std::uint64_t idle_bytes     = 0;
+    std::uint32_t active_entries = 0;
+    std::uint64_t active_bytes   = 0;
+};
+
+// P2.5 Increment 3 (O0+): one retained net unit's identity — the per-entry
+// view behind the tier census. Bounded (top-N by bytes) so /stats stays
+// small. `session` is the session key as a printable string (empty when the
+// entry has none); `tier` is the eviction tier (dead/live/idle/active).
+struct NetUnitInfo {
+    std::uint32_t frontier = 0;   // execution_frontier (tokens)
+    std::uint64_t bytes    = 0;   // retained cost (KV page bytes + state bytes)
+    std::string   tier;          // dead / live / idle / active
+    bool          ever_matched = false;
+    bool          pinned       = false;
+    bool          active_session = false;  // session_key matches an Active continuation
+    std::string   session;      // session key (empty if none)
+};
+
 // Monotonic execution counters, boundary-consistent current gauges, and explicitly named last
 // decision observations. Consumers derive interval counters by subtracting two snapshots.
 struct RuntimeStats {
+    // P1.5(d): one waiting request's visible queue state. `position` is the
+    // 1-based FIFO order in the pending queue; `wait_seconds` is time since
+    // submission. Bounded to the first kQueueReportCap entries (the count is
+    // the number valid); a fixed aggregate so the snapshot stays heap-free.
+    struct QueueWaitEntry {
+        std::uint64_t request_id = 0;
+        std::uint32_t position   = 0;
+        double wait_seconds      = 0.0;
+    };
+    static constexpr std::size_t kQueueReportCap = 16;
+
     RuntimeHostWorkStats host_work;
     // Actual prompt tokens evaluated by prefill; reused checkpoint-prefix tokens are excluded.
     std::uint64_t computed_prefill_tokens = 0;
@@ -790,6 +873,10 @@ struct RuntimeStats {
     std::uint32_t materializing_requests    = 0;
     std::uint32_t capture_pending_requests  = 0;
     std::uint32_t terminal_pending_requests = 0;
+    // P1.5(d): visible queue — the first kQueueReportCap waiting requests, in
+    // FIFO order. `queue_report_count` is the number of valid entries.
+    std::array<QueueWaitEntry, kQueueReportCap> queue_report{};
+    std::uint32_t queue_report_count = 0;
     std::uint64_t active_captures_completed = 0;
     std::uint64_t active_captures_aborted   = 0;
 
@@ -853,6 +940,83 @@ struct RuntimeStats {
     // and restores served from the host-KV safety net.
     std::uint64_t admission_catalog_hits        = 0;
     std::uint64_t admission_safety_net_restores = 0;
+    // Host-KV arena cumulative counters (monotonic): single-extent allocation
+    // failures despite sufficient total free (the fragmentation signature),
+    // arena compactions that repaired it, and whole units evicted from the
+    // safety net to make room.
+    std::uint64_t host_kv_single_alloc_failures = 0;
+    std::uint64_t host_kv_compactions           = 0;
+    std::uint64_t host_kv_evictions             = 0;
+    // P2.4 Inc 3: fit-gate/queued KV relief ([relief-kv]) — releases of idle
+    // continuations / shared prefixes and the device pages actually freed.
+    // `relief_kv_not_retained` counts releases where the whole-unit spill was
+    // refused (state pool full / budget): the unit was lost, not preserved.
+    std::uint64_t relief_kv_releases     = 0;
+    std::uint64_t relief_kv_not_retained = 0;
+    std::uint64_t relief_kv_pages_freed  = 0;
+    // P2.4 follow-ups: units destroyed (not retained in the net) at a
+    // continuation-slot release, and the spill path's state-image D2H
+    // transfers (the state half of a unit's move — the planner-driven
+    // state-transfer counters do not see the spill path).
+    std::uint64_t slot_release_destroys = 0;
+    std::uint64_t spill_state_d2h_count = 0;
+    std::uint64_t spill_state_d2h_bytes = 0;
+    // Materialization allocation failures by resource (monotonic): the plan
+    // projected feasibility, but the physical reservation ran out. State-slot
+    // exhaustion (device state pool full) is the 2026-09 parallel-large-session
+    // bad_alloc signature; KV-page and host-arena failures rule the others in
+    // or out.
+    std::uint64_t materialize_state_slot_alloc_failures = 0;
+    std::uint64_t materialize_dual_device_replica_drops = 0;
+    std::uint64_t materialize_kv_page_alloc_failures    = 0;
+    // Per-pool KV reservation failures: the summed counter cannot say which
+    // pool (main attention vs MTP/DFlash backend) is binding.
+    std::uint64_t materialize_kv_page_alloc_failures_main    = 0;
+    std::uint64_t materialize_kv_page_alloc_failures_backend = 0;
+    // Materializations whose device-KV reservation demand did not fit the current pool
+    // occupancy and were deferred to a later engine tick instead of throwing bad_alloc
+    // into the worker OOM handler (monotonic).
+    std::uint64_t materialize_kv_defers = 0;
+    // P2.4 Increment 1: materializations whose plan was re-baselined to the
+    // materialized unit after relief left a plan-optional state image
+    // unrealized (monotonic).
+    std::uint64_t materialize_state_replans = 0;
+    // Checkpoint residency (gauge): live checkpoint state images and the
+    // device slots they pin.
+    std::uint32_t checkpoint_device_count       = 0;
+    std::uint32_t checkpoint_host_only_count    = 0;
+    std::uint32_t checkpoint_device_state_slots = 0;
+    // State-slot residency census (gauge): the host-pool occupancy classes that
+    // checkpoint residency cannot see. dual_resident = objects holding both a
+    // device and a host replica (invisible inside checkpoint_device_count);
+    // active_with_host = thawed ActiveMutables holding a host replica (no code
+    // path drops those); pending_host_slots = in-flight D2H transfers.
+    std::uint32_t state_dual_resident_count    = 0;
+    std::uint32_t state_active_with_host_count = 0;
+    std::uint32_t state_pending_host_slots     = 0;
+    // Host-KV safety-net gauges: entry count and retained state-image bytes
+    // (the net's heap state images, distinct from the host state pool slots).
+    std::uint32_t host_kv_net_entries     = 0;
+    std::uint64_t host_kv_net_state_bytes = 0;
+    // P2.5 Increment 3 (O0 census): per-eviction-tier composition of the net
+    // (dead / live / idle-catalogued / active), so /stats shows which tier
+    // holds the retained units and their bytes.
+    NetTierCensus host_kv_tier_census = {};
+    // P2.5 Increment 3 (O0+): the net's largest retained units (top-N by
+    // bytes) — the per-entry view behind the tier census, so /stats shows
+    // WHICH units hold the budget (live frontiers vs. finished sub-agents).
+    std::vector<NetUnitInfo> host_kv_top_units;
+    // P2.2 (#7 Slice 1): the shared meter over host unit occupancy — the sum of
+    // each retained unit's cost (KV page bytes + state image bytes) across the
+    // safety net, plus the host state pool's demoted-checkpoint bytes. One
+    // number across the two pools that were accounted separately.
+    std::uint64_t host_unit_occupied_bytes = 0;
+    std::uint32_t host_unit_count          = 0;
+    // Cumulative entries dropped by supersede-on-add (monotonic).
+    std::uint64_t host_kv_superseded = 0;
+    // release() refusals in noexcept teardown paths (monotonic): each one
+    // orphans the state object and its slots.
+    std::uint64_t host_slot_release_failures = 0;
     std::uint32_t shared_active_references             = 0;
     std::uint64_t historical_fork_hits                 = 0;
     double actual_context_transfer_seconds             = 0.0;

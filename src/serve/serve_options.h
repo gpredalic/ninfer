@@ -23,6 +23,10 @@ struct ServeOptions {
     std::string artifact_path;
     std::string host = "127.0.0.1";
     int port         = 8080;
+    // Optional second port for a dedicated single-thread /stats + /health
+    // server. 0 (default) disables it; the main server keeps serving both
+    // routes on `port` either way.
+    int stats_port   = 0;
     std::string api_key;                          // empty => no auth
     std::optional<std::string> model_id_override; // unset => artifact identity.model_id
     std::string request_log_jsonl;                // empty => structured request logging disabled
@@ -66,6 +70,11 @@ struct ServeOptions {
     // fields. An omitted seed is replaced per request with a fresh random seed.
     SamplingOverrides sampling_overrides;
     bool greedy = false; // --greedy: force temperature 0 (exact argmax)
+    // --post-thinking-temperature F: server-level post-thinking temperature. Unset
+    // (the default) imposes no server default — the model's registered post-thinking
+    // preset applies and request post_thinking fields win. When set, it is the base
+    // for the post-thinking phase (request post_thinking fields still win).
+    std::optional<float> post_thinking_temperature;
     std::filesystem::path chat_template_path;      // --chat-template PATH
     std::string chat_template_semantics;            // --chat-template-semantics MODE
     std::string weights_profile_override;           // --weights-profile PROFILE

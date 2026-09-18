@@ -43,9 +43,10 @@ void prepare_sse_response(httplib::Response& response) {
 }
 
 SseTransport::SseTransport(httplib::DataSink& sink, std::atomic<bool>& cancelled,
-                           Clock::duration heartbeat_interval, Clock::time_point now)
+                           Clock::duration heartbeat_interval, Clock::time_point now,
+                           std::string_view heartbeat_payload)
     : sink_(sink), cancelled_(cancelled), heartbeat_interval_(heartbeat_interval),
-      last_write_(now) {
+      heartbeat_payload_(heartbeat_payload), last_write_(now) {
     if (heartbeat_interval_ <= Clock::duration::zero()) {
         throw std::invalid_argument("SSE heartbeat interval must be positive");
     }
@@ -72,7 +73,7 @@ bool SseTransport::poll(Clock::time_point now) {
     if (cancelled_.load(std::memory_order_acquire)) { return true; }
     if (sink_.is_writable && !sink_.is_writable()) { return mark_cancelled(); }
     if (now - last_write_ < heartbeat_interval_) { return false; }
-    if (!sink_.write(kHeartbeatComment.data(), kHeartbeatComment.size())) {
+    if (!sink_.write(heartbeat_payload_.data(), heartbeat_payload_.size())) {
         return mark_cancelled();
     }
     last_write_ = now;

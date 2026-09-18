@@ -6,6 +6,7 @@
 
 #include <cuda_runtime_api.h>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -199,6 +200,9 @@ public:
     [[nodiscard]] std::uint32_t allocated_pages() const noexcept;
     [[nodiscard]] std::uint32_t reserved_pages() const noexcept;
     [[nodiscard]] std::uint32_t available_pages() const noexcept;
+    // Reservation attempts that failed for lack of capacity (for /stats).
+    [[nodiscard]] std::uint64_t reservation_failures() const noexcept;
+    void count_reservation_failure() noexcept;
     [[nodiscard]] std::size_t plane_count() const noexcept;
     [[nodiscard]] const Tensor& plane(std::size_t index) const;
     [[nodiscard]] std::uint32_t
@@ -268,6 +272,7 @@ private:
     mutable std::uint32_t validation_stamp_ = 0;
     std::uint32_t allocated_pages_          = 0;
     std::uint32_t reserved_pages_           = 0;
+    std::atomic<std::uint64_t> reservation_failures_{0};
 };
 
 struct DeviceKVPageReservationRequest {

@@ -269,6 +269,10 @@ struct ContextTransferObservation {
     ContextResourceClass resource      = ContextResourceClass::State;
     ContextTransferDirection direction = ContextTransferDirection::DeviceToHost;
     std::uint64_t units                = 0; // State images for State; bytes for typed KV.
+    // True transferred bytes for byte accounting. 0 keeps the legacy behavior
+    // (bytes := units, which is already bytes for typed-KV resources); State
+    // transfers set it to the state-image size because units there is a count.
+    std::uint64_t units_bytes          = 0;
     std::uint32_t page_count           = 0;
     TransferWork work;
     std::uint64_t elapsed_ns = 0;

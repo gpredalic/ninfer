@@ -1,0 +1,143 @@
+schema_version: 1
+
+# BFCL v4 A/B for the post-thinking sampler, on the production artifact at the validated
+# reference sampling.
+#
+# Artifact: qwen3_8_27b_QUASAR_nvfp4.ninfer (the shipped model), server defaults
+# temperature 1.0 / top_p 0.95 / top_k 20, froggeric template, --weights-profile
+# qwen36-nvfp4.
+#
+# The sampler is a pure positional hash of (seed, position, params), so with the same seed
+# and identical thinking parameters the thinking block is bit-identical between the arms.
+# They diverge only at the reasoning close, where the tool call is emitted - which is
+# exactly what BFCL scores. Any delta is therefore attributable to the post-thinking phase,
+# not to reasoning noise.
+#
+#   bfcl_uniform - post_thinking mirrors the thinking sampler (1.0/0.95/20), so one preset
+#                  governs the whole generation: the pre-feature behaviour.
+#   bfcl_post    - no post_thinking override, so the registered preset (temperature 0.2,
+#                  top_p 0.95, top_k 20) governs the emission phase.
+#
+# All five subsets run at full population. The probe at temp 1.0 showed headroom where a
+# colder emission should help - multiple 0.75, multi_turn_base 0.625, parallel 0.875 -
+# while simple_python and irrelevance were already 1.00.
+
+targets:
+  qwen38_api:
+    protocol: openai_chat
+    base_url: http://127.0.0.1:18080/v1
+    model: qwen3.8-27b
+    max_concurrency: 2
+    request:
+      timeout_seconds: 86400
+      retries: 2
+      retry_interval_seconds: 10
+
+suites:
+  bfcl_uniform:
+    jobs:
+      - id: simple_python
+        backend: evalscope
+        dataset: bfcl_v4
+        target: qwen38_api
+        max_concurrency: 2
+        generation: &uniform_generation
+          temperature: 1.0
+          top_p: 0.95
+          top_k: 20
+          presence_penalty: 0.0
+          frequency_penalty: 0.0
+          max_tokens: 16384
+          seed: 42
+          extra_body:
+            enable_thinking: true
+            min_p: 0.0
+            post_thinking:
+              temperature: 1.0
+              top_p: 0.95
+              top_k: 20
+              presence_penalty: 0.0
+              frequency_penalty: 0.0
+        backend_args: {is_fc_model: true, underscore_to_dot: true, subset_list: [simple_python]}
+      - id: multiple
+        backend: evalscope
+        dataset: bfcl_v4
+        target: qwen38_api
+        max_concurrency: 2
+        generation: *uniform_generation
+        backend_args: {is_fc_model: true, underscore_to_dot: true, subset_list: [multiple]}
+      - id: parallel
+        backend: evalscope
+        dataset: bfcl_v4
+        target: qwen38_api
+        max_concurrency: 2
+        generation: *uniform_generation
+        backend_args: {is_fc_model: true, underscore_to_dot: true, subset_list: [parallel]}
+      - id: irrelevance
+        backend: evalscope
+        dataset: bfcl_v4
+        target: qwen38_api
+        max_concurrency: 2
+        generation: *uniform_generation
+        backend_args: {is_fc_model: true, underscore_to_dot: true, subset_list: [irrelevance]}
+      - id: multi_turn_base
+        backend: evalscope
+        dataset: bfcl_v4
+        target: qwen38_api
+        max_concurrency: 2
+        generation: *uniform_generation
+        backend_args: {is_fc_model: true, underscore_to_dot: true, subset_list: [multi_turn_base]}
+
+  bfcl_post:
+    jobs:
+      - id: simple_python
+        backend: evalscope
+        dataset: bfcl_v4
+        target: qwen38_api
+        max_concurrency: 2
+        generation: &post_generation
+          temperature: 1.0
+          top_p: 0.95
+          top_k: 20
+          presence_penalty: 0.0
+          frequency_penalty: 0.0
+          max_tokens: 16384
+          seed: 42
+          extra_body:
+            enable_thinking: true
+            min_p: 0.0
+        backend_args: {is_fc_model: true, underscore_to_dot: true, subset_list: [simple_python]}
+      - id: multiple
+        backend: evalscope
+        dataset: bfcl_v4
+        target: qwen38_api
+        max_concurrency: 2
+        generation: *post_generation
+        backend_args: {is_fc_model: true, underscore_to_dot: true, subset_list: [multiple]}
+      - id: parallel
+        backend: evalscope
+        dataset: bfcl_v4
+        target: qwen38_api
+        max_concurrency: 2
+        generation: *post_generation
+        backend_args: {is_fc_model: true, underscore_to_dot: true, subset_list: [parallel]}
+      - id: irrelevance
+        backend: evalscope
+        dataset: bfcl_v4
+        target: qwen38_api
+        max_concurrency: 2
+        generation: *post_generation
+        backend_args: {is_fc_model: true, underscore_to_dot: true, subset_list: [irrelevance]}
+      - id: multi_turn_base
+        backend: evalscope
+        dataset: bfcl_v4
+        target: qwen38_api
+        max_concurrency: 2
+        generation: *post_generation
+        backend_args: {is_fc_model: true, underscore_to_dot: true, subset_list: [multi_turn_base]}
+
+runtime:
+  max_parallel_jobs: 1
+  runs_dir: eval/runs
+  progress: {enabled: true, refresh_seconds: 1, heartbeat_seconds: 900}
+  samples: {retention: all}

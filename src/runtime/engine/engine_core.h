@@ -42,6 +42,8 @@ class EngineCore {
 public:
     using Package            = typename Instance::Package;
     using Program            = typename Package::Program;
+    using KvAdmissionFit     = typename Package::KvAdmissionFit;
+    using QueuedKvBlockProgress = typename Package::QueuedKvBlockProgress;
     using BasePlan           = typename Package::RequestBasePlan;
     using Plan               = typename Package::AdmissionCandidate;
     using SequenceHandle     = typename Package::SequenceHandle;
@@ -522,6 +524,20 @@ private:
         {
             std::lock_guard lock(queue_mutex_);
             snapshot.waiting_requests = static_cast<std::uint32_t>(pending_.size());
+            // P1.5(d): visible queue — record the first kQueueReportCap waiting
+            // requests in FIFO order with their wait so far. `id`/`submitted`
+            // are immutable after construction, so reading them here is safe.
+            const Clock::time_point now = Clock::now();
+            std::uint32_t position = 0;
+            for (const auto& request : pending_) {
+                if (snapshot.queue_report_count >= RuntimeStats::kQueueReportCap) { break; }
+                ++position;
+                auto& entry = snapshot.queue_report[snapshot.queue_report_count++];
+                entry.request_id   = request->id;
+                entry.position     = position;
+                entry.wait_seconds =
+                    std::chrono::duration<double>(now - request->submitted).count();
+            }
         }
         snapshot.prefilling_requests = 0;
         if (const auto lane = scheduler_.prefill_lane();
@@ -940,6 +956,41 @@ private:
         if (changed) { publish_runtime_stats(); }
     }
 
+    // P1.5(d) Increment 2: abort a queued request whose KV block hit the
+    // 120s deadline (the same bound as the prepare-time fit-gate defer).
+    // Mirrors expire_pending_requests' removal mechanics; returns false if
+    // the request is no longer queued (it completed or was cancelled first —
+    // the block is already cleared by the caller).
+    [[nodiscard]] bool abort_queued_kv_request(std::uint64_t request_id) {
+        std::shared_ptr<Request> request;
+        {
+            std::lock_guard lock(queue_mutex_);
+            for (auto it = pending_.begin(); it != pending_.end(); ++it) {
+                if ((*it)->id == request_id) {
+                    request = *it;
+                    pending_.erase(it);
+                    break;
+                }
+            }
+        }
+        if (!request) { return false; }
+        scheduler_.on_waiting_removed(request->id);
+        try {
+            complete_error(request,
+                           std::make_exception_ptr(RequestError(
+                               RequestErrorKind::QueueTimeout,
+                               "inference request expired waiting for device-KV capacity "
+                               "(120s queued; relief could not free enough pages)")));
+        } catch (...) {
+            const std::exception_ptr error = std::current_exception();
+            complete_error(request, error);
+            throw;
+        }
+        request_admission_check();
+        publish_runtime_stats();
+        return true;
+    }
+
     [[nodiscard]] bool expire_pending_requests() {
         std::vector<std::shared_ptr<Request>> cancelled;
         std::vector<std::shared_ptr<Request>> expired;
@@ -1294,16 +1345,55 @@ private:
         if (!request->lane || !progress.pending) {
             throw std::logic_error("completed prefill has no lane or pending token");
         }
-        // The prompt and reuse path must match the committed admission exactly.
-        // reused_prompt_tokens may only grow: the transparent host-KV safety-net
-        // restore (a Root admission whose prefix is restored from host RAM)
-        // advances the staged prefill base after the admission was sealed, so
-        // the runtime legitimately reports more reuse than the plan committed.
+        // The prompt must match the committed admission exactly. Reuse may
+        // only grow: the transparent host-KV safety-net restore (a Root
+        // admission whose prefix is restored from host RAM) advances the
+        // staged prefill base after the admission was sealed, so the runtime
+        // legitimately reports more reuse than the plan committed.
+        //
+        // One documented downgrade is legal: a source-based admission whose
+        // source's state image is no longer resident degrades to a Root
+        // admission at materialization ("materialization source has no
+        // resident state — falling back to root prefill"), optionally fronted
+        // by a safety-net restore. The runtime Begin is still content-verified
+        // (prompt_tokens equal; the reported reuse is a prefix boundary the
+        // runtime matched), so accept it — the only loss is the smaller reuse
+        // (a few hundred extra prefill tokens). Any other path/reuse change
+        // remains fatal.
         if (!request->admitted_begin ||
-            progress.summary.prompt_tokens != request->admitted_begin->prompt_tokens ||
-            progress.summary.prefix_reuse_path != request->admitted_begin->prefix_reuse_path ||
-            progress.summary.reused_prompt_tokens < request->admitted_begin->reused_prompt_tokens) {
+            progress.summary.prompt_tokens != request->admitted_begin->prompt_tokens) {
             throw std::logic_error("runtime Begin summary differs from committed admission");
+        }
+        if (progress.summary.prefix_reuse_path != request->admitted_begin->prefix_reuse_path ||
+            progress.summary.reused_prompt_tokens < request->admitted_begin->reused_prompt_tokens) {
+            const bool documented_fallback =
+                request->admitted_begin->prefix_reuse_path != PrefixReusePath::Root &&
+                progress.summary.prefix_reuse_path == PrefixReusePath::Root;
+            // The safety-net restore is discovered at materialization, AFTER
+            // admission committed a Root begin: the runtime begin UPGRADES the
+            // admitted root to the restored path (the reuse frontier moves up,
+            // not down — the reused_prompt_tokens clause above stays false).
+            const bool documented_upgrade =
+                request->admitted_begin->prefix_reuse_path == PrefixReusePath::Root &&
+                progress.summary.prefix_reuse_path != PrefixReusePath::Root;
+            if (!documented_fallback && !documented_upgrade) {
+                throw std::logic_error("runtime Begin summary differs from committed admission");
+            }
+            if (documented_upgrade) {
+                std::fprintf(stderr,
+                             "[admission] Begin upgraded from committed root to path=%d (reuse %u) "
+                             "— safety-net restore at materialization\n",
+                             static_cast<int>(progress.summary.prefix_reuse_path),
+                             progress.summary.reused_prompt_tokens);
+            } else {
+                std::fprintf(stderr,
+                             "[admission] Begin degraded from committed path=%d (reuse %u) to root "
+                             "(reuse %u) — source state not resident at materialization; "
+                             "safety-net/root fallback\n",
+                             static_cast<int>(request->admitted_begin->prefix_reuse_path),
+                             request->admitted_begin->reused_prompt_tokens,
+                             progress.summary.reused_prompt_tokens);
+            }
         }
         const std::uint32_t lane = request->lane->value;
         if (scheduler_.prefill_lane() == lane) {
@@ -1657,6 +1747,28 @@ private:
                 if (!head_inspection.choice) {
                     throw std::logic_error("ready resource inspection has no admission choice");
                 }
+                // P1.5(d) Increment 2: occupancy-aware admission. The
+                // prepare-time fit gate would defer this request for up to
+                // 120s; probe the pool instead and keep an unfitted request
+                // in the visible queue (position/wait in /stats) while
+                // relief-while-queued works toward its demand.
+                const KvAdmissionFit kv_fit =
+                    resources_.probe_kv_fit(*instance_.program, *head_inspection.choice);
+                if (!kv_fit.fits) {
+                    instance_.program->queue_kv_block(kv_fit, head->id);
+                    // P1.6: the request stays in pending_. Do NOT re-arm
+                    // admission here — the worker ticks at ~1ms and an
+                    // immediate re-arm would re-run the full admission
+                    // planner (up to 30ms under pressure) every tick for a
+                    // head that still cannot fit. Re-arms come from:
+                    // relief-while-queued (pages freed), natural state
+                    // changes (completions/expirations), and the 5s
+                    // heartbeat in the worker loop.
+                    queued_kv_block_rearm_due_ = Clock::now() + std::chrono::seconds(5);
+                    return AdmissionProgress::ControlProgress;
+                }
+                queued_kv_block_rearm_due_.reset();
+                instance_.program->clear_queued_kv_block();
                 AdmissionGrant grant = scheduler_.grant_head(
                     head->id, head_inspection.choice->summary().service_work_quanta);
                 return admit_planned_request(head, std::move(*head_inspection.choice),
@@ -1931,6 +2043,33 @@ private:
                 HostPhaseMeasurement boundary = begin_host_phase();
                 const bool have_pending       = expire_pending_requests();
                 (void)progress_context_transaction(have_pending);
+                // P1.5(d) Increment 2: relief-while-queued — progress the
+                // blocked queued-KV block (15s stall relief toward the
+                // blocked demand + 120s deadline). Relief is suppressed while
+                // a context transaction is in flight (its own fit-gate
+                // relief clock owns demotions then); the deadline still runs.
+                if (instance_.program->has_queued_kv_block()) {
+                    const QueuedKvBlockProgress queued_progress =
+                        instance_.program->progress_queued_kv_block(
+                            instance_.program->has_context_transaction());
+                    if (queued_progress == QueuedKvBlockProgress::ReliefFired) {
+                        request_admission_check();  // pages freed — re-check the head
+                        queued_kv_block_rearm_due_ = Clock::now() + std::chrono::seconds(5);
+                    } else if (queued_progress == QueuedKvBlockProgress::Expired) {
+                        const std::uint64_t expired_id =
+                            instance_.program->queued_kv_block_request_id();
+                        instance_.program->clear_queued_kv_block();
+                        queued_kv_block_rearm_due_.reset();
+                        (void)abort_queued_kv_request(expired_id);
+                    } else if (queued_kv_block_rearm_due_ &&
+                               Clock::now() >= *queued_kv_block_rearm_due_) {
+                        // 5s heartbeat: a page-freeing event that did not
+                        // re-arm admission (or a relief that freed nothing)
+                        // must not wedge the queue — the P1.6 class.
+                        request_admission_check();
+                        queued_kv_block_rearm_due_ = Clock::now() + std::chrono::seconds(5);
+                    }
+                }
                 (void)settle_terminal_requests(boundary);
                 const auto cancelled_at_boundary = snapshot_cancellations();
                 cancel_active_requests(cancelled_at_boundary, boundary);
@@ -1947,6 +2086,20 @@ private:
                     consume_admission_check()) {
                     (void)try_admit_one();
                     membership = scheduler_.build_round_membership(slots_, max_concurrency_);
+                }
+
+                // P1.5(d): keep the visible queue fresh — re-publish stats at
+                // most once per second while requests wait, so /stats reports
+                // an accurate wait_seconds even when nothing else is changing
+                // state (a pure queue wait has no state change to trigger a
+                // publish otherwise).
+                if (have_pending &&
+                    (last_queue_stats_publish_ == Clock::time_point{} ||
+                     Clock::now() - last_queue_stats_publish_ >= std::chrono::seconds(1))) {
+                    last_queue_stats_publish_ = Clock::now();
+                    try {
+                        publish_runtime_stats();
+                    } catch (...) {}
                 }
 
                 // Cancellation is sampled once for the execution unit. A request arriving while
@@ -2027,6 +2180,12 @@ private:
                 recover_from_oom_locked(oom_error);
                 finish_engine_phase(cleanup, EngineHostPhase::Maintenance);
                 oom_backoff_ = kOomBackoffIterations;
+                // Recovery changed admission-visible program/resource state
+                // (fail_all_cleanup + catalog clear) and the admission check
+                // signal was already consumed by the failing attempt — re-arm
+                // it, or a still-pending request would never be re-admitted
+                // (the 23:10:21 wedge: waiting=1, GPU 0%, until restart).
+                request_admission_check();
                 // Scheduler state was cleared by recover_from_oom_locked; treat the next
                 // iteration as a fresh scheduling boundary (no decode continuity).
                 previous_unit_was_decode = false;
@@ -2045,6 +2204,13 @@ private:
                 recover_from_oom_locked(std::current_exception());
                 finish_engine_phase(cleanup, EngineHostPhase::Maintenance);
                 oom_backoff_ = kOomBackoffIterations;
+                // Same re-arm as the OOM path: the failing admission attempt
+                // consumed the one-shot admission check, and recovery left
+                // pending requests behind. Without this, a logic_error during
+                // admission wedges the worker at waiting>=1 / GPU 0% forever
+                // (bounded only by the sentinel); with it, the request is
+                // re-admitted or fails via the kOomMaxRecoveries fail-all.
+                request_admission_check();
                 previous_unit_was_decode = false;
                 continue;
             } catch (...) {
@@ -2095,6 +2261,16 @@ private:
     std::size_t current_decode_lane_count_ = 0;
     RuntimeStats cumulative_stats_;
     RuntimeStats published_stats_;
+    // P1.5(d): last time the queue was published to /stats. The worker loop
+    // re-publishes at most once per second while the queue is non-empty so the
+    // visible wait_seconds stays fresh during a pure queue wait (no state
+    // change to otherwise trigger a publish). Worker-thread-only.
+    Clock::time_point last_queue_stats_publish_{};
+    // P1.5(d) Increment 2: next admission re-arm for the blocked queued-KV
+    // head. Set on a KV occupancy block (5s out) and after each relief-fire
+    // or heartbeat; the worker loop re-arms when it is due. Empty = no
+    // blocked head. Worker-thread-only.
+    std::optional<Clock::time_point> queued_kv_block_rearm_due_;
     bool stopping_ = false;
     bool failed_   = false;
     static constexpr std::uint32_t kOomBackoffIterations = 4;
