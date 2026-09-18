@@ -104,6 +104,9 @@ bool report_has_activity(const ThroughputReport& report) {
                report.previous.pressure_search_budget_exhaustions ||
            report.current.pressure_maximal_fallback_selections !=
                report.previous.pressure_maximal_fallback_selections ||
+           report.current.relief_kv_releases != report.previous.relief_kv_releases ||
+           report.current.relief_kv_not_retained != report.previous.relief_kv_not_retained ||
+           report.current.relief_kv_pages_freed != report.previous.relief_kv_pages_freed ||
            report.current.historical_fork_hits != report.previous.historical_fork_hits ||
            report.current.device_state_occupied_slots !=
                report.previous.device_state_occupied_slots ||

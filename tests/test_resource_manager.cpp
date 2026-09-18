@@ -576,6 +576,9 @@ public:
     [[nodiscard]] std::uint64_t host_kv_single_alloc_failures() const noexcept { return 0; }
     [[nodiscard]] std::uint64_t host_kv_compaction_count() const noexcept { return 0; }
     [[nodiscard]] std::uint64_t host_kv_eviction_count() const noexcept { return 0; }
+    [[nodiscard]] std::uint64_t relief_kv_releases() const noexcept { return 0; }
+    [[nodiscard]] std::uint64_t relief_kv_not_retained() const noexcept { return 0; }
+    [[nodiscard]] std::uint64_t relief_kv_pages_freed() const noexcept { return 0; }
     [[nodiscard]] std::uint64_t materialize_state_slot_alloc_failures() const noexcept {
         return 0;
     }

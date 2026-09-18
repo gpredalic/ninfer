@@ -576,8 +576,11 @@ public:
         const ContinuationHandle* source, const SharedPrefixHandle* shared_source,
         std::optional<runtime::CheckpointRef> checkpoint, bool must_retain_private_source,
         const runtime::ContextMachineCostModel& machine_cost);
-    // Copy a victim continuation's device KV to host RAM before eviction.
-    void spill_victim_to_host_kv_safety_net(std::uint32_t index,
+    // Spill a victim continuation's complete {KV + state} unit to the host
+    // safety net before eviction. Returns whether the net retained the unit
+    // (false: skipped/aborted — a subsequent slot release destroys the unit,
+    // so the caller must account for the loss).
+    bool spill_victim_to_host_kv_safety_net(std::uint32_t index,
                                             bool relinquish_store_state = true) noexcept;
     // P2.4 Increment 1 (spill-before-loss): before a continuation slot is
     // released, ensure the unit's complete {KV + state} is retained in the
@@ -589,6 +592,12 @@ public:
     [[nodiscard]] std::uint64_t host_kv_single_alloc_failures() const noexcept;
     [[nodiscard]] std::uint64_t host_kv_compaction_count() const noexcept;
     [[nodiscard]] std::uint64_t host_kv_eviction_count() const noexcept;
+    // P2.4 Inc 3: fit-gate/queued KV relief ([relief-kv]) — releases of idle
+    // continuations / shared prefixes, the not-retained (unit lost) subset,
+    // and the device pages actually freed (for /stats).
+    [[nodiscard]] std::uint64_t relief_kv_releases() const noexcept;
+    [[nodiscard]] std::uint64_t relief_kv_not_retained() const noexcept;
+    [[nodiscard]] std::uint64_t relief_kv_pages_freed() const noexcept;
     // Materialization allocation failures by resource (for /stats).
     [[nodiscard]] std::uint64_t materialize_state_slot_alloc_failures() const noexcept;
     [[nodiscard]] std::uint64_t materialize_dual_device_replica_drops() const noexcept;
@@ -789,6 +798,12 @@ public:
     // materialized unit after relief left a plan-optional state image
     // unrealized; read by /stats from the serve thread).
     std::atomic<std::uint64_t> materialize_state_replans_{0};
+    // P2.4 Inc 3: fit-gate/queued KV relief ([relief-kv]) — releases of idle
+    // continuations / shared prefixes, the not-retained (unit lost) subset,
+    // and the device pages actually freed (monotonic; read by /stats).
+    std::atomic<std::uint64_t> relief_kv_releases_{0};
+    std::atomic<std::uint64_t> relief_kv_not_retained_{0};
+    std::atomic<std::uint64_t> relief_kv_pages_freed_{0};
 
     // Checkpoint state is retained only inside a complete {attention KV + GDN state}
     // unit held by the safety net; there is no state-only capture. The old

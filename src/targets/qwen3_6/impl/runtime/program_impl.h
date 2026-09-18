@@ -5031,23 +5031,32 @@ std::uint32_t ProgramImplCore::relieve_kv_fit(const KvReliefSkip& skip) noexcept
                      "(scored %u unique, freed %u pages); content preserved in "
                      "safety-net turn entries\n",
                      shared_victim, shared_pages, freed);
+        ++relief_kv_releases_;
+        relief_kv_pages_freed_ += freed;
         return freed;
     }
     // Same unit operation as the catalog-rotation and pressure-victim paths:
     // park the {KV + state} unit in the host safety net, then release the
     // device-side continuation (frees the device KV pages the gate is waiting
     // on). A refused state release (shared-prefix retention) still leaves the
-    // KV freed — the state slot is a separate pool, not gated here.
-    spill_victim_to_host_kv_safety_net(cont_victim);
+    // KV freed — the state slot is a separate pool, not gated here. When the
+    // spill is NOT retained (state pool full / budget), the release is an
+    // eviction: the unit is lost, and the log/counters say so.
+    const bool retained = spill_victim_to_host_kv_safety_net(cont_victim);
     release_continuation_slot(cont_victim);
     const std::uint32_t freed =
         (text_kv_pages->physical_pool().available_pages() - free_text_before) +
         (backend_kv_pages ? backend_kv_pages->physical_pool().available_pages() - free_backend_before
                           : 0);
-    std::fprintf(stderr,
-                 "[relief-kv] fit gate stalled — demoted idle continuation %u "
-                 "(scored %u unique, freed %u pages) to the host safety net\n",
+    std::fprintf(stderr, retained
+                     ? "[relief-kv] fit gate stalled — demoted idle continuation %u "
+                       "(scored %u unique, freed %u pages) to the host safety net\n"
+                     : "[relief-kv] fit gate stalled — EVICTED idle continuation %u "
+                       "(scored %u unique, freed %u pages) — spill not retained; unit lost\n",
                  cont_victim, cont_pages, freed);
+    ++relief_kv_releases_;
+    if (!retained) { ++relief_kv_not_retained_; }
+    relief_kv_pages_freed_ += freed;
     return freed;
 }
 
@@ -6530,8 +6539,12 @@ void ProgramImplCore::abort_pressure_work(MaterializationTransaction::PressureWo
     } catch (...) { std::terminate(); }
 }
 
-void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index,
+bool ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index,
                                                          bool relinquish_store_state) noexcept {
+    // Returns whether the net retained the complete {KV + state} unit. Every
+    // skip/abort path returns false — the KV copy may have landed in the
+    // arena, but without a state image the unit is not restorable and the
+    // caller's slot release destroys it (an eviction, not a demotion).
     // P2.4 Increment 2: captured state-image pool slots, hoisted above the try
     // so the catch handlers can return them to the pool (a slot is a plain
     // handle — dropping it without release() leaks the pool slot).
@@ -6548,7 +6561,7 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index,
                          sequence.prefix_identity.size(),
                          sequence.execution_frontier,
                          host_kv_arena ? 1 : 0);
-            return;
+            return false;
         }
         // P2.3: admission decided this unit can never fit the shared host
         // budget — retention is a planned property, not a spill-time
@@ -6558,7 +6571,7 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index,
                          "[safety-spill] SKIP: index=%u frontier=%u — unit not retention-"
                          "eligible (host cost exceeds the shared host budget), nothing retained\n",
                          index, sequence.execution_frontier);
-            return;
+            return false;
         }
         const SequenceKVBundle& kv = *sequence.kv;
 
@@ -6571,7 +6584,7 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index,
                      text_pages, text_kv_addresses->active(kv.text) ? 1 : 0);
         if (text_pages == 0) {
             std::fprintf(stderr, "[safety-spill] SKIP: text_pages=0 index=%u\n", index);
-            return;
+            return false;
         }
         const std::uint32_t backend_pages =
             kv.backend && backend_kv_addresses ? backend_kv_addresses->mapped_pages(*kv.backend) : 0;
@@ -6581,7 +6594,7 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index,
             host_kv_arena->layout_for(text_kv_pages->physical_pool().geometry());
         if (text_layout == nullptr) {
             std::fprintf(stderr, "[safety-spill] SKIP: text_layout=null index=%u\n", index);
-            return;
+            return false;
         }
 
         // Check if the arena has enough free capacity for text; if not, reclaim whole
@@ -6710,7 +6723,7 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index,
             if (!single) {
                 std::fprintf(stderr, "[safety-spill] FAIL: text allocate need=%zu free=%zu\n",
                              text_bytes, host_kv_arena->free_bytes());
-                return;
+                return false;
             }
             text_allocations.push_back(std::move(*single));
         }
@@ -6810,7 +6823,7 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index,
                 std::fprintf(stderr, "[safety-spill] FAIL: backend allocate need=%zu free=%zu\n",
                              backend_bytes, host_kv_arena->free_bytes());
                 cudaStreamSynchronize(device.transfer_stream);
-                return;
+                return false;
             }
             backend_allocations.push_back(std::move(*single));
             // Copy D2H for the backend allocation.
@@ -7103,7 +7116,7 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index,
             if (checkpoint_state_slot && host_state_images) {
                 host_state_images->release(*checkpoint_state_slot);
             }
-            return;
+            return false;
         }
         entry.text_page_count = text_allocations.empty() ? 0 : text_pages;
         entry.backend_page_count = backend_allocations.empty() ? 0 : backend_pages;
@@ -7161,6 +7174,7 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index,
                              index, entry.execution_frontier, static_cast<int>(checkpoint_valid),
                              checkpoint_frontier, entry.ledger.size(), entry.prefix_identity.size());
                 host_kv_safety_net.add(std::move(entry));
+                return true;
             } else {
                 // A thinking session with an uncaptured checkpoint cannot
                 // serve its next (rewound) turn from an endpoint-only unit,
@@ -7233,6 +7247,7 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index,
                          index, entry.execution_frontier, frontier,
                          entry.ledger.size(), entry.prefix_identity.size());
             host_kv_safety_net.add(std::move(entry));
+            return true;
         } else {
             std::fprintf(stderr,
                          "[safety-spill] ABORT: index=%u frontier=%u reason=no_state_image — no "
@@ -7268,6 +7283,9 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index,
         }
         try { cudaStreamSynchronize(device.transfer_stream); } catch (...) {}
     }
+    // ABORT paths (no state image / uncaptured checkpoint) reach here: the
+    // unit was not retained in the net.
+    return false;
 }
 
 
@@ -7281,6 +7299,16 @@ std::uint64_t ProgramImplCore::host_kv_compaction_count() const noexcept {
 
 std::uint64_t ProgramImplCore::host_kv_eviction_count() const noexcept {
     return host_kv_safety_net.eviction_count();
+}
+
+std::uint64_t ProgramImplCore::relief_kv_releases() const noexcept {
+    return relief_kv_releases_.load(std::memory_order_relaxed);
+}
+std::uint64_t ProgramImplCore::relief_kv_not_retained() const noexcept {
+    return relief_kv_not_retained_.load(std::memory_order_relaxed);
+}
+std::uint64_t ProgramImplCore::relief_kv_pages_freed() const noexcept {
+    return relief_kv_pages_freed_.load(std::memory_order_relaxed);
 }
 
 std::uint64_t ProgramImplCore::materialize_state_slot_alloc_failures() const noexcept {

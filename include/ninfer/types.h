@@ -947,6 +947,13 @@ struct RuntimeStats {
     std::uint64_t host_kv_single_alloc_failures = 0;
     std::uint64_t host_kv_compactions           = 0;
     std::uint64_t host_kv_evictions             = 0;
+    // P2.4 Inc 3: fit-gate/queued KV relief ([relief-kv]) — releases of idle
+    // continuations / shared prefixes and the device pages actually freed.
+    // `relief_kv_not_retained` counts releases where the whole-unit spill was
+    // refused (state pool full / budget): the unit was lost, not preserved.
+    std::uint64_t relief_kv_releases     = 0;
+    std::uint64_t relief_kv_not_retained = 0;
+    std::uint64_t relief_kv_pages_freed  = 0;
     // Materialization allocation failures by resource (monotonic): the plan
     // projected feasibility, but the physical reservation ran out. State-slot
     // exhaustion (device state pool full) is the 2026-09 parallel-large-session

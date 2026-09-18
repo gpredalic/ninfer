@@ -738,6 +738,12 @@ public:
     [[nodiscard]] std::uint64_t host_kv_single_alloc_failures() const noexcept;
     [[nodiscard]] std::uint64_t host_kv_compaction_count() const noexcept;
     [[nodiscard]] std::uint64_t host_kv_eviction_count() const noexcept;
+    // P2.4 Inc 3: fit-gate/queued KV relief ([relief-kv]) — releases of idle
+    // continuations / shared prefixes, the not-retained (unit lost) subset,
+    // and the device pages actually freed (for /stats).
+    [[nodiscard]] std::uint64_t relief_kv_releases() const noexcept;
+    [[nodiscard]] std::uint64_t relief_kv_not_retained() const noexcept;
+    [[nodiscard]] std::uint64_t relief_kv_pages_freed() const noexcept;
     // Materialization allocation failures by resource (for /stats): state-slot
     // exhaustion (device state pool full) is the parallel-large-session bad_alloc
     // signature; KV-page exhaustion rules the page pool in or out.

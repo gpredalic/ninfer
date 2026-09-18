@@ -281,6 +281,21 @@ std::uint64_t Program<Variant>::host_kv_eviction_count() const noexcept {
 }
 
 template <>
+std::uint64_t Program<Variant>::relief_kv_releases() const noexcept {
+    return impl_ ? impl_->relief_kv_releases() : 0;
+}
+
+template <>
+std::uint64_t Program<Variant>::relief_kv_not_retained() const noexcept {
+    return impl_ ? impl_->relief_kv_not_retained() : 0;
+}
+
+template <>
+std::uint64_t Program<Variant>::relief_kv_pages_freed() const noexcept {
+    return impl_ ? impl_->relief_kv_pages_freed() : 0;
+}
+
+template <>
 std::uint64_t Program<Variant>::materialize_state_slot_alloc_failures() const noexcept {
     return impl_ ? impl_->materialize_state_slot_alloc_failures() : 0;
 }
