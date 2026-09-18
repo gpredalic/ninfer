@@ -332,6 +332,14 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
         std::vector<PromptCacheMarker> protocol_markers = std::move(input.context_cache.markers);
         const bool protocol_allows_engine_automatic =
             input.context_cache.allow_engine_automatic_shared_prefixes;
+        // P2.5 Inc 3 (session-key gap): requests that carry no explicit session key
+        // (the anthropic Messages path) get a derived one so their net units are
+        // session-keyed — the per-session eviction tiering (dead/live/idle/active)
+        // and the safety-find session fallback can then engage. An explicit key
+        // (the OpenAI Responses path) is never overridden.
+        if (!context_cache.session_key) {
+            context_cache.session_key = derive_session_key(request);
+        }
         input.context_cache = std::move(context_cache);
         input.context_cache.markers.insert(input.context_cache.markers.end(),
                                            std::make_move_iterator(protocol_markers.begin()),
