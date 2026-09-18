@@ -397,6 +397,18 @@ development. Each is verified with the P0 e2e gate + the live journal.
       45,673 request-log rows spanning 09-15 → 09-18 (both pre- and
       post-`09425996`), i.e. >2 live days with zero queued-request
       cancellations. The `event: ping` heartbeat is holding.
+      **REGRESSION (2026-09-18, under overcommit):** 18 `finish=cancelled`
+      today; 6 are queue-wait cancellations (queue_wait 60–198s, gen=0) —
+      the client abandoned a queued request after a long wait despite the
+      `event: ping` heartbeat. This is the documented P1.8 *residual*: the
+      client's timer is a hard send-relative timeout not reset by pings, so
+      a queue wait longer than the client's timeout cancels regardless of
+      server heartbeats. The fix is the documented next stage (emit
+      `message_start` early, before prefill) — only worth it if the class
+      stays frequent. The other 12 are instant cancels (queue_wait=0, the
+      known user-ESC non-defect). Root driver of the long queue waits is the
+      device-side overcommit (the RECOVER/re-prefill cycle), so reducing the
+      overcommit (P2.4) should reduce these too.
 - [ ] **P1.9 — generation loops at ~350k context (YaRN position-scaling
       suspect; new 2026-09-18).** The user's live session, at ~350k tokens of
       context, repeatedly stops making progress: the model emits the same
