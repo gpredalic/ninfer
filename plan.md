@@ -279,21 +279,26 @@ development. Each is verified with the P0 e2e gate + the live journal.
       15s — **done `a53db4b4`**; (c) make the **shared prefix itself a demotion unit** — **stage 2 shipped `f02bc048`**: when no private victim exists, relief releases the idle shared prefix entry (Catalogued, active_references==0, not the transaction's shared source) with the most resident pages; content survives in the safety net via spilled turn continuations. **Regression:** its admission→reserve race with pending captures (victim chosen at admission, pinned only at reserve) threw `capture replacement capability is stale` 38× — fixed by the `622c841d` degrade-to-no-replacement (runtime-reserve side) and `4e712ab3` RM catalog probe (RM-planning side; see P1.2). Full unit-grade version (D2H spill of the shared prefix as one {KV + state} unit) is P2.4; also noted: the incoming restore allocates NEW device pages for a prefix that is already device-resident (identity-based restore is the deeper fix — shipped `33c53fb9`/`a1cd9dda`, see P1.7); (d) admission
       should see the pool's shared-prefix occupancy and queue the request
       (visible queue position) instead of a 120s silent defer.
-      **Increment 2 implemented `b811ab23`+`344d8f69` (2026-09-17), NOT
-      deployed — blocked on a crash regression.** Occupancy-aware admission
+      **Increment 2 implemented `b811ab23`+`344d8f69` (2026-09-17), and is
+      IN PROD (post-P4.1-fix).** Occupancy-aware admission
       (probe before grant; unfitted head stays in the visible queue) +
       relief-while-queued (15s stall relief toward the blocked demand, 120s
       deadline) + sentinel Class-C (shipped `0214e6ef`). Unit-tested (probe
-      delegation; 5 baseline RM FAILs unchanged). **e2e blocked:** the
-      increment-2 binary crashed the e2e server 5/5 at ~107s (P4.1-family
-      `InvalidResourceHandle` on the event timer, at the first H2D restore
-      while a queued block was active); the make-room binary (f264074b)
-      completed the same suite crash-free in the same environment minutes
-      later — the binary is the variable. Prime suspect: relief-while-queued
-      firing a D2H spill + device release while another lane is mid-H2D-
-      restore (the in-flight fit-gate relief only ever fires when the engine
-      is quiescent). See P4.1 for the crash log. Do not deploy until the
-      crash is resolved on a clean system.
+      delegation; 5 baseline RM FAILs unchanged). *Status correction
+      (2026-09-18):* the crash that blocked it was the P4.1-family
+      `InvalidResourceHandle` on the event timer at the first H2D restore
+      while a queued block was active — **fixed by the P4.1 timer-read fix
+      `9521103d` (09-17 19:30, ~5h after the Inc 2 implementation)**. Both
+      commits are ancestors of HEAD; the Inc 2 code is active by default
+      (the `NINFER_NO_QUEUED_RELIEF=1` kill-switch is opt-in, so relief is ON
+      unless disabled). It has been running in prod through every deploy
+      since 09-17 evening (incl. today's 12:41 census deploy) with **0
+      crashes** in the journal. *Remaining:* verify the exit criterion — a
+      5th-conversation e2e scenario completes (via shared-prefix demotion or
+      a fast visible queue) without a deadline abort — via the phase-14
+      queued-relief gate (`344d8f69`). The current 1–2-session soak exercises
+      the relief path (the `WORKER RECOVER` blocked requests) but not the full
+      5-conversation scenario.
       **State-pool sizing fix deployed 2026-09-16 01:04 (config-only, no code):**
       the 500s from the (reverted) P2.4 gate fix were device-state-pool
       exhaustion — total slots = `max_concurrency + device_state_slots` = 3+5 =
