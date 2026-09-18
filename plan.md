@@ -1593,17 +1593,19 @@ shared meter.
       site (where the sequence gets its prefix identity). Live-verified
       14:36–14:40: 34 `has_sk=1` entries; the subagent's root-admitted unit
       (86743) carries its key.
-      **GAP 3 — RM shared-prefix candidate `819ee058` (committed, PENDING
-      DEPLOY):** the RM has FIVE `inspect_admission` sites but only three set
-      the session key — the shared-prefix candidate path (resource_manager.h:
-      390) left the plan keyless, so a request admitted via a shared prefix
-      carried an empty key, and the end-of-turn catalogue (11291) then
-      OVERWROTE the sequence's birth-stamped key with nullopt. Live-verified
-      14:40: the main session's 210k–228k units (all
-      `shared_stable_prefix` requests) were keyless while the subagent's
-      root-admitted unit was keyed — the exact split. Also fixed: the RM
-      test's FakeProgram was missing the O0/O0+ census methods (the test
-      target had not built since e995bbad). After deploy, ALL admission
+      **GAP 3 — RM shared-prefix candidate `819ee058` (committed, DEPLOYED
+      15:01:36 via e2e swap 4/4 PASS, PID 122293):** the RM has FIVE
+      `inspect_admission` sites but only three set the session key — the
+      shared-prefix candidate path (resource_manager.h:390) left the plan
+      keyless, so a request admitted via a shared prefix carried an empty
+      key, and the end-of-turn catalogue (11291) then OVERWROTE the
+      sequence's birth-stamped key with nullopt. Live-verified 14:40: the
+      main session's 210k–228k units (all `shared_stable_prefix` requests)
+      were keyless while the subagent's root-admitted unit was keyed — the
+      exact split. Also fixed: the RM test's FakeProgram was missing the
+      O0/O0+ census methods (the test target had not built since e995bbad).
+      After this deploy ALL admission paths carry the key; the census
+      staying 100% dead would then be a real bug, not a key gap. After deploy, ALL admission
       paths carry the key and the main session's units should classify
       live/idle/active — the census leaving 100% dead would then be a real
       bug, not a key gap.
