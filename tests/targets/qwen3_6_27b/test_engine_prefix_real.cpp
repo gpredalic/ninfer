@@ -1354,13 +1354,12 @@ int exercise_pressure_partial_spill_and_resume(const char* artifact) {
         after_resume.main_kv_h2d_pages - before_resume.main_kv_h2d_pages;
     const std::uint32_t reused_pages = (resumed.reused_prompt_tokens + 63U) / 64U;
     // The retained unit restores as ONE: the full turn closure (~120 pages)
-    // comes back H2D from the net — not the old four-page partial. The reuse
-    // is proven by the page counts, NOT prefix_reuse_path: the device
-    // shortlist misses (the unit is on host, not device) so the plan reports
-    // Root, and the safety-net re-find restores it without reclassifying the
-    // plan-level path. (Observability gap: a host-net turn-closure restore
-    // reports path=Root with reused_prompt_tokens>0 — see plan.md P2.4.)
+    // comes back H2D from the net — not the old four-page partial. The
+    // restore reports PrivateTurnClosure (the net entry's checkpoint kind is
+    // TurnClosure; a host-net restore reports the same path a device-side
+    // checkpoint restore would — the engine-core "documented upgrade" case).
     if (resumed.generated_token_ids.size() != 1 ||
+        resumed.prefix_reuse_path != ninfer::PrefixReusePath::PrivateTurnClosure ||
         reused_pages < 119 || restored_pages < 100) {
         std::cerr << "pressure-resume did not restore the retained turn closure: path="
                   << static_cast<int>(resumed.prefix_reuse_path)

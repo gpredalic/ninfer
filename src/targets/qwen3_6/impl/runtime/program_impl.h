@@ -4458,6 +4458,9 @@ ProgramImplCore::reserve_materialization(AdmissionCandidate&& plan, PreparedProm
                 transaction.host_kv_restore_entry_index = host_kv_safety_net.pin(match->index);
                 transaction.host_kv_restore_frontier = match->reuse_tokens;
                 transaction.host_kv_restore_checkpoint = match->checkpoint;
+                transaction.host_kv_restore_reuse = match->checkpoint
+                    ? restore_path(match->checkpoint_kind)
+                    : ReusePath::PrivateEndpoint;
                 ++safety_net_restore_count_;
             }
         }
@@ -4597,7 +4600,12 @@ ProgramImplCore::reserve_materialization(AdmissionCandidate&& plan, PreparedProm
             .initial_mtp_extent = initial_mtp_extent,
             .elapsed_seconds    = 0.0,
             .prepare_mtp        = request_plan.prepare_mtp,
-            .reuse              = request_plan.reuse,
+            // A pinned safety-net restore (found at reserve, above) reports the
+            // restore's path, not the plan's Root — the same path a device-side
+            // restore of the same unit would report.
+            .reuse              = (transaction.host_kv_restore_frontier > 0)
+                                      ? transaction.host_kv_restore_reuse
+                                      : request_plan.reuse,
             .mtp_bridge         = request_plan.mtp_bridge,
         };
         request.session_key = request_plan.session_key;
@@ -7144,6 +7152,9 @@ bool ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index,
         entry.checkpoint_frontier = checkpoint_frontier;
         entry.checkpoint_state_slot = std::move(checkpoint_state_slot);
         entry.checkpoint_state_bytes = checkpoint_state_bytes;
+        // The kind rides with the checkpoint so a checkpoint-level restore
+        // reports the same path a device-side checkpoint restore would.
+        entry.checkpoint_kind = sequence.rewrite_checkpoint.kind;
         // P2.5: retain the unit at its DEEPEST COMPLETE frontier. A unit is
         // {KV[0..F] + state@F}: the retained state image must correspond to
         // the retained KV prefix (KV columns are append-only, so a captured
@@ -7962,6 +7973,12 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
                 transaction.host_kv_restore_entry_index = host_kv_safety_net.pin(match->index);
                 transaction.host_kv_restore_frontier = match->reuse_tokens;
                 transaction.host_kv_restore_checkpoint = match->checkpoint;
+                transaction.host_kv_restore_reuse = match->checkpoint
+                    ? restore_path(match->checkpoint_kind)
+                    : ReusePath::PrivateEndpoint;
+                // The prefill was staged before this re-find — update its
+                // reported path (the Begin summary is built later).
+                requests[lane].prefill->reuse = transaction.host_kv_restore_reuse;
                 ++safety_net_restore_count_;
                 std::fprintf(stderr,
                              "[safety-find] re-find HIT after pressure: frontier=%u checkpoint=%d\n",
@@ -8159,6 +8176,12 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
                     transaction.host_kv_restore_entry_index = host_kv_safety_net.pin(match->index);
                     transaction.host_kv_restore_frontier = match->reuse_tokens;
                     transaction.host_kv_restore_checkpoint = match->checkpoint;
+                    transaction.host_kv_restore_reuse = match->checkpoint
+                        ? restore_path(match->checkpoint_kind)
+                        : ReusePath::PrivateEndpoint;
+                    // The prefill was staged before this re-find — update its
+                    // reported path (the Begin summary is built later).
+                    requests[lane].prefill->reuse = transaction.host_kv_restore_reuse;
                     ++safety_net_restore_count_;
                     std::fprintf(stderr,
                                  "[materialize] safety-net HIT after source eviction: frontier=%u checkpoint=%d\n",
@@ -13750,7 +13773,12 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
     }
     const runtime::BeginSummary summary{.prompt_tokens        = staged.prompt_tokens,
                                         .reused_prompt_tokens = staged.base,
-                                        .prefix_reuse_path    = staged.reuse};
+                                        // A restore that later failed (OOM, missing state
+                                        // source) resets staged.base to 0 — report Root in
+                                        // that case so the path never claims a reuse the
+                                        // prefill did not actually get.
+                                        .prefix_reuse_path    = staged.base > 0 ? staged.reuse
+                                                                                : ReusePath::Root};
     std::uint32_t processed_prompt_tokens = 0;
     const auto started                    = Clock::now();
     try {

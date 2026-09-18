@@ -1369,16 +1369,31 @@ private:
             const bool documented_fallback =
                 request->admitted_begin->prefix_reuse_path != PrefixReusePath::Root &&
                 progress.summary.prefix_reuse_path == PrefixReusePath::Root;
-            if (!documented_fallback) {
+            // The safety-net restore is discovered at materialization, AFTER
+            // admission committed a Root begin: the runtime begin UPGRADES the
+            // admitted root to the restored path (the reuse frontier moves up,
+            // not down — the reused_prompt_tokens clause above stays false).
+            const bool documented_upgrade =
+                request->admitted_begin->prefix_reuse_path == PrefixReusePath::Root &&
+                progress.summary.prefix_reuse_path != PrefixReusePath::Root;
+            if (!documented_fallback && !documented_upgrade) {
                 throw std::logic_error("runtime Begin summary differs from committed admission");
             }
-            std::fprintf(stderr,
-                         "[admission] Begin degraded from committed path=%d (reuse %u) to root "
-                         "(reuse %u) — source state not resident at materialization; "
-                         "safety-net/root fallback\n",
-                         static_cast<int>(request->admitted_begin->prefix_reuse_path),
-                         request->admitted_begin->reused_prompt_tokens,
-                         progress.summary.reused_prompt_tokens);
+            if (documented_upgrade) {
+                std::fprintf(stderr,
+                             "[admission] Begin upgraded from committed root to path=%d (reuse %u) "
+                             "— safety-net restore at materialization\n",
+                             static_cast<int>(progress.summary.prefix_reuse_path),
+                             progress.summary.reused_prompt_tokens);
+            } else {
+                std::fprintf(stderr,
+                             "[admission] Begin degraded from committed path=%d (reuse %u) to root "
+                             "(reuse %u) — source state not resident at materialization; "
+                             "safety-net/root fallback\n",
+                             static_cast<int>(request->admitted_begin->prefix_reuse_path),
+                             request->admitted_begin->reused_prompt_tokens,
+                             progress.summary.reused_prompt_tokens);
+            }
         }
         const std::uint32_t lane = request->lane->value;
         if (scheduler_.prefill_lane() == lane) {

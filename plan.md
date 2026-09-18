@@ -1542,6 +1542,24 @@ shared meter.
         displaced), so reuse is the honest evidence. **Window 11: ALL 4
         SCENARIOS PASS (rc=0)** — the P2.4 test suite is green (the slice's
         prod-soak verification remains open).
+        **Follow-up #1 (path reporting) — DONE (window 12, 2026-09-18 19:2x):**
+        a host-net restore now reports the same path a device-side restore
+        would, instead of Root with reused_prompt_tokens>0. The net entry
+        records the unit's rewrite-checkpoint kind at spill time
+        (`checkpoint_kind`); `find()` propagates it in the match; the three
+        re-find sites resolve the restore path (`checkpoint ?
+        restore_path(kind) : PrivateEndpoint`) into the transaction and the
+        staged prefill; the Begin summary reports `staged.base > 0 ?
+        staged.reuse : Root` (self-correcting: every restore-failure path
+        resets base to 0, so a failed restore still reports Root); and
+        engine-core's admission/runtime Begin consistency check accepts the
+        documented UPGRADE direction (admitted Root → runtime restore path,
+        logged as "Begin upgraded from committed root to path=%d").
+        Window 12: all 4 scenarios pass with the pressure-resume oracle
+        RE-TIGHTENED to assert `path == PrivateTurnClosure` again
+        (`[admission] Begin upgraded from committed root to path=2 (reuse
+        7676)` in the log). The concurrent-settlement replay stays
+        path-agnostic (its restore may be device- or net-served).
         **Prod soak (2026-09-18 18:51–19:01, counter-instrumented binary
         already live — no restart needed):** relief accounting verified in
         prod. Baseline→now: `relief_kv_releases` 5→8, `relief_kv_pages_freed`

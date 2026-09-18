@@ -118,6 +118,14 @@ struct HostKVSafetyNetEntry {
 
     std::size_t checkpoint_state_bytes = 0;
 
+    // The unit's rewrite-checkpoint kind, captured at spill time. A
+    // checkpoint-level restore reports the same path a device-side
+    // checkpoint restore would (TurnClosure -> PrivateTurnClosure,
+    // ResponseReplay -> PrivateResponseReplay); valid only when
+    // checkpoint_valid.
+    qwen3_6::RewriteCheckpointKind checkpoint_kind =
+        qwen3_6::RewriteCheckpointKind::TurnClosure;
+
 
 
     // Timestamp for LRU eviction.
@@ -206,6 +214,11 @@ struct HostKVSafetyNetMatch {
     std::uint32_t reuse_tokens = 0;
 
     bool checkpoint           = false;
+
+    // The matched entry's rewrite-checkpoint kind (checkpoint matches only) —
+    // the restore reports the same path a device-side checkpoint restore would.
+    qwen3_6::RewriteCheckpointKind checkpoint_kind =
+        qwen3_6::RewriteCheckpointKind::TurnClosure;
 
 };
 
@@ -468,7 +481,8 @@ public:
 
                 best = HostKVSafetyNetMatch{
 
-                    .index = index, .reuse_tokens = reuse, .checkpoint = checkpoint};
+                    .index = index, .reuse_tokens = reuse, .checkpoint = checkpoint,
+                    .checkpoint_kind = entry.checkpoint_kind};
 
             }
 

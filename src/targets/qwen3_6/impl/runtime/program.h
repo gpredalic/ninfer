@@ -1042,6 +1042,11 @@ private:
         // start_sequence must restore the checkpoint state image, not the
         // endpoint state (they differ).
         bool host_kv_restore_checkpoint = false;
+        // The reuse path the restore reports (PrivateEndpoint at the
+        // execution frontier; restore_path(kind) at the checkpoint frontier) —
+        // the same path a device-side restore of the same unit would report.
+        // Valid only when host_kv_restore_frontier > 0.
+        ReusePath host_kv_restore_reuse = ReusePath::Root;
         // P1.7(b): pages the safety-net restore adopted from still-resident
         // frozen shared pages instead of re-materializing. resident_resources
         // excludes shared pages from an owner's exact transition effect, so
