@@ -1604,11 +1604,12 @@ shared meter.
       were keyless while the subagent's root-admitted unit was keyed — the
       exact split. Also fixed: the RM test's FakeProgram was missing the
       O0/O0+ census methods (the test target had not built since e995bbad).
-      After this deploy ALL admission paths carry the key; the census
-      staying 100% dead would then be a real bug, not a key gap. After deploy, ALL admission
-      paths carry the key and the main session's units should classify
-      live/idle/active — the census leaving 100% dead would then be a real
-      bug, not a key gap.
+      **LIVE-VERIFIED 15:01–15:04 (post-deploy, PID 122293): 0 keyless
+      entries (25 `has_sk=1`, 0 `has_sk=0`); the main session's 277886 unit
+      (5.75 GiB) now classifies `idle` (was `dead`) — the first unit in a
+      protected tier. All three gaps closed; the per-session tiering engages
+      on every admission path. If the census stays 100% dead from here on,
+      it is a real bug, not a key gap.**
 - [x] **P2.6 — config.** `--host-state-slots` derived from (or replaced by) the
       shared budget; document the single `--host-cache-mib`. **Shipped
       (2026-09-17, with the P4.1 relief-fix deploy):** `host_cache_mib` +
