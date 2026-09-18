@@ -390,6 +390,12 @@ public:
                     program.inspect_admission(prompt, base, *destination, nullptr, &*entry.handle,
                                               index.checkpoint, false, cost_model_);
                 if (!plan) { continue; }
+                // P2.5 Inc 3 (session-key gap): the shared-prefix candidate must
+                // carry the session key like the other admission paths — a
+                // keyless plan writes an empty session_key at the end-of-turn
+                // catalogue, clearing the sequence's key and leaving its next
+                // spill dead-tier forever.
+                plan->set_session_key(base.context_cache().session_key);
                 if (plan->summary().reusable_prompt_tokens == 0 ||
                     plan->identity_assessment().source_disposition != ClaimDisposition::Retained) {
                     throw std::logic_error("Program returned an invalid shared candidate");
