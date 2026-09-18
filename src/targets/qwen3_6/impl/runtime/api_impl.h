@@ -354,6 +354,11 @@ std::uint64_t Program<Variant>::host_kv_net_state_bytes() const noexcept {
 }
 
 template <>
+NetTierCensus Program<Variant>::host_kv_net_tier_census() const noexcept {
+    return impl_ ? impl_->host_kv_net_tier_census() : NetTierCensus{};
+}
+
+template <>
 std::uint64_t Program<Variant>::host_unit_occupied_bytes() const noexcept {
     return impl_ ? impl_->host_unit_occupied_bytes() : 0;
 }

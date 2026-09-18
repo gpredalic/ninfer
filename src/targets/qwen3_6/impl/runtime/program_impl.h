@@ -6640,8 +6640,8 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index,
             std::fprintf(stderr,
                          "[safety-spill] evict: index=%zu tier=%s pages=%lu pinned=%d remaining=%zu free=%zu\n",
                          *victim,
-                         host_kv_safety_net.classify_tier(
-                             host_kv_safety_net.at(*victim), std::chrono::steady_clock::now()),
+                         HostKVSafetyNet::tier_name(host_kv_safety_net.classify_tier(
+                             host_kv_safety_net.at(*victim), std::chrono::steady_clock::now())),
                          static_cast<unsigned long>(
                              host_kv_safety_net.at(*victim).text_page_count +
                              host_kv_safety_net.at(*victim).backend_page_count),
@@ -7316,6 +7316,11 @@ std::uint32_t ProgramImplCore::host_kv_net_entries() const noexcept {
 
 std::uint64_t ProgramImplCore::host_kv_net_state_bytes() const noexcept {
     return host_kv_safety_net.retained_state_bytes();
+}
+
+ninfer::NetTierCensus ProgramImplCore::host_kv_net_tier_census() const noexcept {
+    return host_kv_safety_net.tier_census(text_host_kv_page_stride,
+                                          backend_host_kv_page_stride);
 }
 
 std::uint64_t ProgramImplCore::host_unit_occupied_bytes() const noexcept {

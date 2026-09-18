@@ -556,6 +556,69 @@ void test_active_vs_idle_tiering() {
     check(victim.has_value() && *victim == 0, "active session's unit is the last resort");
 }
 
+// P2.5 Increment 3 (O0 census): tier_census() buckets the net's entries into the
+// four eviction tiers (dead / live / idle-catalogued / active) and sums each
+// tier's retained unit bytes — the /stats view of which tier holds the budget.
+void test_tier_census() {
+    const auto now = std::chrono::steady_clock::now();
+    const std::size_t sb = 1024;
+    const std::uint64_t stride = 2;  // bytes per KV page (arbitrary; bytes = pages*stride + state)
+
+    auto make_key = [](const char* name) {
+        PreparedSessionKey key;
+        const std::size_t n = std::strlen(name);
+        std::memcpy(key.bytes.data(), name, n);
+        key.size = static_cast<std::uint16_t>(n);
+        return key;
+    };
+    const PreparedSessionKey key_active = make_key("active-session");
+    const PreparedSessionKey key_idle   = make_key("idle-session");
+
+    const auto is_live = [&key_active, &key_idle](const std::optional<PreparedSessionKey>& k) {
+        return k.has_value() && (*k == key_active || *k == key_idle);
+    };
+    const auto is_active = [&key_active](const std::optional<PreparedSessionKey>& k) {
+        return k.has_value() && *k == key_active;
+    };
+
+    HostKVSafetyNet net;
+    net.set_dead_ttl(std::chrono::minutes(15));
+    net.set_state_budget_bytes(0);  // unbounded: add() never evicts
+    net.set_session_is_live(is_live);
+    net.set_session_is_active(is_active);
+
+    auto dead = make_entry(4000, 0, sb);
+    dead.ever_matched = true;
+    dead.last_matched = now - std::chrono::hours(2);  // past the 15-min TTL
+    net.add(std::move(dead));
+
+    auto live = make_entry(3000, 1000000, sb);  // live, no session key
+    live.ever_matched = true;
+    live.last_matched = now;
+    net.add(std::move(live));
+
+    auto idle = make_entry(4000, 2000000, sb);  // live, Catalogued (old copy)
+    idle.ever_matched = true;
+    idle.last_matched = now;
+    idle.session_key = key_idle;
+    net.add(std::move(idle));
+
+    auto active = make_entry(5000, 3000000, sb);  // live, Active (being served)
+    active.ever_matched = true;
+    active.last_matched = now;
+    active.session_key = key_active;
+    net.add(std::move(active));
+
+    const auto c = net.tier_census(stride, stride);
+    check(c.dead_entries == 1 && c.live_entries == 1 &&
+          c.idle_entries == 1 && c.active_entries == 1,
+          "one entry in each tier");
+    check(c.dead_bytes   == 4000 * stride + sb, "dead tier bytes");
+    check(c.live_bytes   == 3000 * stride + sb, "live tier bytes");
+    check(c.idle_bytes   == 4000 * stride + sb, "idle tier bytes");
+    check(c.active_bytes == 5000 * stride + sb, "active tier bytes");
+}
+
 }  // namespace
 
 int main() {
@@ -564,6 +627,7 @@ int main() {
     test_select_victim_directly();
     test_session_protection();
     test_active_vs_idle_tiering();
+    test_tier_census();
     test_retains();
     test_state_slot_lifecycle();
     test_make_room_for_state_slots();

@@ -15,6 +15,7 @@
 #include "targets/qwen3_6/impl/runtime/logical_kv_store.h"
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
 #include <ninfer/targets/qwen3_6/state_image.h>
+#include <ninfer/types.h>
 
 
 
@@ -603,19 +604,73 @@ public:
 
     // P2.5 Increment 3: which eviction tier an entry falls into under the
     // current predicates — mirrors select_eviction_victim's classification
-    // (dead > unprotected-live > idle-catalogued > active). For logging: the
-    // evict lines report tier= so the journal shows whether a victim was a
-    // dead remnant, an unprotected live unit, an idle (Catalogued) old copy,
-    // or the actively-serving session's unit.
-    [[nodiscard]] const char* classify_tier(const HostKVSafetyNetEntry& entry,
-                                            std::chrono::steady_clock::time_point now) const noexcept {
-        if (!entry.ever_matched || (now - entry.last_matched) > dead_ttl_) { return "dead"; }
+    // (dead > unprotected-live > idle-catalogued > active). Used by the evict
+    // logs (tier=) and the /stats census.
+    enum class EvictionTier : std::uint8_t { Dead, Live, Idle, Active };
+
+    [[nodiscard]] static const char* tier_name(EvictionTier tier) noexcept {
+        switch (tier) {
+        case EvictionTier::Dead:   return "dead";
+        case EvictionTier::Live:   return "live";
+        case EvictionTier::Idle:   return "idle";
+        case EvictionTier::Active: return "active";
+        }
+        return "?";
+    }
+
+    [[nodiscard]] EvictionTier classify_tier(const HostKVSafetyNetEntry& entry,
+                                             std::chrono::steady_clock::time_point now) const noexcept {
+        if (!entry.ever_matched || (now - entry.last_matched) > dead_ttl_) {
+            return EvictionTier::Dead;
+        }
         if (!session_is_live_ || !entry.session_key ||
-            !session_is_live_(*entry.session_key)) { return "live"; }
+            !session_is_live_(*entry.session_key)) {
+            return EvictionTier::Live;
+        }
         const bool active = session_is_active_
             ? session_is_active_(*entry.session_key)
             : session_is_live_(*entry.session_key);  // fallback: old lumped tier
-        return active ? "active" : "idle";
+        return active ? EvictionTier::Active : EvictionTier::Idle;
+    }
+
+    // P2.5 Increment 3 (O0 census): per-eviction-tier composition of the net
+    // (entry counts + retained unit bytes per tier). For /stats: shows which
+    // tier holds the budget — dead remnants, unprotected live units, idle
+    // (Catalogued) old copies, or the actively-serving session's units.
+    [[nodiscard]] ninfer::NetTierCensus tier_census(std::uint64_t text_stride,
+                                                   std::uint64_t backend_stride) const noexcept {
+        const auto now = std::chrono::steady_clock::now();
+        ninfer::NetTierCensus out;
+        for (const HostKVSafetyNetEntry& entry : entries_) {
+            const std::uint64_t bytes = entry_occupied_bytes(entry, text_stride, backend_stride);
+            switch (classify_tier(entry, now)) {
+            case EvictionTier::Dead:
+                ++out.dead_entries;
+                out.dead_bytes = out.dead_bytes > std::numeric_limits<std::uint64_t>::max() - bytes
+                                     ? std::numeric_limits<std::uint64_t>::max()
+                                     : out.dead_bytes + bytes;
+                break;
+            case EvictionTier::Live:
+                ++out.live_entries;
+                out.live_bytes = out.live_bytes > std::numeric_limits<std::uint64_t>::max() - bytes
+                                     ? std::numeric_limits<std::uint64_t>::max()
+                                     : out.live_bytes + bytes;
+                break;
+            case EvictionTier::Idle:
+                ++out.idle_entries;
+                out.idle_bytes = out.idle_bytes > std::numeric_limits<std::uint64_t>::max() - bytes
+                                     ? std::numeric_limits<std::uint64_t>::max()
+                                     : out.idle_bytes + bytes;
+                break;
+            case EvictionTier::Active:
+                ++out.active_entries;
+                out.active_bytes = out.active_bytes > std::numeric_limits<std::uint64_t>::max() - bytes
+                                       ? std::numeric_limits<std::uint64_t>::max()
+                                       : out.active_bytes + bytes;
+                break;
+            }
+        }
+        return out;
     }
 
     // Host KV pages and retained state images share ONE host memory budget. The
@@ -642,30 +697,37 @@ public:
         if (backend_stride == 0) { backend_stride = text_stride; }
         std::uint64_t total = 0;
         for (const HostKVSafetyNetEntry& entry : entries_) {
-            const std::uint64_t text_pages    = entry.text_page_count;
-            const std::uint64_t backend_pages = entry.backend_page_count;
-            const std::uint64_t text_bytes =
-                text_pages > std::numeric_limits<std::uint64_t>::max() / text_stride
-                    ? std::numeric_limits<std::uint64_t>::max()
-                    : text_pages * text_stride;
-            const std::uint64_t backend_bytes =
-                backend_pages > std::numeric_limits<std::uint64_t>::max() / backend_stride
-                    ? std::numeric_limits<std::uint64_t>::max()
-                    : backend_pages * backend_stride;
-            const std::uint64_t kv_bytes =
-                text_bytes > std::numeric_limits<std::uint64_t>::max() - backend_bytes
-                    ? std::numeric_limits<std::uint64_t>::max() - backend_bytes
-                    : text_bytes + backend_bytes;
-            const std::uint64_t state_bytes = entry_state_bytes(entry);
-            const std::uint64_t unit =
-                kv_bytes > std::numeric_limits<std::uint64_t>::max() - state_bytes
-                    ? std::numeric_limits<std::uint64_t>::max() - kv_bytes
-                    : kv_bytes + state_bytes;
+            const std::uint64_t unit = entry_occupied_bytes(entry, text_stride, backend_stride);
             total = total > std::numeric_limits<std::uint64_t>::max() - unit
                         ? std::numeric_limits<std::uint64_t>::max()
                         : total + unit;
         }
         return total;
+    }
+
+    // One unit's retained cost (KV page bytes + state image bytes). Shared by
+    // unit_occupied_bytes and the tier census. Saturates instead of throwing.
+    [[nodiscard]] static std::uint64_t entry_occupied_bytes(const HostKVSafetyNetEntry& entry,
+                                                            std::uint64_t text_stride,
+                                                            std::uint64_t backend_stride) noexcept {
+        const std::uint64_t text_pages    = entry.text_page_count;
+        const std::uint64_t backend_pages = entry.backend_page_count;
+        const std::uint64_t text_bytes =
+            text_pages > std::numeric_limits<std::uint64_t>::max() / text_stride
+                ? std::numeric_limits<std::uint64_t>::max()
+                : text_pages * text_stride;
+        const std::uint64_t backend_bytes =
+            backend_pages > std::numeric_limits<std::uint64_t>::max() / backend_stride
+                ? std::numeric_limits<std::uint64_t>::max()
+                : backend_pages * backend_stride;
+        const std::uint64_t kv_bytes =
+            text_bytes > std::numeric_limits<std::uint64_t>::max() - backend_bytes
+                ? std::numeric_limits<std::uint64_t>::max() - backend_bytes
+                : text_bytes + backend_bytes;
+        const std::uint64_t state_bytes = entry_state_bytes(entry);
+        return kv_bytes > std::numeric_limits<std::uint64_t>::max() - state_bytes
+                   ? std::numeric_limits<std::uint64_t>::max() - kv_bytes
+                   : kv_bytes + state_bytes;
     }
 
     [[nodiscard]] static std::size_t entry_state_bytes(const HostKVSafetyNetEntry& entry) noexcept {
@@ -798,7 +860,7 @@ public:
             std::fprintf(stderr,
                          "[host-state-pool] evict=%zu tier=%s ctx_pages=%zu state_bytes=%zu retained=%zu "
                          "shared=%zu budget=%zu (dead->live->idle->active)\n",
-                         *victim, classify_tier(entries_[*victim], std::chrono::steady_clock::now()),
+                         *victim, tier_name(classify_tier(entries_[*victim], std::chrono::steady_clock::now())),
                          unit_context_pages(entries_[*victim]),
                          entry_state_bytes(entries_[*victim]),
                          state_retained_bytes_, shared_occupied_bytes(), state_budget_bytes_);
@@ -826,7 +888,7 @@ public:
             std::fprintf(stderr,
                          "[host-state-pool] make-room: evict=%zu tier=%s ctx_pages=%zu state_slots=%u "
                          "(dead->live->idle->active)\n",
-                         *victim, classify_tier(entry, std::chrono::steady_clock::now()),
+                         *victim, tier_name(classify_tier(entry, std::chrono::steady_clock::now())),
                          unit_context_pages(entry), entry_slots);
             remove(*victim);
             freed += entry_slots;

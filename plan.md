@@ -1328,6 +1328,21 @@ shared meter.
       accumulate: evictions should drain dead → idle (Catalogued) first, with
       the active session's frontier last. O0 census + O2 reaper remain as
       follow-ups if the tiering alone doesn't clear the thrash.
+      **O0 census IMPLEMENTED (2026-09-18, uncommitted):** the net's
+      per-eviction-tier composition is now in `/stats` (`host_kv.tier_census`
+      = {dead, live, idle, active} × {entries, bytes}). `NetTierCensus` in
+      `include/ninfer/types.h` (embedded in `RuntimeStats.host_kv_tier_census`);
+      `HostKVSafetyNet::tier_census()` + `entry_occupied_bytes()` helper +
+      `EvictionTier` enum / `tier_name()` (classify_tier now returns the enum;
+      the evict logs use `tier_name(classify_tier(...))`); facade plumbing
+      through `program.h` / `program_impl.h` / export `runtime.h` /
+      `api_impl.h` / `resource_manager.h` / `stats_json.cpp`. Unit test
+      `test_tier_census` (one entry per tier, per-tier byte sums) passes;
+      `ninfer-serve` builds; stats_json test all-pass; resource_manager test
+      at its 5 baseline FAILs (no new). Rides the next deploy — it is the
+      tool for judging, from `/stats`, whether the budget is held by dead
+      remnants, idle old copies, or live sessions (i.e. whether the tiering
+      alone clears the thrash or O1/O2 are still needed).
 - [x] **P2.6 — config.** `--host-state-slots` derived from (or replaced by) the
       shared budget; document the single `--host-cache-mib`. **Shipped
       (2026-09-17, with the P4.1 relief-fix deploy):** `host_cache_mib` +

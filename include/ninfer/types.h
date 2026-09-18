@@ -811,6 +811,25 @@ struct RuntimeHostWorkStats {
     std::uint64_t stats_publication_invocations = 0;
 };
 
+// P2.5 Increment 3 (O0 census): the host safety net's composition per eviction
+// tier. The tiers mirror select_eviction_victim's ordering (dead-largest,
+// unprotected-live-smallest, idle-catalogued-smallest, active-smallest):
+//   dead   — never matched, or unmatched past the dead TTL (re-prefill free)
+//   live   — live, no session key (unprotected)
+//   idle   — live, session Catalogued (retained for reuse — an "old copy")
+//   active — live, session Active (currently being served)
+// Bytes are each unit's retained cost (KV page bytes + state image bytes).
+struct NetTierCensus {
+    std::uint32_t dead_entries   = 0;
+    std::uint64_t dead_bytes     = 0;
+    std::uint32_t live_entries   = 0;
+    std::uint64_t live_bytes     = 0;
+    std::uint32_t idle_entries   = 0;
+    std::uint64_t idle_bytes     = 0;
+    std::uint32_t active_entries = 0;
+    std::uint64_t active_bytes   = 0;
+};
+
 // Monotonic execution counters, boundary-consistent current gauges, and explicitly named last
 // decision observations. Consumers derive interval counters by subtracting two snapshots.
 struct RuntimeStats {
@@ -951,6 +970,10 @@ struct RuntimeStats {
     // (the net's heap state images, distinct from the host state pool slots).
     std::uint32_t host_kv_net_entries     = 0;
     std::uint64_t host_kv_net_state_bytes = 0;
+    // P2.5 Increment 3 (O0 census): per-eviction-tier composition of the net
+    // (dead / live / idle-catalogued / active), so /stats shows which tier
+    // holds the retained units and their bytes.
+    NetTierCensus host_kv_tier_census = {};
     // P2.2 (#7 Slice 1): the shared meter over host unit occupancy — the sum of
     // each retained unit's cost (KV page bytes + state image bytes) across the
     // safety net, plus the host state pool's demoted-checkpoint bytes. One

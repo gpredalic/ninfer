@@ -1159,6 +1159,7 @@ public:
         out.state_pending_host_slots              = program.state_pending_host_slots();
         out.host_kv_net_entries                   = program.host_kv_net_entries();
         out.host_kv_net_state_bytes               = program.host_kv_net_state_bytes();
+        out.host_kv_tier_census                   = program.host_kv_net_tier_census();
         out.host_unit_occupied_bytes              = program.host_unit_occupied_bytes();
         out.host_unit_count                        = program.host_unit_count();
         out.host_kv_superseded                    = program.host_kv_superseded_count();

@@ -131,7 +131,19 @@ std::string format_stats_json(const StatsSnapshot& s) {
               {"net_entries", s.scheduler.host_kv_net_entries},
               {"net_state_bytes", s.scheduler.host_kv_net_state_bytes},
               {"unit_bytes", s.scheduler.host_unit_occupied_bytes},
-              {"unit_count", s.scheduler.host_unit_count}}},
+              {"unit_count", s.scheduler.host_unit_count},
+              // P2.5 Increment 3 (O0 census): per-eviction-tier composition of
+              // the net — which tier (dead / live / idle-catalogued / active)
+              // holds the retained units and their bytes.
+              {"tier_census",
+               json{{"dead",   json{{"entries", s.scheduler.host_kv_tier_census.dead_entries},
+                                    {"bytes",   s.scheduler.host_kv_tier_census.dead_bytes}}},
+                    {"live",   json{{"entries", s.scheduler.host_kv_tier_census.live_entries},
+                                    {"bytes",   s.scheduler.host_kv_tier_census.live_bytes}}},
+                    {"idle",   json{{"entries", s.scheduler.host_kv_tier_census.idle_entries},
+                                    {"bytes",   s.scheduler.host_kv_tier_census.idle_bytes}}},
+                    {"active", json{{"entries", s.scheduler.host_kv_tier_census.active_entries},
+                                    {"bytes",   s.scheduler.host_kv_tier_census.active_bytes}}}}}}},
         {"load",
          json{{"target", s.load.target},
               {"model_id", s.load.model_id},

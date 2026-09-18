@@ -612,6 +612,9 @@ public:
     // bytes (the net's heap state images, distinct from the host state pool).
     [[nodiscard]] std::uint32_t host_kv_net_entries() const noexcept;
     [[nodiscard]] std::uint64_t host_kv_net_state_bytes() const noexcept;
+    // P2.5 Increment 3 (O0 census): per-eviction-tier composition of the net
+    // (dead / live / idle-catalogued / active — entry counts + unit bytes).
+    [[nodiscard]] ninfer::NetTierCensus host_kv_net_tier_census() const noexcept;
     // P2.2 (#7 Slice 1): shared meter over host unit occupancy — the sum of each
     // retained unit's cost (KV page bytes + state image bytes) across the safety
     // net, plus the host state pool's demoted-checkpoint bytes. One number across
