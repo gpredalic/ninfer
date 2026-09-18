@@ -1667,16 +1667,20 @@ shared meter.
         exactly (follow-up #3 counters verified live). Net at ceiling
         (25.75/27.6 GiB, all dead tier) — the O2 soft-ceiling dead reaper
         fired (`reap=stale` ×4, 21:15:45), the expected steady-state
-        behavior. **WORKER RECOVER ×6 (20:59–21:15, ~every 3–5 min), all
+        behavior. **WORKER RECOVER ×7 (20:59–21:16, ~every 3–5 min), all
         the same class** ("isolated-feasible request is blocked in an
         idle Engine" — the e2e state-saturation class, logic_error caught,
         worker recovered): every affected request still COMPLETED
         successfully (e.g. req 101: ttft=473ms, reuse=private_turn_closure,
-        wall=1.02s) — the recovery path works in prod; no client-visible
-        impact. Frequency is driven by this session's load (97–100k-token
+        wall=1.02s) — the recovery path works in prod; client-visible cost (the recovered request cold re-prefills: req 123 after the 21:16:42 recovery came back cache=0 reuse=root ttft=17.3s, and req 124 queued 16.8s behind it — each recovery costs the affected turn ~17s TTFT; adjacent requests are unaffected). Frequency is driven by this session's load (97–100k-token
         prompts, device-state-slots=7, heavy compact-prefix churn). Not a
         P2.4 exit signal (exit = 0 "no resident state" + 0 wedge restarts);
-        tracked as the known state-saturation class.
+        tracked as the known state-saturation class. Verified NOT a
+        regression from the recent counter/path commits: the
+        `retain_unit_before_state_loss` void→bool change (2360dbe3) is
+        count-only — the spill is the function's final unconditional action
+        and its return feeds only `slot_release_destroys_`; the
+        spill-before-loss backstop predates them (P2.4 Inc 1, 0c364877).
 - [x] **P2.5 — Slice 4: unit LRU/retention + per-session guarantee.** One LRU
       over the shared budget, evicting whole units cost-aware smallest-first
       (kills the 19s class: state can no longer outlive its KV's retention
