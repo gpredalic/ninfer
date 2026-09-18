@@ -25,6 +25,7 @@ Usage: python3 ninfer-e2e.py [--host 127.0.0.1] [--port 8080] [--serve-log /home
 
 import argparse
 import json
+import os
 import re
 import random
 import sys
@@ -1508,7 +1509,11 @@ def phase_13(args):
     for s in s13:
         s.args = type(args)(**vars(args))
         s.args.max_output_tokens = 512
-    for r in range(1, 9):
+    # PHASE13_ROUNDS (env, default 8): reduced-round A/B variant — the full
+    # 8-round phase exceeds the 10-minute foreground swap limit when the
+    # pressure relief does D2H work (P2.4 Slice 3 Inc 3, 2026-09-17).
+    rounds = int(os.environ.get("PHASE13_ROUNDS", "8"))
+    for r in range(1, rounds + 1):
         print(f"Round {r}:")
         errors = run_round(s13, r, args.timeout)
         if errors:

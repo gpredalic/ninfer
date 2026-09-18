@@ -608,15 +608,22 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::greedy_cover_target(
         std::uint32_t degradation = 0;
         std::uint32_t ordinal = 0;
         bool shared = false;
+        // 0 = the owner's eviction choice; otherwise an index into
+        // owner_options.decisions (Inc 3: a shared-prefix demote move).
+        std::uint16_t choice = 0;
     };
     std::vector<Efficiency> efficiency;
     detail::PhysicalDelta applied{};
-    for (std::size_t index = 0; index < owners.size(); ++index) {
-        const CandidateOwnerOptions& owner_options = options.owners[index];
-        if (owner_options.participation != OwnerParticipation::PressureEligible) { continue; }
-        if (owner_options.eviction_choice == 0) { continue; }
-        const PressureDecision& eviction =
-            owner_options.decisions[owner_options.eviction_choice - 1U];
+    // Inc 3: the seed must see the shared-prefix demote move, not just
+    // evictions — a shared prefix's device KV is locked by shared references
+    // (evict-all frees ~0 of it), so a KV deficit that only a demote can
+    // cover must be seedable or the planner defers (the 2026-09-17
+    // state-saturation stall: blocked root head, idle engine, 13-14
+    // catalog-clearing liveness recoveries per phase).
+    const detail::PhysicalResources seed_deficit =
+        program->guided_materialization_deficit(*candidate.impl_, applied);
+    const auto append_move = [&](std::size_t owner_index, const PressureDecision& decision,
+                                 std::uint16_t choice) {
         // Normalized freed across all dimensions: a victim that frees more
         // (in any scarce dimension) goes first so the cover takes the
         // fewest evictions.
@@ -631,27 +638,79 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::greedy_cover_target(
             return std::max<std::uint64_t>(1, scaled / limit + (scaled % limit != 0 ? 1U : 0U));
         };
         std::uint64_t freed = 0;
-        freed += normalize(eviction.effect.removed.device.active_lanes,
+        freed += normalize(decision.effect.removed.device.active_lanes,
                            capacity.device.active_lanes);
-        freed += normalize(eviction.effect.removed.device.state_slots,
+        freed += normalize(decision.effect.removed.device.state_slots,
                            capacity.device.state_slots);
-        freed += normalize(eviction.effect.removed.device.main_kv_pages,
+        freed += normalize(decision.effect.removed.device.main_kv_pages,
                            capacity.device.main_kv_pages);
-        freed += normalize(eviction.effect.removed.device.backend_kv_pages,
+        freed += normalize(decision.effect.removed.device.backend_kv_pages,
                            capacity.device.backend_kv_pages);
-        freed += normalize(eviction.effect.removed.host.state_slots, capacity.host.state_slots);
-        freed += normalize(eviction.effect.removed.host.kv_bytes, capacity.host.kv_bytes);
-        const std::uint32_t units = NINFER_QWEN36_RUNTIME_NS::degradation_units(eviction);
+        freed += normalize(decision.effect.removed.host.state_slots, capacity.host.state_slots);
+        freed += normalize(decision.effect.removed.host.kv_bytes, capacity.host.kv_bytes);
+        const std::uint32_t units = NINFER_QWEN36_RUNTIME_NS::degradation_units(decision);
         const std::uint64_t cost_per_freed =
             freed == 0 ? std::numeric_limits<std::uint64_t>::max()
                        : ((std::uint64_t{units} << 20U) + freed - 1U) / freed;
         efficiency.push_back(Efficiency{
-            .owner_index  = index,
+            .owner_index  = owner_index,
             .cost_per_freed = cost_per_freed,
             .degradation  = units,
-            .ordinal      = owners[index].ordinal,
-            .shared       = owners[index].shared,
+            .ordinal      = owners[owner_index].ordinal,
+            .shared       = owners[owner_index].shared,
+            .choice       = choice,
         });
+    };
+    for (std::size_t index = 0; index < owners.size(); ++index) {
+        const CandidateOwnerOptions& owner_options = options.owners[index];
+        if (owner_options.participation != OwnerParticipation::PressureEligible) { continue; }
+        if (owner_options.eviction_choice == 0) { continue; }
+        const PressureDecision& eviction =
+            owner_options.decisions[owner_options.eviction_choice - 1U];
+        append_move(index, eviction, 0);
+        // Inc 3: a shared prefix's device KV is locked by shared references —
+        // evict-all frees ~0 of it, but the per-logical-page demote frees it
+        // all. Include the demote move in the seed so a KV deficit that only
+        // a demote can cover is seedable (without this, the seed fails and
+        // the planner defers before the search — which could find the cover
+        // — ever runs).
+        if (owners[index].shared &&
+            (seed_deficit.device.main_kv_pages != 0 ||
+             seed_deficit.device.backend_kv_pages != 0)) {
+            using PlanningContractAccess =
+                qwen3_6::detail::RuntimeContractAccess<NINFER_QWEN36_VARIANT>;
+            const auto& shared_state =
+                program->shared_prefix_states[PlanningContractAccess::index(
+                    *owners[index].shared_handle)];
+            const std::vector<PressureDecision> demote_options =
+                program->inspect_shared_pressure_options(shared_state, seed_deficit, nullptr,
+                                                         nullptr);
+            for (const PressureDecision& demote : demote_options) {
+                if (demote.evicts_continuation) { continue; }
+                const bool has_kv_demote =
+                    std::any_of(demote.main_kv_changes.begin(), demote.main_kv_changes.end(),
+                               [](const auto& a) {
+                                   return a.kind ==
+                                          qwen3_6::detail::PressureKVDecisionKind::DemoteToHost;
+                               }) ||
+                    std::any_of(demote.backend_kv_changes.begin(),
+                                demote.backend_kv_changes.end(),
+                               [](const auto& a) {
+                                   return a.kind ==
+                                          qwen3_6::detail::PressureKVDecisionKind::DemoteToHost;
+                               });
+                if (!has_kv_demote) { continue; }
+                std::vector<PressureDecision>& decisions =
+                    candidate_options[selected_candidate].owners[index].decisions;
+                auto existing = std::find(decisions.begin(), decisions.end(), demote);
+                if (existing == decisions.end()) {
+                    decisions.push_back(demote);
+                    existing = decisions.end() - 1;
+                }
+                append_move(index, *existing,
+                            static_cast<std::uint16_t>(existing - decisions.begin() + 1));
+            }
+        }
     }
     std::sort(efficiency.begin(), efficiency.end(),
               [](const Efficiency& left, const Efficiency& right) {
@@ -679,19 +738,49 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::greedy_cover_target(
     };
     for (const Efficiency& entry : efficiency) {
         const CandidateOwnerOptions& owner_options = options.owners[entry.owner_index];
-        const PressureDecision& eviction =
-            owner_options.decisions[owner_options.eviction_choice - 1U];
-        target.owner_choices[entry.owner_index] = owner_options.eviction_choice;
+        if (target.owner_choices[entry.owner_index] != 0) { continue; }
+        const std::uint16_t choice =
+            entry.choice != 0 ? entry.choice : owner_options.eviction_choice;
+        const PressureDecision& decision = owner_options.decisions[choice - 1U];
+        target.owner_choices[entry.owner_index] = choice;
         applied.removed = NINFER_QWEN36_RUNTIME_NS::planning_resource_sum(
-            applied.removed, eviction.effect.removed);
+            applied.removed, decision.effect.removed);
         applied.added = NINFER_QWEN36_RUNTIME_NS::planning_resource_sum(
-            applied.added, eviction.effect.added);
+            applied.added, decision.effect.added);
         if (residual() == detail::PhysicalResources{}) { break; }
     }
     const bool any_decision = std::any_of(target.owner_choices.begin(),
                                           target.owner_choices.end(),
                                           [](std::uint16_t choice) { return choice != 0; });
     if (!any_decision || residual() != detail::PhysicalResources{}) {
+        {
+            const auto r = residual();
+            const auto occ = program->physical_occupancy();
+            std::size_t eligible = 0, with_eviction = 0, shared_eligible = 0;
+            for (std::size_t i = 0; i < options.owners.size(); ++i) {
+                const auto& oo = options.owners[i];
+                if (oo.participation == OwnerParticipation::PressureEligible) {
+                    ++eligible;
+                    if (owners[i].shared) { ++shared_eligible; }
+                }
+                if (oo.eviction_choice != 0) { ++with_eviction; }
+            }
+            std::fprintf(stderr,
+                "[planner-no-plan] cand=%u any_decision=%d elig=%zu (shared=%zu) w/evict=%zu "
+                "src=%d shrsrc=%d "
+                "free dev{lanes=%u slots=%u mkv=%u bkf=%u} "
+                "resid dev{lanes=%u slots=%u mkv=%u bkf=%u} host{slots=%u kv=%zu}\n",
+                (unsigned)selected_candidate, (int)any_decision, eligible, shared_eligible,
+                with_eviction,
+                (int)(candidate.impl_->has_source ? 1 : 0),
+                (int)(candidate.impl_->has_shared_source ? 1 : 0),
+                capacity.device.active_lanes - occ.device.active_lanes,
+                capacity.device.state_slots - occ.device.state_slots,
+                capacity.device.main_kv_pages - occ.device.main_kv_pages,
+                capacity.device.backend_kv_pages - occ.device.backend_kv_pages,
+                r.device.active_lanes, r.device.state_slots, r.device.main_kv_pages,
+                r.device.backend_kv_pages, r.host.state_slots, (size_t)r.host.kv_bytes);
+        }
         // No eligible owner, or even evicting every owner does not cover —
         // no feasible plan exists (the evict-all target is the same
         // decisions), so defer.

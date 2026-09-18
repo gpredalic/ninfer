@@ -273,6 +273,32 @@ static bool keep_replica_demotes() noexcept {
     return keep;
 }
 
+// P2.4 Slice 3 Inc 3 (2026-09-17): shared-prefix demote re-enable. Inc 2
+// retired ALL per-replica demotes, but a shared prefix's device KV is locked
+// by shared references (address_references > 1): evicting the forking
+// sessions keeps the pages (the prefix still references them) and evicting
+// the prefix frees ~0 (the sessions still reference them), so a root
+// admission under KV saturation has no plan and the engine self-heals via
+// the catalog-clearing liveness recovery (13-14x per forced-saturation
+// phase; each recovery wipes every session's cache). The demote is the only
+// mechanism that frees shared KV: it is per-LOGICAL-page (D2H host replica +
+// drop_device_replica), so one demote frees the physical page for every
+// aliasing address at once, and the existing per-page H2D restore
+// (prepare_kv_restores) brings it back when a session resumes. Unity is
+// preserved: the demote is unit-complete (KV + state when a state-slot
+// deficit exists) and neither half is ever lost — the state stays
+// device-resident (or is demoted alongside) and the KV is host-resident and
+// restorable. Private units stay demote-free (the "splits the unit" case
+// Inc 2 retired); only shared prefixes get the demote option.
+// NINFER_SHARED_PREFIX_DEMOTES=0 disables (rollback).
+static bool shared_prefix_demotes() noexcept {
+    static const bool demote = [] {
+        const char* v = std::getenv("NINFER_SHARED_PREFIX_DEMOTES");
+        return v == nullptr || v[0] == '\0' || std::string(v) != "0";
+    }();
+    return demote;
+}
+
 std::optional<StateImageHandle> pressure_state_source(qwen3_6::detail::PressureStateDecision change,
                                                       const SequenceState* sequence,
                                                       const SharedPrefixState* shared) {
@@ -401,7 +427,7 @@ select_kv_pressure_actions(const KVAddressSpaceStore& addresses, LogicalKVPageSt
                            std::uint32_t requested_device_pages, std::size_t requested_host_bytes,
                            runtime::ContextResourceClass resource,
                            std::span<const qwen3_6::detail::PressureKVDecision> existing_actions,
-                           ProtectedPage&& protected_page) {
+                           bool allow_demote, ProtectedPage&& protected_page) {
     KVPressureSelection selection;
     selection.host_bytes_remaining = requested_host_bytes;
     const std::uint32_t mapped     = std::min(addresses.mapped_pages(address),
@@ -533,10 +559,13 @@ select_kv_pressure_actions(const KVAddressSpaceStore& addresses, LogicalKVPageSt
     // cost of added host demand; the caller's feasibility check rejects the option if
     // the combined host demand exceeds the budget. Without this, a candidate that needs
     // host KV budget suppresses all demotes, causing full eviction instead of parking.
-    // P2.4 Slice 3 Inc 2: retired by default — a KV-only demote splits the unit
-    // (state half managed separately); the whole-unit Evict decision is the
-    // device→host pressure move. NINFER_KEEP_REPLICA_DEMOTES=1 restores it.
-    if (keep_replica_demotes() && device_remaining != 0 && host_allocation_available &&
+    // P2.4 Slice 3 Inc 2/3: the demote pass is retired for PRIVATE units (a
+    // KV-only demote splits the unit; the whole-unit Evict is the device→host
+    // pressure move) but re-enabled for SHARED PREFIXES (Inc 3): their device
+    // KV is locked by shared references and only a per-logical-page demote
+    // (D2H + drop_device_replica) can free it. The caller passes allow_demote
+    // accordingly (NINFER_KEEP_REPLICA_DEMOTES=1 restores it for all owners).
+    if (allow_demote && device_remaining != 0 && host_allocation_available &&
         host_extents != nullptr) {
         select_device_runs(false);
     }
@@ -1525,7 +1554,8 @@ std::optional<qwen3_6::detail::PressureDecision> ProgramImplCore::inspect_shared
             state_change = qwen3_6::detail::PressureStateDecision::DropSharedDeviceDuplicate;
         } else if (deficit.device.state_slots != 0 &&
                    residency == StateReplicaResidency::DeviceOnly &&
-                   keep_replica_demotes() && host_state_images != nullptr) {
+                   (keep_replica_demotes() || shared_prefix_demotes()) &&
+                   host_state_images != nullptr) {
             state_change = qwen3_6::detail::PressureStateDecision::DemoteSharedToHost;
             ++option.effect.added.host.state_slots;
             append_pressure_transfer(option, state_transfer_requirement(
@@ -1552,6 +1582,10 @@ std::optional<qwen3_6::detail::PressureDecision> ProgramImplCore::inspect_shared
             addresses, pages, host_kv_extents.get(),
             host_kv_arena != nullptr && host_kv_extents != nullptr, address, std::nullopt,
             requested, host_kv_remaining, resource, changes,
+            // Inc 3: a shared prefix's device KV is locked by shared references —
+            // only the per-logical-page demote frees it (private units stay
+            // demote-free; NINFER_KEEP_REPLICA_DEMOTES=1 restores all demotes).
+            keep_replica_demotes() || shared_prefix_demotes(),
             [&](std::uint32_t page, LogicalKVPageHandle logical) {
                 return protected_materialization_page(protection, addresses, page, logical,
                                                       backend);
@@ -1796,6 +1830,9 @@ std::optional<qwen3_6::detail::PressureDecision> ProgramImplCore::inspect_pressu
             addresses, pages, host_kv_extents.get(),
             host_kv_arena != nullptr && host_kv_extents != nullptr, address, mapped_limit,
             requested, host_kv_remaining, resource, changes,
+            // Inc 2: private units stay demote-free (the whole-unit Evict is the
+            // device→host move); NINFER_KEEP_REPLICA_DEMOTES=1 restores it.
+            keep_replica_demotes(),
             [&](std::uint32_t page, LogicalKVPageHandle logical) {
                 return protected_materialization_page(protection, addresses, page, logical,
                                                       backend);
@@ -6282,7 +6319,15 @@ void ProgramImplCore::prepare_pressure_work(MaterializationTransaction::Pressure
                 action.kind != qwen3_6::detail::PressureKVDecisionKind::DropHostDuplicate;
             if (!pages.device_resident(logical) || pages.writer_references(logical) != 0 ||
                 pages.source_pins(logical) != 0 || !valid_residency ||
-                (removes_device && addresses.has_active_reference(logical))) {
+                (removes_device && addresses.has_active_reference(logical)) ||
+                // Inc 3: the per-address active check above cannot see active
+                // references held by OTHER address spaces aliasing this logical
+                // page (e.g. a running session that forked from a shared
+                // prefix). drop_device_replica at publish requires the GLOBAL
+                // count to be 0 (can_drop_device_replica) and terminates on
+                // failure — check it here so the option is a controlled
+                // "replica changed" failure instead of a terminate.
+                (removes_device && pages.active_address_references(logical) != 0)) {
                 throw std::logic_error("pressure KV replica changed before transfer");
             }
             if (change.pages[offset] != logical) {
@@ -6421,6 +6466,16 @@ void ProgramImplCore::publish_pressure_work(
                     work.spill_pages += work.backend_kv_changes[index].pages.size();
                 }
             }
+        }
+        // Inc 3 observability: a shared-prefix demote is the only mechanism that
+        // frees shared (multi-reference) device KV — log it so the soak monitor
+        // can distinguish it from the queued-relief continuation demotes.
+        if (work.shared_owner && work.spill_pages > 0) {
+            std::fprintf(stderr,
+                         "[relief-shared] demoted shared prefix KV to host: %u pages "
+                         "(per-logical-page D2H + device-replica drop; aliasing "
+                         "sessions restore via H2D on resume)\n",
+                         (unsigned)work.spill_pages);
         }
         work.submitted = false;
         work.completed = true;
