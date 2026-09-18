@@ -1534,6 +1534,19 @@ shared meter.
       if the client can supply one) so units carry a key and the tiering
       engages. Design fork: the fingerprint must stay stable across the
       conversation AND across compaction, and not collide across sessions.
+      **IMPLEMENTED `613171bd` (2026-09-18, pending deploy):**
+      `derive_session_key()` in `src/serve/request.h` — FNV-1a (the net's own
+      constants) over system-prompt text + first-user-turn text; wired at the
+      `prepare_impl` chokepoint (an explicit key from the OpenAI Responses path
+      is never overridden; no user text → no key, pre-fix behavior). Unit test
+      `test_serve_session_key` (stability across turns, distinct first-user →
+      distinct key, format/capacity, no-user → no key, non-text excluded); all
+      serve tests pass. *Behavior note:* a key also flips RM retention
+      RecentPrivate(4) → LiveSession(16) — intended (protect the active
+      session's units in the catalog too), watch retention bloat in the soak.
+      *Post-deploy signal:* `/stats` `host_kv.tier_census` shows live/idle/
+      active entries (was 100% dead) and `[safety-find]` logs `has_sk=1`.
+      Deploy = e2e swap (user-directed).
 - [x] **P2.6 — config.** `--host-state-slots` derived from (or replaced by) the
       shared budget; document the single `--host-cache-mib`. **Shipped
       (2026-09-17, with the P4.1 relief-fix deploy):** `host_cache_mib` +
