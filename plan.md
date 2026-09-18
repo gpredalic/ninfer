@@ -1659,6 +1659,24 @@ shared meter.
         retain is working in prod (endpoint state lost, checkpoint state
         keeps the unit whole). Soak continues; exit signal = 0 wedge
         restarts over a full working day with plausible relief counts.
+        **Prod soak (2026-09-18 20:54–21:16, post-20:53-restart baseline):**
+        the 20:53:55 sentinel restart (the v3.1/v3.3 misfire) reset the
+        counters; since 20:54:37: 0 crash classes, 0 "no resident state",
+        0 "private source result is missing", 0 finish=error/cancelled.
+        `spill_state_d2h_count` 30 = 30×153,954,304 = `spill_state_d2h_bytes`
+        exactly (follow-up #3 counters verified live). Net at ceiling
+        (25.75/27.6 GiB, all dead tier) — the O2 soft-ceiling dead reaper
+        fired (`reap=stale` ×4, 21:15:45), the expected steady-state
+        behavior. **WORKER RECOVER ×6 (20:59–21:15, ~every 3–5 min), all
+        the same class** ("isolated-feasible request is blocked in an
+        idle Engine" — the e2e state-saturation class, logic_error caught,
+        worker recovered): every affected request still COMPLETED
+        successfully (e.g. req 101: ttft=473ms, reuse=private_turn_closure,
+        wall=1.02s) — the recovery path works in prod; no client-visible
+        impact. Frequency is driven by this session's load (97–100k-token
+        prompts, device-state-slots=7, heavy compact-prefix churn). Not a
+        P2.4 exit signal (exit = 0 "no resident state" + 0 wedge restarts);
+        tracked as the known state-saturation class.
 - [x] **P2.5 — Slice 4: unit LRU/retention + per-session guarantee.** One LRU
       over the shared budget, evicting whole units cost-aware smallest-first
       (kills the 19s class: state can no longer outlive its KV's retention
