@@ -438,7 +438,7 @@ class Monitor:
             out = subprocess.run(
                 [
                     "nvidia-smi",
-                    "--query-gpu=memory.used,memory.total,utilization.gpu,power.draw,temperature.gpu",
+                    "--query-gpu=memory.used,memory.total,utilization.gpu,power.draw,temperature.gpu,power.limit",
                     "--format=csv,noheader,nounits",
                 ],
                 capture_output=True,
@@ -452,6 +452,7 @@ class Monitor:
                 "util_pct": float(p[2]),
                 "power_w": float(p[3]),
                 "temp_c": float(p[4]),
+                "power_limit_w": float(p[5]),
             }
         except Exception:
             return None
@@ -1030,7 +1031,7 @@ function render(d){
     tile('TTFT p50',agg.ttft.p50?agg.ttft.p50.toFixed(2)+'s':'–','p95 '+(agg.ttft.p95?agg.ttft.p95.toFixed(1)+'s':'–')),
     tile('GPU',gpu.util_pct!=null?gpu.util_pct.toFixed(0)+'%':'–',
       gpu.mem_used_mb?(gpu.mem_used_mb/1024).toFixed(1)+' / '+(gpu.mem_total_mb/1024).toFixed(0)+' GB':''),
-    tile('GPU pwr',gpu.power_w!=null?gpu.power_w.toFixed(0)+' W':'–','of 450 W'),
+    tile('GPU pwr',gpu.power_w!=null?gpu.power_w.toFixed(0)+' W':'–','of '+(gpu.power_limit_w!=null?gpu.power_limit_w.toFixed(0):'?')+' W'),
     tile('12VHPWR',hpwr!=null?hpwr.toFixed(1)+'°C':'–',hpwrSub,hpwrColor),
     tile('CPU',latest.cpu_pct!=null?latest.cpu_pct.toFixed(0)+'%':'–',ram.used_mb?(ram.used_mb/1024).toFixed(1)+' / '+(ram.total_mb/1024).toFixed(0)+' GB':''),
     tile('HTTP in-flight',(latest.stats?.http?.in_flight!=null?latest.stats.http.in_flight:'–')+' / '+(latest.stats?.http?.max_in_flight!=null?latest.stats.http.max_in_flight:'–'),'requests'),
@@ -1150,7 +1151,7 @@ function render(d){
   ],{vmax:100});
   draw('c-gpupwr','l-gpupwr',[
     seriesFrom(S,s=>s.gpu?.power_w,C.gpu[0],'power W'),
-  ],{vmax:450});
+  ],{vmax:gpu.power_limit_w||450});
   const hpwrVals=S.map(s=>s.hpwr_c).filter(v=>v!=null);
   draw('c-hpwr','l-hpwr',[
     seriesFrom(S,s=>s.hpwr_c,C.hpwr[0],'12VHPWR °C'),
