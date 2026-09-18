@@ -1,5 +1,5 @@
 #!/bin/bash
-# ninfer wedge sentinel (v3.1, 2026-09-17).
+# ninfer wedge sentinel (v3.4, 2026-09-18).
 #
 # Restarts ninfer.service when the engine is wedged: work outstanding, no
 # engine progress. Three classes per poll (15s):
@@ -15,10 +15,15 @@
 #          flight/queued, there has been no engine progress for 150s.
 #          Progress evidence (v3.1): a /stats "counters" advance (prefill/
 #          decode tokens, rounds, capture completions) OR a fresh journal
-#          throughput line with non-zero tok/s. Any real engine progress
-#          shows up in at least one of the two at the 15s poll scale, so
-#          flat evidence with work outstanding is a wedge — including a
-#          frozen prefilling=1 (the 12:20 case) and a fully silent process.
+#          throughput line with non-zero tok/s. v3.4 adds a third source:
+#          fresh [relief-kv] / [admission] queued KV block lines — a queued
+#          demand converging under the fit gate (15s relief bursts freeing
+#          pages) shows zero tok/s and flat counters while the engine works,
+#          and is bounded by the request's own 120s deadline. Any real
+#          engine progress shows up in at least one of the three at the 15s
+#          poll scale, so flat evidence with work outstanding is a wedge —
+#          including a frozen prefilling=1 (the 12:20 case) and a fully
+#          silent process.
 #
 # Signal sources per poll, in order:
 #   1. HTTP /stats — scheduler gauges + counters sum.
@@ -111,6 +116,26 @@ journal_progress() {
     awk -v r="$rates" 'BEGIN { split(r, a, " "); exit !(a[1] > 0 || a[2] > 0) }'
 }
 
+journal_relief_progress() {
+  # exit 0 if a fresh (within 90s) [relief-kv] / [admission] queued KV block
+  # line exists — the fit-gate/relief machinery is actively working a queued
+  # demand. That is real engine progress invisible to BOTH other evidence
+  # sources: while a large request waits in the queue, the tok/s lines log
+  # 0.0 (no token work) and the /stats counters stay flat, but the 15s relief
+  # bursts demote units, free pages, and the demand converges — bounded by
+  # the request's own 120s fit-gate deadline, which is under this sentinel's
+  # 150s threshold. A wedged engine cannot emit these lines (the scheduler
+  # loop is frozen). 2026-09-18 20:53: request 36 (250k tokens) queued at
+  # 20:50:50, relief freed 18-34 pages every 15s (free 3409->3473), the
+  # request fit and was admitted at 111.9s — healthy throughout — yet C
+  # armed at 150s (20:53:35, token-centric evidence only) and the restart
+  # killed a healthy prefill ~4s after admission.
+  $JC -u ninfer.service --since "90 sec ago" --no-pager 2>/dev/null \
+    | grep -qE '\[relief-kv\]|\[admission\] queued KV block'
+}
+
+engine_progress() { journal_progress || journal_relief_progress; }
+
 fresh_server() {
   $JC -u ninfer.service --since "120 sec ago" --no-pager 2>/dev/null \
     | grep -q "listening on http"
@@ -143,12 +168,28 @@ while true; do
       last_progress=$csum
       c_last_advance=$now
     fi
+    # v3.3: a flat counter sum is NOT no-progress during a long single
+    # prefill — computed_prefill_tokens commits at completion, so a
+    # 250k-token cold prefill (150s+) holds the /stats counters flat while
+    # the 5s reporter's throughput line shows non-zero tok/s throughout.
+    # /stats succeeding only proves the HTTP pool is alive, not that the
+    # engine is computing, so the journal evidence must be consulted on
+    # EVERY poll, not just when /stats fails (v3.1 wired it into the
+    # failure path only). 2026-09-18 20:53 misfire: a 250k cold prefill
+    # (post-compaction re-prefill) armed C at 150s of flat counters
+    # mid-prefill and the restart killed it ~10s before completion. A
+    # wedged engine still cannot satisfy this: it goes silent (no fresh
+    # line) or logs 0.0 tok/s.
+    # v3.4: relief/queued-block lines are progress too (see
+    # journal_relief_progress) — a queued demand converging under the fit
+    # gate shows zero tok/s and flat counters while the engine works.
+    engine_progress && c_last_advance=$now
   else
     state=$(poll_journal_state)
     # v3.1: the /stats poll failed — a fresh journal line with non-zero tok/s
     # still proves engine progress (2026-09-17 21:10 misfire: long prefill,
     # /stats unreachable, journal showed a healthy ~1000 tok/s throughout).
-    journal_progress && c_last_advance=$now
+    engine_progress && c_last_advance=$now
   fi
   echo "$state" | grep -qE '^[0-9]+( [0-9]+){4}$' || state=""
 
