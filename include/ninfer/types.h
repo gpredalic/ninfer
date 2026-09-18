@@ -830,6 +830,20 @@ struct NetTierCensus {
     std::uint64_t active_bytes   = 0;
 };
 
+// P2.5 Increment 3 (O0+): one retained net unit's identity — the per-entry
+// view behind the tier census. Bounded (top-N by bytes) so /stats stays
+// small. `session` is the session key as a printable string (empty when the
+// entry has none); `tier` is the eviction tier (dead/live/idle/active).
+struct NetUnitInfo {
+    std::uint32_t frontier = 0;   // execution_frontier (tokens)
+    std::uint64_t bytes    = 0;   // retained cost (KV page bytes + state bytes)
+    std::string   tier;          // dead / live / idle / active
+    bool          ever_matched = false;
+    bool          pinned       = false;
+    bool          active_session = false;  // session_key matches an Active continuation
+    std::string   session;      // session key (empty if none)
+};
+
 // Monotonic execution counters, boundary-consistent current gauges, and explicitly named last
 // decision observations. Consumers derive interval counters by subtracting two snapshots.
 struct RuntimeStats {
@@ -974,6 +988,10 @@ struct RuntimeStats {
     // (dead / live / idle-catalogued / active), so /stats shows which tier
     // holds the retained units and their bytes.
     NetTierCensus host_kv_tier_census = {};
+    // P2.5 Increment 3 (O0+): the net's largest retained units (top-N by
+    // bytes) — the per-entry view behind the tier census, so /stats shows
+    // WHICH units hold the budget (live frontiers vs. finished sub-agents).
+    std::vector<NetUnitInfo> host_kv_top_units;
     // P2.2 (#7 Slice 1): the shared meter over host unit occupancy — the sum of
     // each retained unit's cost (KV page bytes + state image bytes) across the
     // safety net, plus the host state pool's demoted-checkpoint bytes. One

@@ -615,6 +615,9 @@ public:
     // P2.5 Increment 3 (O0 census): per-eviction-tier composition of the net
     // (dead / live / idle-catalogued / active — entry counts + unit bytes).
     [[nodiscard]] ninfer::NetTierCensus host_kv_net_tier_census() const noexcept;
+    // P2.5 Increment 3 (O0+): the net's largest retained units (top-n by
+    // bytes) — the per-entry view behind the tier census.
+    [[nodiscard]] std::vector<ninfer::NetUnitInfo> host_kv_net_top_units(std::size_t n) const noexcept;
     // P2.2 (#7 Slice 1): shared meter over host unit occupancy — the sum of each
     // retained unit's cost (KV page bytes + state image bytes) across the safety
     // net, plus the host state pool's demoted-checkpoint bytes. One number across

@@ -673,6 +673,45 @@ public:
         return out;
     }
 
+    // P2.5 Increment 3 (O0+): the net's largest retained units (top-n by
+    // bytes) — the per-entry view behind the tier census. For /stats: shows
+    // WHICH units hold the budget (live frontiers vs. finished sub-agents vs.
+    // orphans) so the operator can tell a necessary working set from
+    // trimmable weight. `session` is the entry's session key (empty if none);
+    // `active_session` is true when that key matches an Active continuation
+    // (i.e. the unit is currently being served — its host copy is a redundant
+    // mirror of the device-resident unit).
+    [[nodiscard]] std::vector<ninfer::NetUnitInfo> top_units(std::uint64_t text_stride,
+                                                             std::uint64_t backend_stride,
+                                                             std::size_t n) const noexcept {
+        const auto now = std::chrono::steady_clock::now();
+        std::vector<std::pair<std::uint64_t, std::size_t>> order;  // (bytes, index)
+        order.reserve(entries_.size());
+        for (std::size_t i = 0; i < entries_.size(); ++i) {
+            order.emplace_back(entry_occupied_bytes(entries_[i], text_stride, backend_stride), i);
+        }
+        std::sort(order.begin(), order.end(),
+                  [](const auto& a, const auto& b) { return a.first > b.first; });
+        std::vector<ninfer::NetUnitInfo> out;
+        out.reserve(std::min(n, order.size()));
+        for (std::size_t k = 0; k < n && k < order.size(); ++k) {
+            const HostKVSafetyNetEntry& e = entries_[order[k].second];
+            ninfer::NetUnitInfo info;
+            info.frontier     = e.execution_frontier;
+            info.bytes        = order[k].first;
+            info.tier         = tier_name(classify_tier(e, now));
+            info.ever_matched = e.ever_matched;
+            info.pinned       = e.pinned;
+            if (e.session_key) {
+                info.session.assign(e.session_key->view());
+                info.active_session = session_is_active_ ? session_is_active_(*e.session_key)
+                                                         : false;
+            }
+            out.push_back(std::move(info));
+        }
+        return out;
+    }
+
     // Host KV pages and retained state images share ONE host memory budget. The
     // arena is the other tenant, so it is queried live instead of duplicating the
     // limit: neither pool may consume the other's headroom.

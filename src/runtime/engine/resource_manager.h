@@ -1160,6 +1160,9 @@ public:
         out.host_kv_net_entries                   = program.host_kv_net_entries();
         out.host_kv_net_state_bytes               = program.host_kv_net_state_bytes();
         out.host_kv_tier_census                   = program.host_kv_net_tier_census();
+        // P2.5 Increment 3 (O0+): the net's largest retained units (top-12 by
+        // bytes) — the per-entry view behind the tier census.
+        out.host_kv_top_units                     = program.host_kv_net_top_units(12);
         out.host_unit_occupied_bytes              = program.host_unit_occupied_bytes();
         out.host_unit_count                        = program.host_unit_count();
         out.host_kv_superseded                    = program.host_kv_superseded_count();

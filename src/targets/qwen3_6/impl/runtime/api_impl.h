@@ -359,6 +359,11 @@ NetTierCensus Program<Variant>::host_kv_net_tier_census() const noexcept {
 }
 
 template <>
+std::vector<NetUnitInfo> Program<Variant>::host_kv_net_top_units(std::size_t n) const noexcept {
+    return impl_ ? impl_->host_kv_net_top_units(n) : std::vector<NetUnitInfo>{};
+}
+
+template <>
 std::uint64_t Program<Variant>::host_unit_occupied_bytes() const noexcept {
     return impl_ ? impl_->host_unit_occupied_bytes() : 0;
 }

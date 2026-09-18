@@ -143,7 +143,23 @@ std::string format_stats_json(const StatsSnapshot& s) {
                     {"idle",   json{{"entries", s.scheduler.host_kv_tier_census.idle_entries},
                                     {"bytes",   s.scheduler.host_kv_tier_census.idle_bytes}}},
                     {"active", json{{"entries", s.scheduler.host_kv_tier_census.active_entries},
-                                    {"bytes",   s.scheduler.host_kv_tier_census.active_bytes}}}}}}},
+                                    {"bytes",   s.scheduler.host_kv_tier_census.active_bytes}}}}},
+              // P2.5 Increment 3 (O0+): the net's largest retained units — the
+              // per-entry view (frontier, bytes, tier, session, active-session).
+              {"top_units",
+               [&] {
+                   json arr = json::array();
+                   for (const auto& u : s.scheduler.host_kv_top_units) {
+                       arr.push_back(json{{"frontier",       u.frontier},
+                                          {"bytes",          u.bytes},
+                                          {"tier",           u.tier},
+                                          {"matched",        u.ever_matched},
+                                          {"pinned",         u.pinned},
+                                          {"active_session", u.active_session},
+                                          {"session",        u.session}});
+                   }
+                   return arr;
+               }()}}},
         {"load",
          json{{"target", s.load.target},
               {"model_id", s.load.model_id},

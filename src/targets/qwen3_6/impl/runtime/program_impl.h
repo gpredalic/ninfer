@@ -7338,6 +7338,11 @@ ninfer::NetTierCensus ProgramImplCore::host_kv_net_tier_census() const noexcept 
                                           backend_host_kv_page_stride);
 }
 
+std::vector<ninfer::NetUnitInfo> ProgramImplCore::host_kv_net_top_units(std::size_t n) const noexcept {
+    return host_kv_safety_net.top_units(text_host_kv_page_stride,
+                                        backend_host_kv_page_stride, n);
+}
+
 std::uint64_t ProgramImplCore::host_unit_occupied_bytes() const noexcept {
     // P2.2 (#7 Slice 1): one number across the two host pools that were
     // accounted separately — the safety net's retained units (KV page bytes +
