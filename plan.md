@@ -1560,6 +1560,11 @@ shared meter.
         (`[admission] Begin upgraded from committed root to path=2 (reuse
         7676)` in the log). The concurrent-settlement replay stays
         path-agnostic (its restore may be device- or net-served).
+        **Deployed 2026-09-18 19:27 (e2e swap, rc=0):** all 4 e2e verdicts
+        PASS (zero bad_alloc, restore fired under pressure, cache reuse > 0,
+        safety-net H2D restore fired). Prod healthy post-restore (0 crash
+        classes; relief counters reset to 0 — expected post-restart, the
+        soak baseline restarts from here).
         **Prod soak (2026-09-18 18:51–19:01, counter-instrumented binary
         already live — no restart needed):** relief accounting verified in
         prod. Baseline→now: `relief_kv_releases` 5→8, `relief_kv_pages_freed`
