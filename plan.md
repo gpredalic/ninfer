@@ -397,6 +397,114 @@ development. Each is verified with the P0 e2e gate + the live journal.
       45,673 request-log rows spanning 09-15 → 09-18 (both pre- and
       post-`09425996`), i.e. >2 live days with zero queued-request
       cancellations. The `event: ping` heartbeat is holding.
+- [ ] **P1.9 — generation loops at ~350k context (YaRN position-scaling
+      suspect; new 2026-09-18).** The user's live session, at ~350k tokens of
+      context, repeatedly stops making progress: the model emits the same
+      statements over and over until Claude Code compaction (which truncates +
+      re-prefills the context and clears it). Recurred several times in the
+      2026-09-18 session. *Most urgent open item: past ~350k the model is
+      effectively unusable.*
+      **Why "yarn":** the loop onset (~350k) sits just above the deployed YaRN
+      ramp threshold. Prod runs `--rope-scaling-factor 2.12
+      --rope-scaling-original-context 262144` (256k): positions ≤ 256k are
+      unchanged, above that they are linearly contracted by 2.12
+      (`yarn_scale_position`, program_impl.h:65; GPU `scale_positions_yarn`
+      kernel, ops/kernel/position.cuh). The formula itself is verified correct
+      and the host fn is documented to match the kernel — so "broke" is not the
+      formula. The signature (correct below the threshold, wrong above it) is
+      the classic one for a **raw-position vs scaled-position space confusion or
+      a double-scale** in a path whose output only changes once positions enter
+      the contracted region:
+      - **Restore/reuse position recompute.** Restored/spilled/reused units
+        recompute scaled positions at a frontier via `yarn_scale_position` at
+        program_impl.h:13300 (graph representative), 14125 (ordinary batch),
+        14282 (MTP batch), 13969/13979 (MTP bridge rope). If a stored frontier
+        is already in scaled space and is scaled AGAIN (or a raw frontier is
+        compared against a scaled one), the restored prefix's positions don't
+        match → self-attention over the model's own recent output is corrupted
+        → it "forgets" what it just said and loops. This path is only exercised
+        above the threshold (below it scaling is identity, masking the bug) —
+        matches the onset. Recent work (safety-net spill/restore, checkpoint
+        frontiers, shared prefixes, the MTP-bridge root-fallback clear
+        `ea934911`) is exactly the set of paths to audit.
+      - **MTP bridge / speculative positions** (`mtp_impl.h:167`; `--spec mtp
+        --draft-tokens 5` is ON in prod): draft-token positions are scaled too;
+        a space mismatch there would break speculative alignment.
+      *Investigation (no deploy):*
+      1. Nail the boundary: pull the loop episodes' prompt/frontier token counts
+         from `/home/zenz/ninfer-requests.jsonl` — is onset consistently just
+         past 262144? A clean threshold crossing is the strongest evidence.
+      2. Confirm the deployed scaling values (done: factor 2.12, threshold 256k).
+      3. Audit every `yarn_scale_position` / `scale_positions_yarn` call site for
+         raw-vs-scaled space and double-scaling, prioritizing the restore/reuse
+         frontier sites (13300/14125/14282/13969-13979) and the MTP bridge
+         (mtp_impl.h:167). The kernel and host fn must receive the SAME input
+         space at each site.
+      4. Isolate fresh vs restored: a single ~300k+ token filler prompt (no
+         caching) — if it does NOT loop, the bug is in the reuse/restore path
+         (not the base prefill); if it DOES loop even on a cold prefill, the bug
+         is in the base position computation.
+      5. Correlate first occurrence with a specific deploy (bisect the recent
+         position-adjacent commits: MTP-bridge `ea934911`, P4.1 timer fix
+         `9521103d`, the spill/restore increments).
+      *Symptom (user-clarified 2026-09-18):* NOT word-for-word repetition. It is
+      **macro stuckness**: the model re-announces the same state and next-step
+      every turn ("Build is clean… let me verify… let me add a test… let me
+      commit…") without completing the actual task, until Claude Code
+      compaction truncates the context and it works again. Each turn behaves as
+      if it does not know what the previous turn did.
+      *Forensics (2026-09-18, all 5 request-log days + git):*
+      - **Ruled out — "we broke yarn" as a code regression:** the rope path is
+        UNTOUCHED. `--rope-scaling-factor 2.12 --rope-scaling-original-context
+        262144` constant since 09-08 (first log); zero commits since 09-01 to
+        the position op (`src/ops/**/position.*`), the `yarn_scale_position`
+        call sites, or `text_context_impl.h`. The formula is verified correct.
+      - **Ruled out — MTP artifact:** `fallback_steps=0` and normal
+        per-position acceptance on every turn, including the dump turns.
+      - **Long dumps (≥12k-token single turns) are chronic, not new:** present
+        since 09-09 in every prompt bin (incl. 32 below 200k). Per-day counts:
+        09-09: 25, 09-10: 49 (the bad days), then 0–5/day through 09-18 (today:
+        2 so far — not a bad day by this metric). The drop coincides with the
+        09-11 chat-template change (`cb535944` vendored-jinja template
+        execution, froggeric_v225) — the template change IMPROVED the metric.
+      - **Rate gradient with context:** ≥8k completions are 0.5% of requests
+        <200k, 1.0% at 256–300k, 1.5% at 300–350k, **3.4% at >350k** — the
+        degradation climbs above ~350k, not at the 256k ramp.
+      - **Both cold-root and reuse turns produce dumps** (req 36 today: 11.9k
+        @312k, cold ROOT, no cache) — so the restore/reuse path is not the
+        sole trigger.
+      *Remaining hypotheses (ranked):*
+      - **H-A — intrinsic long-context degradation** (the model's utilization
+        of its own context degrades with length; the 3.4%-at->350k gradient +
+        chronic presence fit this). Baseline explanation.
+      - **H-B — template rendering of long histories** (the 09-11 template
+        change improved dumps overall, but may mishandle long
+        assistant/tool/thinking histories — e.g. truncating or misrendering
+        the model's own recent turns, which would produce exactly the
+        "re-establishes context every turn" pattern).
+      - **H-C — attention quality over cached prefixes at 300k+** (weaker now
+        that cold-root dumps exist, but a restore-path position/attention bug
+        could still add to it).
+      *Discriminating experiments:*
+      1. **(cheap, no deploy)** Reconstruct one stuck episode's rendered
+         prompt: compare the request-log `prompt_tokens` at that turn against
+         the client transcript's content at the same point; inspect what the
+         model actually sees of its own last N turns (a template drop/misrender
+         would show as a token-count gap or missing recent turns).
+      2. **(needs a prod-stopped window)** Long-context recall probe: a 300k+
+         prompt with needles planted at 10k/110k/210k/290k, run (a) cold and
+         (b) on a warm cache. Deep-position recall failing on BOTH → H-A
+         (intrinsic/scaling quality); failing only warm → H-C (restore path).
+      3. **(cheap)** Diff froggeric_v225 against the pre-09-11 template
+         (`git show cb535944^:...`) for how it renders long assistant/tool/
+         thinking histories; A/B the two templates on a 300k+ conversation in
+         a stopped window.
+      4. Track the macro-stuck pattern itself: count consecutive no-progress
+         turns per session from the client transcripts (the request log has no
+         content, so this must come from the .jsonl transcripts) — establish
+         whether today's episodes are an outlier vs the 09-09/09-10 baseline.
+      *Exit:* a 350k+ context session makes steady progress with no looping,
+      across both fresh-prefill and restored/reused paths.
 - [x] **P1.7 — planner H2D demand + identity-based restore (Slice 0 of #7).**
       Two standalone fixes that ship before the unit refactor and address
       today's live pain: (a) model the restore's new device state slot when the
@@ -1400,6 +1508,32 @@ shared meter.
       Watch +15 min: as the 13:04 entries age past the TTL, the reaper should
       start trimming the dead-tier ones; if the net stays ~29 GiB, O1 is
       needed.
+      **Session-key gap — ROOT CAUSE PINNED (2026-09-18, live window 13:59–14:00).**
+      A WORKER RECOVER at 13:59:39 (transient liveness stall during overcommit;
+      self-healed — req 63 re-prefilled from root, ttft 5.4s, no crash/wedge/
+      restart) opened a live window: the safety-find dump shows **every net
+      entry `has_sk=0`** and the incoming request logs `session_key NOT SET
+      (nullopt)`; the tier_census is 100% dead (16 entries / 27.4 GiB), 0
+      live/idle/active. Traced the key chain: the session key is a
+      **CLIENT-PROVIDED HINT** (`PromptInput.hints.session_key`,
+      frontend.cpp:729) — the anthropic Messages handler NEVER populates it
+      (grep: `session_key` appears only in the `openai_responses_*` serve
+      files). Only the OpenAI Responses path sets one (from the `response_id`,
+      openai_responses_state.cpp:184–193). Prod is all Anthropic → **every unit
+      is session-less → classified `dead` → the P2.5 Inc 2/3 per-session
+      tiering (active/idle/live protection) is a no-op in prod.** The plumbing
+      (request_plan:4603 → request → state:11291 → entry:7070) is correct; the
+      gap is at the top — no key is ever supplied. *Consequence:* under
+      overcommit the eviction can't protect the active session's frontier (it
+      sits in the `dead` tier, evictable like any stale unit) — the
+      active-session re-prefill cost is unmitigated. Complementary to O1
+      (budget sizing): O1 fixes *how much* is retained, the session key fixes
+      *which* unit survives. *Next increment:* derive a session key
+      SERVER-SIDE for the anthropic path (a stable conversation fingerprint —
+      e.g. hash of system prompt + first user turn — or a client conversation id
+      if the client can supply one) so units carry a key and the tiering
+      engages. Design fork: the fingerprint must stay stable across the
+      conversation AND across compaction, and not collide across sessions.
 - [x] **P2.6 — config.** `--host-state-slots` derived from (or replaced by) the
       shared budget; document the single `--host-cache-mib`. **Shipped
       (2026-09-17, with the P4.1 relief-fix deploy):** `host_cache_mib` +
