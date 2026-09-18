@@ -359,7 +359,13 @@ development. Each is verified with the P0 e2e gate + the live journal.
       fails within a deadline (the 120s-defer pattern generalized) —
       **shipped for the admission-wedge class by `20213d4b` (re-arm + bounded
       fail-all); verify in a live window**; (c) 0 sentinel firings over a
-      full day of live use.
+      full day of live use. **Soak (2026-09-18):** 0 sentinel firings in the
+      journal window (since 10:43 today; the only sentinel activity is the
+      e2e-swap's expected stop/start). The full 24h predates journald
+      retention, but there have been no unplanned restarts — the only
+      restarts today were the three directed e2e swaps. (a) the 15:15–15:32
+      stall class remains uninvestigated (its journal rotated out; the
+      request logs for that window are in `~/ninfer-requests.jsonl.2`).
 - [ ] **P1.8 — client abandons queued requests (serve-layer, new 2026-09-16).**
       The user's session showed `finish=cancelled` at queue=29.37s (0 tokens)
       with the client re-sending the same turn 0.5s later (that copy
@@ -384,6 +390,10 @@ development. Each is verified with the P0 e2e gate + the live journal.
       machine; only if the class recurs. The 0.5s double-submission is
       client retry logic — not server-addressable. *Exit:* 0
       `finish=cancelled` on queued requests over a live day.
+      **Exit MET (verified 2026-09-18):** 0 `finish=cancelled` across
+      45,673 request-log rows spanning 09-15 → 09-18 (both pre- and
+      post-`09425996`), i.e. >2 live days with zero queued-request
+      cancellations. The `event: ping` heartbeat is holding.
 - [x] **P1.7 — planner H2D demand + identity-based restore (Slice 0 of #7).**
       Two standalone fixes that ship before the unit refactor and address
       today's live pain: (a) model the restore's new device state slot when the
