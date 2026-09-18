@@ -69,12 +69,20 @@
 # - 90s grace after a fresh server (model load window) — no restarts.
 # - 3 restarts within 30 minutes (any class) stops auto-restart and alerts.
 PORT=8080
+STATS_PORT=8081   # dedicated single-thread /stats server (--stats-port); never
+                  # saturates behind streaming handlers. Main port is the
+                  # fallback (old binaries without --stats-port).
 if [ "$(id -u)" != "0" ]; then JC="sudo -n journalctl"; else JC="journalctl"; fi
 
 poll_stats() {
-  # prints "r p d w m counters_sum" or nothing
-  curl -s --max-time 5 "http://127.0.0.1:$PORT/stats" 2>/dev/null \
-    | python3 -c '
+  # prints "r p d w m counters_sum" or nothing. Tries the dedicated stats
+  # port first: a /stats poll on the main port can time out while the shared
+  # worker pool is saturated by streaming handlers spanning a long prefill
+  # (2026-09-17 21:10 misfire contributor); the dedicated port cannot.
+  local body
+  body=$(curl -s --max-time 5 "http://127.0.0.1:$STATS_PORT/stats" 2>/dev/null)
+  [ -n "$body" ] || body=$(curl -s --max-time 5 "http://127.0.0.1:$PORT/stats" 2>/dev/null)
+  [ -n "$body" ] && printf '%s' "$body" | python3 -c '
 import json, sys
 try:
     s = json.load(sys.stdin)

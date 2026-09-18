@@ -58,6 +58,7 @@ class Config:
         self.port = args.port
         self.bind = args.bind
         self.server_url = args.server_url.rstrip("/")
+        self.stats_url = (args.stats_url or args.server_url).rstrip("/")
         self.jsonl = args.jsonl
         self.serve_log = args.serve_log
         self.interval = args.interval
@@ -363,7 +364,7 @@ class Monitor:
 
     def poll_stats(self) -> None:
         try:
-            with urllib.request.urlopen(self.cfg.server_url + "/stats",
+            with urllib.request.urlopen(self.cfg.stats_url + "/stats",
                                         timeout=POLL_TIMEOUT_S) as r:
                 stats = json.loads(r.read().decode("utf-8", "replace"))
         except Exception:
@@ -1305,6 +1306,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--port", type=int, default=8090)
     p.add_argument("--bind", default="0.0.0.0")
     p.add_argument("--server-url", default="http://127.0.0.1:8080")
+    p.add_argument("--stats-url", default=None,
+                   help="base URL for /stats polling (default: --server-url). "
+                        "Point this at the dedicated --stats-port server so "
+                        "polls never queue behind streaming handlers.")
     p.add_argument("--jsonl", default=os.path.expanduser("~/ninfer-requests.jsonl"))
     p.add_argument("--serve-log", default=os.path.expanduser("~/ninfer-serve.log"))
     p.add_argument("--log-source", choices=("file", "journal"), default="file",
