@@ -1615,8 +1615,19 @@ shared meter.
       entries (25 `has_sk=1`, 0 `has_sk=0`); the main session's 277886 unit
       (5.75 GiB) now classifies `idle` (was `dead`) — the first unit in a
       protected tier. All three gaps closed; the per-session tiering engages
-      on every admission path. If the census stays 100% dead from here on,
-      it is a real bug, not a key gap.**
+      on every admission path.**
+      **Census interpretation (15:08): an all-`dead` census is a NORMAL
+      steady-state artifact, NOT a bug signal.** `classify_tier` anchors the
+      dead tier on match recency (`!ever_matched || last_matched > 15min
+      TTL`), and every supersede mints a fresh never-matched unit (dead by
+      construction) while dropping the previously-matched one — so the
+      newest unit is always dead at any snapshot, and the census catches the
+      net mid-churn. The reliable signals are (a) 0 keyless entries and (b)
+      state-pool evictions being all `tier=dead` (10/10 since deploy — the
+      tiering protects live/idle/active state images). Do NOT treat "100%
+      dead census" as a regression; treat "keyless entries" or "a
+      live/idle/active unit evicted while a dead one remains" as the bug
+      signals.
       **Census interpretation (15:08, post-deploy): the all-dead census is
       EXPECTED, not a tiering failure.** `classify_tier` (host_kv_safety_net.
       h:621) anchors the dead tier on MATCH RECENCY: `!ever_matched ||
