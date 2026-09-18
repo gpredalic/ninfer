@@ -753,34 +753,6 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::greedy_cover_target(
                                           target.owner_choices.end(),
                                           [](std::uint16_t choice) { return choice != 0; });
     if (!any_decision || residual() != detail::PhysicalResources{}) {
-        {
-            const auto r = residual();
-            const auto occ = program->physical_occupancy();
-            std::size_t eligible = 0, with_eviction = 0, shared_eligible = 0;
-            for (std::size_t i = 0; i < options.owners.size(); ++i) {
-                const auto& oo = options.owners[i];
-                if (oo.participation == OwnerParticipation::PressureEligible) {
-                    ++eligible;
-                    if (owners[i].shared) { ++shared_eligible; }
-                }
-                if (oo.eviction_choice != 0) { ++with_eviction; }
-            }
-            std::fprintf(stderr,
-                "[planner-no-plan] cand=%u any_decision=%d elig=%zu (shared=%zu) w/evict=%zu "
-                "src=%d shrsrc=%d "
-                "free dev{lanes=%u slots=%u mkv=%u bkf=%u} "
-                "resid dev{lanes=%u slots=%u mkv=%u bkf=%u} host{slots=%u kv=%zu}\n",
-                (unsigned)selected_candidate, (int)any_decision, eligible, shared_eligible,
-                with_eviction,
-                (int)(candidate.impl_->has_source ? 1 : 0),
-                (int)(candidate.impl_->has_shared_source ? 1 : 0),
-                capacity.device.active_lanes - occ.device.active_lanes,
-                capacity.device.state_slots - occ.device.state_slots,
-                capacity.device.main_kv_pages - occ.device.main_kv_pages,
-                capacity.device.backend_kv_pages - occ.device.backend_kv_pages,
-                r.device.active_lanes, r.device.state_slots, r.device.main_kv_pages,
-                r.device.backend_kv_pages, r.host.state_slots, (size_t)r.host.kv_bytes);
-        }
         // No eligible owner, or even evicting every owner does not cover —
         // no feasible plan exists (the evict-all target is the same
         // decisions), so defer.
