@@ -495,6 +495,67 @@ void test_byte_budget_eviction_releases_slots() {
     check(net.size() == 1, "one entry retained under the budget");
 }
 
+// P2.5 Increment 3: an idle (Catalogued) "old copy" unit is evicted BEFORE the
+// actively-serving (Active) session's unit. The pre-Increment-3 lumped live
+// predicate (Active OR Catalogued) could not distinguish them, so a single
+// driven session's frontier competed with stale idle copies for the budget.
+void test_active_vs_idle_tiering() {
+    const auto now = std::chrono::steady_clock::now();
+    const std::size_t sb = 1024;
+
+    auto make_key = [](const char* name) {
+        PreparedSessionKey key;
+        const std::size_t n = std::strlen(name);
+        std::memcpy(key.bytes.data(), name, n);
+        key.size = static_cast<std::uint16_t>(n);
+        return key;
+    };
+    const PreparedSessionKey key_active = make_key("active-session");
+    const PreparedSessionKey key_idle   = make_key("idle-session");
+
+    // Both sessions have live continuations (is_live), but only `active` is
+    // actively being served (is_active).
+    const auto is_live = [&key_active, &key_idle](const std::optional<PreparedSessionKey>& k) {
+        return k.has_value() && (*k == key_active || *k == key_idle);
+    };
+    const auto is_active = [&key_active](const std::optional<PreparedSessionKey>& k) {
+        return k.has_value() && *k == key_active;
+    };
+
+    auto unkeyed = make_entry(3000, 0, sb);        // live, no session key
+    unkeyed.ever_matched = true;
+    unkeyed.last_matched = now;
+    auto idle = make_entry(4000, 1000000, sb);     // live, Catalogued (old copy)
+    idle.ever_matched = true;
+    idle.last_matched = now;
+    idle.session_key = key_idle;
+    auto active = make_entry(5000, 2000000, sb);   // live, Active (being served)
+    active.ever_matched = true;
+    active.last_matched = now;
+    active.session_key = key_active;
+    std::vector<HostKVSafetyNetEntry> entries;
+    entries.push_back(std::move(unkeyed));  // 0
+    entries.push_back(std::move(idle));     // 1
+    entries.push_back(std::move(active));   // 2
+
+    auto victim = HostKVSafetyNet::select_eviction_victim(entries, now, std::chrono::minutes(15),
+                                                          /*allow_pinned=*/false, is_live,
+                                                          /*protect_live_sessions=*/true, is_active);
+    check(victim.has_value() && *victim == 0, "unprotected live evicted first");
+
+    entries.erase(entries.begin());  // drop the unkeyed unit
+    victim = HostKVSafetyNet::select_eviction_victim(entries, now, std::chrono::minutes(15),
+                                                     /*allow_pinned=*/false, is_live,
+                                                     /*protect_live_sessions=*/true, is_active);
+    check(victim.has_value() && *victim == 0, "idle (old copy) evicted before the active session");
+
+    entries.erase(entries.begin());  // drop the idle unit
+    victim = HostKVSafetyNet::select_eviction_victim(entries, now, std::chrono::minutes(15),
+                                                     /*allow_pinned=*/false, is_live,
+                                                     /*protect_live_sessions=*/true, is_active);
+    check(victim.has_value() && *victim == 0, "active session's unit is the last resort");
+}
+
 }  // namespace
 
 int main() {
@@ -502,6 +563,7 @@ int main() {
     test_liveness_eviction();
     test_select_victim_directly();
     test_session_protection();
+    test_active_vs_idle_tiering();
     test_retains();
     test_state_slot_lifecycle();
     test_make_room_for_state_slots();

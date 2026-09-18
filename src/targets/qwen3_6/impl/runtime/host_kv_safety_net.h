@@ -556,6 +556,14 @@ public:
     void set_session_is_live(std::function<bool(const std::optional<qwen3_6::PreparedSessionKey>&)> pred) {
         session_is_live_ = std::move(pred);
     }
+    // P2.5 Increment 3: predicate for the actively-serving session (Active
+    // continuation only). When set, eviction tiers idle (Catalogued) units
+    // between the unprotected-live and active tiers, so old copies are reaped
+    // before the session currently being served. When unset, the active tier
+    // falls back to session_is_live_ (the pre-Increment-3 behavior).
+    void set_session_is_active(std::function<bool(const std::optional<qwen3_6::PreparedSessionKey>&)> pred) {
+        session_is_active_ = std::move(pred);
+    }
     [[nodiscard]] std::chrono::seconds dead_ttl() const noexcept { return dead_ttl_; }
 
     // P2.4 Increment 2: entries hold their state images in HostStatePool slots
@@ -580,16 +588,17 @@ public:
         return slots;
     }
 
-    // Pick the next eviction victim under the shared three-tier policy
-    // (dead-largest, live-smallest, active-session-smallest). The spill loop
-    // drives the pinned phase through allow_pinned. P2.5: one pass covers
-    // every candidate — a protected live unit is returned only when nothing
-    // dead or unprotected-live remains (the per-session guarantee), so a
-    // second unprotected pass could never find more.
+    // Pick the next eviction victim under the shared four-tier policy
+    // (dead-largest, live-smallest, idle-catalogued-smallest, active-smallest).
+    // The spill loop drives the pinned phase through allow_pinned. P2.5: one
+    // pass covers every candidate — an actively-serving (Active) session's unit
+    // is returned only when nothing dead, unprotected-live, or idle (Catalogued
+    // "old copy") remains (the per-session guarantee), so a second pass could
+    // never find more.
     [[nodiscard]] std::optional<std::size_t> select_victim(bool allow_pinned) const noexcept {
         return select_eviction_victim(entries_, std::chrono::steady_clock::now(), dead_ttl_,
                                       allow_pinned, session_is_live_,
-                                      /*protect_live_sessions=*/true);
+                                      /*protect_live_sessions=*/true, session_is_active_);
     }
 
     // Host KV pages and retained state images share ONE host memory budget. The
@@ -668,7 +677,7 @@ public:
 
 
     // Victim selection shared by both eviction loops (retain_state_capture and
-    // the spill's evict loop). Three tiers:
+    // the spill's evict loop). Four tiers:
     //   dead  — never matched, or unmatched for longer than the dead TTL.
     //           The conversation is gone, so re-prefill cost is ZERO: evict
     //           the LARGEST dead entry first (frees the most arena). This is
@@ -676,12 +685,17 @@ public:
     //   live  — matched within the TTL. Re-prefill cost scales with context
     //           length, so evict the SMALLEST first; oldest last-match breaks
     //           ties. (plan.md's cost model, with liveness as the primary key.)
-    //   protected-live — P2.5: live units whose session is still active
-    //           (session_is_live matches a Catalogued/Active continuation)
-    //           are evicted only after every dead and unprotected live unit
-    //           is gone: an active session's unit is a last-resort victim
-    //           (the per-session guarantee). Protection is ordering only —
-    //           the tier is exhausted before selection gives up.
+    //   idle-catalogued — P2.5 Increment 3: live units whose session is
+    //           Catalogued (retained for reuse) but NOT actively being served
+    //           (session_is_live true, session_is_active false) — "old copies".
+    //           Evicted before the active session's unit, so a single driven
+    //           session's frontier is not displaced by stale idle copies.
+    //   active — P2.5: live units whose session is actively being served
+    //           (session_is_active matches an Active continuation) are evicted
+    //           only after every dead, unprotected-live, and idle-catalogued
+    //           unit is gone: an active session's unit is a last-resort victim
+    //           (the per-session guarantee). Protection is ordering only — the
+    //           tier is exhausted before selection gives up.
     // Pinned entries are candidates only in the spill loop's phase 2
     // (allow_pinned); they are always live (pinned right after a find hit).
     [[nodiscard]] static std::optional<std::size_t>
@@ -689,15 +703,30 @@ public:
                            std::chrono::steady_clock::time_point now,
                            std::chrono::seconds dead_ttl, bool allow_pinned,
                            const std::function<bool(const std::optional<qwen3_6::PreparedSessionKey>&)>& session_is_live = nullptr,
-                           bool protect_live_sessions = false) noexcept {
+                           bool protect_live_sessions = false,
+                           const std::function<bool(const std::optional<qwen3_6::PreparedSessionKey>&)>& session_is_active = nullptr) noexcept {
         std::optional<std::size_t> dead;
         std::size_t dead_size = 0;
         std::optional<std::size_t> live;
         std::size_t live_size = 0;
         std::chrono::steady_clock::time_point live_time{};
-        std::optional<std::size_t> live_protected;
-        std::size_t live_protected_size = 0;
-        std::chrono::steady_clock::time_point live_protected_time{};
+        // P2.5 Increment 3: idle (Catalogued) "old copy" units — retained for
+        // reuse but not currently being served. Evicted before the
+        // actively-serving (Active) session's unit.
+        std::optional<std::size_t> live_idle;
+        std::size_t live_idle_size = 0;
+        std::chrono::steady_clock::time_point live_idle_time{};
+        std::optional<std::size_t> live_active;
+        std::size_t live_active_size = 0;
+        std::chrono::steady_clock::time_point live_active_time{};
+        const auto is_active = [&](const HostKVSafetyNetEntry& e) -> bool {
+            if (!e.session_key) { return false; }
+            if (session_is_active) { return session_is_active(*e.session_key); }
+            // No active predicate wired: fall back to the live predicate so the
+            // pre-Increment-3 behavior (all live units in one protected tier)
+            // is preserved.
+            return session_is_live ? session_is_live(*e.session_key) : false;
+        };
         for (std::size_t i = 0; i < entries.size(); ++i) {
             const HostKVSafetyNetEntry& candidate = entries[i];
             if (candidate.pinned && !allow_pinned) { continue; }
@@ -709,11 +738,20 @@ public:
                 if (!dead || size > dead_size) { dead = i; dead_size = size; }
             } else if (protect_live_sessions && candidate.session_key &&
                        session_is_live && session_is_live(*candidate.session_key)) {
-                if (!live_protected || size < live_protected_size ||
-                    (size == live_protected_size && candidate.last_matched < live_protected_time)) {
-                    live_protected = i;
-                    live_protected_size = size;
-                    live_protected_time = candidate.last_matched;
+                if (is_active(candidate)) {
+                    if (!live_active || size < live_active_size ||
+                        (size == live_active_size && candidate.last_matched < live_active_time)) {
+                        live_active = i;
+                        live_active_size = size;
+                        live_active_time = candidate.last_matched;
+                    }
+                } else {
+                    if (!live_idle || size < live_idle_size ||
+                        (size == live_idle_size && candidate.last_matched < live_idle_time)) {
+                        live_idle = i;
+                        live_idle_size = size;
+                        live_idle_time = candidate.last_matched;
+                    }
                 }
             } else if (!live || size < live_size ||
                        (size == live_size && candidate.last_matched < live_time)) {
@@ -724,7 +762,8 @@ public:
         }
         if (dead) { return dead; }
         if (live) { return live; }
-        return live_protected;
+        if (live_idle) { return live_idle; }
+        return live_active;
     }
 
     // Reclaim whole units until `incoming` fits the shared host budget. Eviction
@@ -1047,6 +1086,13 @@ private:
     // silence this long means the conversation is gone (compacted, abandoned).
     std::chrono::seconds dead_ttl_{15 * 60};
     std::function<bool(const std::optional<qwen3_6::PreparedSessionKey>&)> session_is_live_;
+    // P2.5 Increment 3: predicate marking a session as ACTIVELY being served
+    // (its continuation is in the Active role, not merely Catalogued/retained).
+    // session_is_live_ is Active OR Catalogued; session_is_active_ is Active
+    // only. The split lets eviction reap idle (Catalogued) "old copy" units
+    // before the actively-serving session's unit, which the lumped live
+    // predicate could not distinguish.
+    std::function<bool(const std::optional<qwen3_6::PreparedSessionKey>&)> session_is_active_;
     // P2.4 Increment 2: returns a dropped entry's state-image pool slots to the
     // HostStatePool the program owns. Invoked by remove() only — take() /
     // take_pinned() transfer the slots with the entry (the program releases

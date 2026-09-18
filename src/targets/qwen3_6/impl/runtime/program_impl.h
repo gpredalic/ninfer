@@ -1017,6 +1017,21 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
                 }
                 return false;
             });
+        // P2.5 Increment 3: an actively-serving session (Active continuation)
+        // is the LAST eviction victim. An idle session (Catalogued — retained
+        // for reuse, an "old copy") is reaped before it, so a single driven
+        // session's frontier is not displaced by stale copies of idle ones.
+        host_kv_safety_net.set_session_is_active(
+            [this](const std::optional<qwen3_6::PreparedSessionKey>& key) {
+                if (!key) { return false; }
+                for (std::size_t i = 0; i < continuation_slots.size(); ++i) {
+                    if (continuation_slots[i].role != ContinuationSlotRole::Active) {
+                        continue;
+                    }
+                    if (continuation_states[i].session_key == *key) { return true; }
+                }
+                return false;
+            });
         std::size_t minimum_stride = layouts.front().page_stride;
         for (const HostKVPageLayout& layout : layouts) {
             minimum_stride = std::min(minimum_stride, layout.page_stride);
