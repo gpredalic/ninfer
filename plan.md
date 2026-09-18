@@ -1270,6 +1270,16 @@ shared meter.
         headroom`. Sizing rule of thumb: budget ≈ 4 × (largest expected
         single-session unit) for 2 sessions, +1× per additional expected
         concurrent session. Bounded by host RAM (53 GB total).
+        *Concrete (2026-09-18 soak, pre-fix):* a single active Claude Code
+        session — including its sub-agent forks and un-reaped old frontiers —
+        drove the net to ~23–27 GiB (9–25 entries), i.e. ~1 heavy session
+        nearly fills the 30 GiB budget. So the 30 GiB budget fits ~1 heavy
+        session with little headroom, or ~1–2 lighter ones. **Size from the
+        post-fix census, not the pre-fix accumulation:** the tiering (48a975bb)
+        + O2 reaper (552dbeba) trim the dead/idle weight, so the retained
+        *active* working set is smaller than the pre-fix 23–27 GiB. Read
+        `host_kv.tier_census` after a representative workload and size
+        `--host-kv-mib` to `N_sessions × (active + idle tier bytes) + headroom`.
       - **O2 — soft-ceiling dead reaper (guardrail, kill-switch-able).** Dead
         entries (unmatched > `dead_ttl`) are reaped only *under* budget
         pressure (the dead-largest tier of the eviction loop). A bounded idle
