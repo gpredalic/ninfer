@@ -2117,10 +2117,15 @@ unit model; building the unit first makes this cheaper.
       ~1000 tok/s throughout, proving the engine was computing. Fix
       (wedge-sentinel.sh v3.1): a fresh journal throughput line with non-zero
       prefill/decode tok/s is now ALSO progress evidence (a dead engine goes
-      silent or logs 0.0 — it cannot mask a wedge). Follow-up (next deploy
-      window): give /stats + /health a dedicated single-thread server/port
-      (a true reserved slot) so the :8090 dashboard stops suffering the same
-      false outages.
+      silent or logs 0.0 — it cannot mask a wedge). Follow-up — **DONE
+      (2026-09-18, deployed via e2e swap rc=0 + ensure restart):** `--stats-port`
+      (default 0 = off) starts a dedicated single-thread httplib server on a
+      second port serving /stats + /health; the main server keeps both routes
+      for back-compat. Prod runs `--stats-port 8081` (ninfer-ensure.sh ARGS);
+      wedge-sentinel polls 8081 first with 8080 fallback (old-binary safe);
+      the :8090 monitor polls via `--stats-url http://127.0.0.1:8081` (unit
+      updated). Verified live: 8081 /health + /stats OK, 8080 /stats OK,
+      monitor samples fresh from 8081.
       **New findings, 2026-09-17 14:2x (e2e window, investigated 14:5x):**
       (c) **5 consecutive e2e-server crashes** (14:24/14:30/14:36/14:42/
       14:48, each ~107s after startup, identical `cudaEventElapsedTime →
