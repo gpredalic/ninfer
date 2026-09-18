@@ -12416,6 +12416,12 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
         sequence.tail_hidden_valid   = base == prompt_tokens && sequence.tail_hidden_valid;
         sequence.ledger.swap(materialization_ledger_);
         sequence.prefix_identity.swap(materialization_identity_);
+        // Stamp the session key at sequence birth so every spill path (at-ckpt
+        // checkpoint-retain, victim eviction, retain-before-loss) sees it — the
+        // end-of-turn catalogue (below) only covers the active sequence, so a
+        // continuation slot evicted before its own turn catalogues would
+        // otherwise carry no key and classify dead forever.
+        sequence.session_key = request.session_key;
         sequence.prefix_digests.swap(materialization_prefix_digests_);
         sequence.rebuild_work       = request_plan.root_rebuild_work;
         sequence.rebuild_tail_begin = request_plan.root_rebuild_tail_begin;
