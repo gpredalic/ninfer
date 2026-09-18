@@ -1396,6 +1396,17 @@ shared meter.
         headroom`. Sizing rule of thumb: budget ≈ 4 × (largest expected
         single-session unit) for 2 sessions, +1× per additional expected
         concurrent session. Bounded by host RAM (53 GB total).
+        **O1 BLOCKED by host RAM (2026-09-18, post-fix census):** the working
+        set for the current 6-conversation load is ~34.75 GiB (unit_bytes),
+        peak shared 32.7 GiB and still growing, against the 30 GiB budget —
+        but `free` shows only **4 GiB available** (49/53 GiB used). Bumping
+        `--host-kv-mib` to fit the working set (~40 GiB) would push the host
+        into its 16 GiB swap — catastrophic for an inference server. So the
+        overcommit is a **physical RAM hard limit, not a tunable**: the net
+        must evict regardless of the budget, and the lever is the tiering
+        (session keys) so the *right* units (active session) survive, not
+        expanding the budget. O1-as-budget-bump is off the table unless host
+        RAM grows or the per-unit cost drops (O5, breaks the unit invariant).
         *Concrete (2026-09-18 soak, pre-fix):* a single active Claude Code
         session — including its sub-agent forks and un-reaped old frontiers —
         drove the net to ~23–27 GiB (9–25 entries), i.e. ~1 heavy session
