@@ -396,7 +396,36 @@ development. Each is verified with the P0 e2e gate + the live journal.
       materialization snapshots; the engine was actively serving (large-unit
       restores + between-turn idle gaps), misread as a stall from sparse
       snapshots. See the standalone item for the full analysis.
-- [ ] **P1.8 — client abandons queued requests (serve-layer, new 2026-09-16).**
+      **Sentinel misfire 2026-09-18 20:53 (fixed, v3.3 + v3.4):** the
+      sentinel restarted prod at 20:53:55 ("WEDGE-C ARMED ... no engine
+      progress for 150s") and killed a healthy cold prefill ~24s in.
+      Journal-reconstructed timeline: request 36 (250k-token user turn)
+      queued at 20:50:50 (needs 4409 pages, free 3409); the client
+      cancelled it and re-sent as request 37 (post-compaction, 249833
+      tokens, needs 4404) at ~20:52:15; relief-while-queued fired every
+      15s (freed 18-34 pages from idle continuations); at 20:53:31
+      stage-2 released an idle shared prefix (2624 pages), request 37
+      fit and was admitted, cold prefill started. C armed at 20:53:35 —
+      150s after the last counter advance (~20:50:55, request 35's final
+      decode) — and the restart landed 24s into a ~6-min prefill.
+      Why every evidence source was silent: while a demand is queued,
+      the tok/s lines log 0.0/0.0 (no token work) and the /stats counters
+      stay flat (`computed_prefill_tokens` commits at prefill completion).
+      Only the `[relief-kv]` / `[admission] queued KV block` lines showed
+      the fit-gate machinery converging. Two fixes: (v3.3) the journal
+      non-zero-tok/s check now runs on EVERY poll, not just when the
+      /stats poll fails — covers long active prefills (the 2026-09-17
+      21:10 class); (v3.4) fresh `[relief-kv]` / `[admission] queued KV
+      block` lines within 90s count as progress — a queued demand is
+      bounded by its own 120s fit-gate deadline (under the sentinel's
+      150s threshold: an unfitted demand self-aborts at 120s and drains
+      the gauges, disarming C), and a wedged engine cannot emit these
+      lines (scheduler loop frozen). Deployed via `systemctl restart
+      ninfer-wedge-sentinel` (the running bash process never picks up
+      on-disk edits). Exit (c) re-baselined from the v3.4 deploy
+      (21:14): the 20:53 firing is a sentinel defect, not an engine
+      wedge — the engine was converging the demand the whole time.
+- [x] **P1.8 — client abandons queued requests (serve-layer, new 2026-09-16).**
       The user's session showed `finish=cancelled` at queue=29.37s (0 tokens)
       with the client re-sending the same turn 0.5s later (that copy
       succeeded) — and once at 51.3s (post-compaction cold prefill) with no
@@ -436,6 +465,20 @@ development. Each is verified with the P0 e2e gate + the live journal.
       known user-ESC non-defect). Root driver of the long queue waits is the
       device-side overcommit (the RECOVER/re-prefill cycle), so reducing the
       overcommit (P2.4) should reduce these too.
+      **Resolved (2026-09-18, post-P2.4 data):** the queue-wait cancel class
+      is gone with the overcommit fix. Today's user-session queue-wait
+      cancels: 8, all 09:23–19:35 (the RECOVER/overcommit era); after the
+      final binary restored at 20:46, exactly ONE — a 250k cold re-prefill
+      at 20:52 (the session COMPACTED 259929→249833 tokens; the compacted
+      prompt is shorter than the stored unit's checkpoint frontier (259411),
+      so find() cannot match it — a genuine full re-prefill, the P1.9
+      compaction class, not overcommit). The client's hard timeout (77s)
+      cancelled it; the re-send was mid-prefill when the 20:53 sentinel
+      misfire (below) killed it too. The 20:01–20:40 burst of 27 ~120s
+      cancels is e2e-suite traffic on the e2e server (phase 13/14 forced
+      saturation, the e2e client's own timeout) — not user sessions. The
+      early-`message_start` stage is NOT justified (the class is not
+      frequent); it stays the documented next step if it recurs.
 - [x] **P1.9 — generation loops at ~350k context (CLOSED 2026-09-18:
       BEHAVIORAL, not attention/cache — see verdict below).** The user's
       live session, at ~350k tokens of
