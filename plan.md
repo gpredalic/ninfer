@@ -948,8 +948,210 @@ shared meter.
         accepts whole-unit Evict (evicted counter) as the relief mechanism
         alongside demote; builds clean, needs a GPU-exclusive run to verify
         (second 16GB model load would OOM alongside prod — run in a
-        prod-stopped window). Next: e2e full suite + phase 13 with the
-        kill-switch OFF, then ON as control; soak both; commit when directed.
+        prod-stopped window).
+        **E2E verification (2026-09-17 21:2x–21:5x, all on the Inc 2 binary):**
+        - focused suite, switch OFF: rc=0, 0 bad_alloc, restore + safety-net
+          H2D fired, cache reuse > 0.
+        - focused suite, switch ON (control): rc=0, same verdicts — and the
+          focused scenario relieves via the safety-net spill in BOTH (degraded
+          = 0 in both), so the focused suite is behavior-neutral ON/OFF.
+        - phase 13 (state-saturation) + 14 (queued-relief), switch OFF:
+          0 bad_alloc, 0 crashes, 46 spills OK, 39 restores, net accumulated,
+          pool saturated 6/6 — the whole-unit machinery works. BUT 13×
+          `[engine] WORKER RECOVER: isolated-feasible request is blocked in an
+          idle Engine` (phase 13) + 1× (phase 14). Each runs the OOM-recovery
+          path (fail_all_cleanup + catalog clear + re-arm) — a transient
+          liveness stall, self-healing (all requests completed), but 13
+          catalog-clears in a phase is a real quality cost.
+        - phase 13 control, switch ON: CAPPED at 360s (the demote path is slow
+          — 44% of the phase in 360s; a full ON run exceeds the 10-min
+          foreground limit, so it cannot be one blocking command). In the
+          portion it covered: 0 WORKER RECOVER, 11 relief-kv demotes firing
+          (confirms the kill-switch reaches the server). Suggests the demote
+          path avoids the stalls, but not a complete comparison.
+        **Attribution (honest):** the recovery mechanism is pre-existing
+        (020ca885, a general liveness net), not new Inc 2 code. Prod under
+        live (lighter) load shows 0 recoveries since restore — the stalls only
+        appear under the e2e's FORCED state-saturation. Cannot fully attribute
+        the 13 stalls to Inc 2 vs pre-existing (full ON control infeasible in
+        one foreground run; OFF log overwritten). **Verdict: Inc 2 is clean on
+        the hard regressions (crash/bad_alloc) and fine for live load, but
+        under forced state-saturation it self-heals 13× via the catalog-clearing
+        OOM path. Do NOT enable permanently yet.**
+        **Root cause (instrumented, 2026-09-17 22:3x):** the blocked head's
+        deficit is **KV, not state** — the planner's `greedy_cover_target`
+        returns nullopt with `residual dev{slots=0, mkv=50–195, bkf=48–192}`
+        and `any_decision=1` (eviction options ARE generated; `w/evict==elig`,
+        so it is NOT an Inc 2 gate bug). Even evicting every eligible owner
+        (including shared prefixes, which DO get eviction options) does not
+        cover the KV deficit. Why: `resident_resources` (program_impl.h:8412,
+        8460) only counts KV pages with `address_references == 1` — a shared
+        prefix's pages are referenced by the private sessions that fork from
+        it, so `address_references > 1` and the shared prefix's eviction frees
+        ~0 KV. Evicting the private sessions doesn't free the prefix either
+        (still referenced by it). So the shared prefix's device KV is locked:
+        evict-all can't reach it. The **KV-only demote** (retired by Inc 2)
+        was the only mechanism that could free a shared prefix's device KV
+        (move it to host, keeping the references). A targeted state-slot
+        relief (tried, reverted) did not help — the deficit is KV.
+        **Verdict: Inc 2 is clean on the hard regressions (crash/bad_alloc)
+        and fine for live load, but under forced state-saturation it self-heals
+        13–14× via the catalog-clearing OOM path because the shared-prefix KV
+        relief (KV-only demote) is retired. Do NOT enable permanently yet.**
+        **Decision (user, 2026-09-17): implement the fix** — "rare in prod"
+        only holds while ONE session runs; with several concurrent Claude Code
+        sessions (the intended usage) the stall is the steady state, not an
+        edge case. Design below (Slice 3 Increment 3).
+        **Root cause pinned (instrumented, 2026-09-17 22:4x):** the blocked
+        head is a ROOT admission (src=0 shrsrc=0 in all 49 no-plan events)
+        needing a full KV working set; the pool is full of a shared prefix
+        (locked KV) + private sessions (tiny unique KV). `resident_resources`
+        (program_impl.h:8412, 8460) counts only `address_references == 1` pages,
+        so a shared prefix's eviction frees ~0 KV (its pages are referenced by
+        the forking sessions). Evict-all therefore can't free the shared KV —
+        the only mechanism that could was the KV-only demote (retired by Inc 2).
+        A targeted state-slot relief (tried, reverted) did not help (deficit is
+        KV). NOTE: a full ON (demotes-active) phase-13 comparison is infeasible
+        in one foreground run (the demote path is too slow — it capped at 44%),
+        so the 13–14 recoveries are not yet cleanly attributed to Inc 2 vs
+        pre-existing; the mechanism (KV-only demote retired) strongly implicates
+        Inc 2, but the ON control only covered the pre-saturation portion.
+        **Slice 3 Increment 3 — shared-prefix KV relief (DESIGN, 2026-09-17;
+        user-directed after the multi-session exposure call).**
+        *Problem / exposure:* under concurrent sessions that share a large
+        prefix (observed 248k tokens in the e2e; prod will be the same shape
+        with several Claude Code sessions), the device KV pool saturates with
+        (a) the shared prefix's KV — locked: every page has
+        `address_references > 1` (forking sessions alias the prefix's logical
+        pages), so `resident_resources` counts the prefix's eviction as ~0
+        pages (program_impl.h:8460 skips `address_references != 1`) — and
+        (b) the sessions' small unique KV. A root admission then needs a full
+        KV working set (~190 pages) that evict-all cannot free: evicting a
+        session keeps the pages (the prefix still references them); evicting
+        the prefix frees ~0 (the sessions still reference them). The planner
+        returns no plan → `TemporarilyBlocked` → idle engine → the brute-force
+        `WORKER RECOVER` (OOM-recovery path: catalog clear + spill-before-loss
+        + re-arm), 13–14× per forced-saturation phase. Self-healing (no
+        crash, no data loss, all requests complete) but each recovery clears
+        the whole catalog — every session loses its cache and re-prefills.
+        *Why it is not a gate flip (investigated 22:4x):* re-enabling the
+        KV-only demote for shared prefixes would NOT free the pages — a D2H
+        of one address space does not drop the physical page while aliasing
+        address spaces still hold device references (the 19:22 incident is the
+        same law: 7300 "freed" pages, +2–16 actual). Freeing shared KV
+        requires a demote that is aware of the aliasing set.
+        *Design options:*
+        - **A (recommended): unit-complete shared-prefix demote.** A new
+          pressure action that moves the WHOLE shared-prefix unit to host —
+          device KV → host + state image → host (unity preserved: no
+          KV-without-state form). The KV half must be a multi-reference-aware
+          D2H: copy each logical page once, drop ALL device references, so
+          aliasing sessions then see a host-resident replica (the
+          `[kv-not-resident] VALID_BUT_NO_DEVICE` + H2D-restore path already
+          handles host-resident sources — verify for the shared-source case).
+          Frees the device KV pages + the device state slot. Enters the
+          planner's option set as one more option per shared owner (greedy
+          cover seeds it; 30ms planner budget must hold).
+        - **B (stopgap): targeted relief on the stall path.** Extend
+          `relieve_kv_fit` (the Inc 1 structure) with a stage: when a fit-gate
+          / queued stall persists and a shared prefix is the dominant pinned
+          holder, demote that prefix (whole unit) as a relief action — outside
+          the planner. Smaller change, no search-space growth; weaker (reacts
+          on the 15s stall cadence instead of at admission).
+        - **C (rejected): KV-only demote for shared prefixes** — splits the
+          unit (KV host, state device): exactly the class Inc 2 retired.
+        - **D (rejected for now): accept the safety net** — the user's
+          multi-session exposure makes the catalog-clear cost unacceptable.
+        *Phasing (after path approval):*
+        1. **Investigation (no deploy):** answer the open questions; pick A
+           vs B; short design of the chosen path with exact call sites.
+        2. **Implementation + unit tests:** the multi-reference-aware KV
+           demote (or the relief stage); tests pin: demoting a shared prefix
+           frees the device pages once the last aliasing reference is
+           demoted; an aliasing session restores from host (H2D) with no data
+           loss; the unit stays complete (no KV-without-state form).
+        3. **E2E A/B:** phase 13 with the relief ON (expect ~0 recoveries, 0
+           bad_alloc, pool saturates, restores fire) vs OFF (13–14
+           recoveries — the current baseline); focused suite both. A full ON
+           (demotes-active) control does not fit one foreground swap (the
+           demote path is too slow — 44% of phase 13 in 360s); use equivalent
+           partial windows or a reduced-round phase-13 variant for A/B.
+        4. **Prod soak with 2–3 concurrent sessions** (the real scenario):
+           exit = 0 `WORKER RECOVER`, 0 `[planner-no-plan]` at saturation,
+           0 wedge restarts, plausible D2H counts.
+        5. Behind an env kill-switch (default ON after verification;
+           `NINFER_SHARED_PREFIX_RELIEF=0` disables).
+        *Open questions (phase 1):*
+        - Is there a D2H primitive that moves a logical page ONCE and drops
+          every device reference (logical_kv_store.h — `begin_device_to_host`
+          is per-address today; `address_references` is tracked)? If not, the
+          demote is N copies (N = alias count) — bandwidth cost must be
+          bounded (demote coldest/idle prefixes first; never a prefix with an
+          in-flight active request if avoidable).
+        - Who holds device references to a shared prefix's pages at
+          saturation: the prefix's address space + each forking continuation's
+          address space + ActiveMutables? Which are demotable while a session
+          is in flight (the `active` flag)?
+        - Does the H2D-restore / materialization path support a HostOnly
+          SHARED SOURCE for KV (not just state)? (program_impl.h:5571's
+          comment covers state; verify the KV path.)
+        - Host KV budget: a 248k-token prefix's device KV (≈3.9k pages text +
+          backend) vs the 12 GiB e2e / 30 GiB prod arenas under multi-session
+          pressure (the host-state-pool-sizing lesson: two tenants share the
+          arena — net units + demoted replicas).
+        - Checkpoint references on the prefix state (`checkpoint_references`)
+          — the demote must respect them (relief tier-1/tier-2 already model
+          DeviceOnly vs dual-resident).
+        - Restore-latency impact on aliasing sessions after a demote (they
+          pay H2D on their next turn) — measure in e2e (restore counters +
+          ttft delta).
+        - Keep the brute-force recovery as the last-resort backstop (do not
+          remove it).
+        *Status:* **Path A implemented + verified (2026-09-18).**
+        Implementation (uncommitted): `shared_prefix_demotes()` helper
+        (env `NINFER_SHARED_PREFIX_DEMOTES`, default ON) re-enables the
+        demote option for shared-prefix owners only (private units stay
+        demote-free per Inc 2): the KV demote pass in
+        `select_kv_pressure_actions` (new `allow_demote` param; shared
+        callers pass the switch, private callers keep the Inc-2
+        retirement), the `DemoteSharedToHost` state branch, plus a
+        global `active_address_references` guard in `prepare_kv` (turns a
+        would-be `terminate` at publish into a controlled "replica
+        changed" failure — the per-address active check can't see active
+        refs held by OTHER aliasing address spaces). The greedy seed
+        (`greedy_cover_target`) now includes the shared demote move in its
+        efficiency ordering (new `choice` field), so a KV deficit only a
+        demote can cover is seedable instead of deferring before the
+        search runs. `[relief-shared]` log line marks published planner
+        demotes.
+        **Verification (5-round phase 13, 2026-09-18 09:1x):** 0 WORKER
+        RECOVER (baseline: 13–14), 0 bad_alloc, 34/34 requests done, 0
+        errors, pool saturated 6/6, 26 spills OK, 10 restores, net
+        accumulated. Mechanism (log-verified): the demote option in the
+        option space makes the planner's plan FEASIBLE → the head routes
+        through the P1.5(d) queued-relief path (KV occupancy block →
+        relief-while-queued) instead of dead-ending at admission
+        (TemporarilyBlocked → idle engine → liveness throw). The physical
+        page freeing is done by the queued relief's idle-prefix release
+        (`[relief-kv] ... released idle shared prefix (freed 376 pages)`),
+        which is why `[relief-shared]` (planner-published demotes) is 0 in
+        this scenario — the planner's demote is the feasibility key, the
+        queued relief is the physical actor. 3 residual `[planner-no-plan]`
+        events (backend-only residual at that instant) are transient: the
+        head re-inspects, the relief cycle frees the prefix, the head is
+        admitted — self-resolving within one 15s cycle, no liveness
+        recovery. Unit tests: resource_manager_test identical 5 baseline
+        FAILs (no new), context_store_test ok.
+        **Remaining:** (a) the 3 transient no-plans (backend-only
+        residual; self-resolving — acceptable per P1.5(d) visible-queue
+        semantics, but the design's "0 no-plan at saturation" criterion is
+        not literally met); (b) full 8-round A/B (the 8-round phase
+        exceeds the 10-min foreground swap limit; 5 rounds covers the
+        stall window — the baseline's first recovery was in the phase's
+        first minute); (c) prod soak with 2–3 concurrent sessions (the
+        real multi-session test); (d) commit + deploy. The
+        `[planner-no-plan]` diagnostic stays in the binary for the soak
+        (observability), removed with the final cleanup.
 - [x] **P2.5 — Slice 4: unit LRU/retention + per-session guarantee.** One LRU
       over the shared budget, evicting whole units cost-aware smallest-first
       (kills the 19s class: state can no longer outlive its KV's retention
