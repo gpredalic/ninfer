@@ -1405,9 +1405,12 @@ shared meter.
         single-session unit) for 2 sessions, +1× per additional expected
         concurrent session. Bounded by host RAM (53 GB total).
         **O1 BLOCKED by host RAM (2026-09-18, post-fix census):** the working
-        set for the current 6-conversation load is ~34.75 GiB (unit_bytes),
-        peak shared 32.7 GiB and still growing, against the 30 GiB budget —
-        but `free` shows only **4 GiB available** (49/53 GiB used). Bumping
+        set is ~34.75 GiB (unit_bytes), peak shared 32.7 GiB and still
+        growing, against the 30 GiB budget — and it is **ONE logical main
+        session** (user-confirmed 14:4x: no other sessions; the load is the
+        main conversation + its sub-agent forks + old frontiers + its
+        compaction generations), not N concurrent conversations. But `free`
+        shows only **4 GiB available** (49/53 GiB used). Bumping
         `--host-kv-mib` to fit the working set (~40 GiB) would push the host
         into its 16 GiB swap — catastrophic for an inference server. So the
         overcommit is a **physical RAM hard limit, not a tunable**: the net
@@ -1415,6 +1418,14 @@ shared meter.
         (session keys) so the *right* units (active session) survive, not
         expanding the budget. O1-as-budget-bump is off the table unless host
         RAM grows or the per-unit cost drops (O5, breaks the unit invariant).
+        *Key-splitting consequence:* the derived key (system + first user
+        turn) CHANGES at every client compaction, so one logical session
+        spans multiple keys over its life — pre-compaction units look like a
+        different (idle) "session" to the tiering. That is acceptable (they
+        ARE stale after compaction) but means the "distinct keys" count
+        overstates the conversation count; the ~18 GiB stale-frontier pile
+        (11 units in a 72–76k band) is the main session's old fork/frontier
+        weight, the prime trimmable target.
         *Concrete (2026-09-18 soak, pre-fix):* a single active Claude Code
         session — including its sub-agent forks and un-reaped old frontiers —
         drove the net to ~23–27 GiB (9–25 entries), i.e. ~1 heavy session
