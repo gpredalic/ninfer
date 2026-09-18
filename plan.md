@@ -493,11 +493,15 @@ development. Each is verified with the P0 e2e gate + the live journal.
         that cold-root dumps exist, but a restore-path position/attention bug
         could still add to it).
       *Discriminating experiments:*
-      1. **(cheap, no deploy)** Reconstruct one stuck episode's rendered
-         prompt: compare the request-log `prompt_tokens` at that turn against
-         the client transcript's content at the same point; inspect what the
-         model actually sees of its own last N turns (a template drop/misrender
-         would show as a token-count gap or missing recent turns).
+      1. **(DONE 2026-09-18)** Reconstruct what the model sees of its own
+         history: `corr(prompt_tokens, message_count) = 0.91` over 724
+         requests, prompt_tokens grows monotonically with message_count
+         (247k@499 → 381k@618 → 361k@830; dips are compactions, msg_count
+         → 2–49). **The model sees its full history — H-B (template
+         drop/misrender) is empirically ruled out**, complementing the
+         template read (no truncation). The macro-stuck symptom is therefore
+         not "not seeing recent turns" — it is behavioral/attention-quality
+         (H-A), not a rendering gap.
       2. **(READY — `tools/longctx_recall_probe.py`, needs a prod-stopped
          window)** Long-context recall probe: a ~300k-token prompt with
          unique recall codes planted at ~10k/110k/210k/290k (spanning below
