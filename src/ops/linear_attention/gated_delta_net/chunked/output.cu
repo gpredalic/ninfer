@@ -1,14 +1,37 @@
 #include "ops/linear_attention/gated_delta_net/chunked/launch.h"
 #include "ops/linear_attention/gated_delta_net/chunked/output.cuh"
 
+#include <mutex>
+
 namespace ninfer::ops::detail::gated_delta_net::chunked {
 namespace {
 
 namespace kernel = output;
 
-constexpr std::int64_t kRtx5090SmCount = 170;
-constexpr std::int64_t kCtasPerSm      = 4;
-constexpr std::int64_t kTargetCtas     = kRtx5090SmCount * kCtasPerSm;
+constexpr std::int64_t kCtasPerSm = 4;
+
+// The output kernel admits four CTAs per SM under the registered sm_120a build, so the
+// one-wave target is the active device's SM count times four. Querying the running device
+// instead of assuming the 170 SMs of the tuned 5090 keeps the wave balance exact on any
+// SM120 part, e.g. the smaller RTX PRO 4000 Blackwell.
+cudaError_t one_wave_target_ctas(std::int64_t* ctas) {
+    static std::once_flag once;
+    static std::int64_t cached = 0;
+    static cudaError_t status  = cudaSuccess;
+    std::call_once(once, [&] {
+        int device = 0;
+        status     = cudaGetDevice(&device);
+        if (status != cudaSuccess) { device = 0; }
+        int sm = 0;
+        status = cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, device);
+        if (status == cudaSuccess && sm > 0) {
+            cached = static_cast<std::int64_t>(sm) * kCtasPerSm;
+        }
+    });
+    if (status != cudaSuccess) { return status; }
+    *ctas = cached;
+    return cudaSuccess;
+}
 
 template <bool MULTI_JOB>
 cudaError_t launch_fixed(const chunk_output_config& cfg, dim3 grid, head_map qk_map, int chunks) {
@@ -40,10 +63,12 @@ cudaError_t launch_output(const chunk_output_config& cfg) {
     const auto qk_map     = head_map::of((int)cfg.H_qk, (int)cfg.H_v);
     const std::int64_t NT = cfg.L / BT;
 
-    // Keep at most one resident RTX 5090 wave and distribute chunks evenly
-    // across it. Small grids retain one logical job per CTA.
+    // Keep at most one resident wave and distribute chunks evenly across it. Small grids
+    // retain one logical job per CTA.
+    std::int64_t target_ctas = 0;
+    NINFER_GATED_DELTA_NET_PROPAGATE(one_wave_target_ctas(&target_ctas));
     const std::int64_t logical_jobs   = NT * cfg.H_v;
-    const std::int64_t jobs_per_block = (logical_jobs + kTargetCtas - 1) / kTargetCtas;
+    const std::int64_t jobs_per_block = (logical_jobs + target_ctas - 1) / target_ctas;
     const std::int64_t grid_chunks    = (NT + jobs_per_block - 1) / jobs_per_block;
     NINFER_GATED_DELTA_NET_PROPAGATE(v.check_grid(grid_chunks, cfg.H_v));
 
