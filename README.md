@@ -27,6 +27,30 @@ This fork targets **reliable 555k-context inference with 3 concurrent agentic se
   reasoning, 0.2 for the answer). Registered per model; override with
   `--post-thinking-temperature/-top-p/-top-k` or the request's `post_thinking` field.
 
+### GPU scheduling
+
+- **Device-adaptive GDN scheduling**: the Gated DeltaNet (GDN) launch paths no longer assume the
+  tuned part's geometry. The BF16 gating-projection planner queries the active device's SM count
+  and derives cooperative split-K residency from it using the per-SM CTA occupancy of the
+  registered `sm_120a` build (two CTAs/SM for the 27B routes and the 35B split32 route, four for
+  the 35B split16/8/4/2 routes); the GDN chunked output launcher balances its grid to one wave of
+  the active device (SM count times four CTAs). This replaces the previously hardcoded 5090
+  constants (170 SMs, 340/680-CTA cooperative residency, 680-CTA one-wave target) with values
+  derived from the running GPU. Kernels, numerics, and artifacts are unchanged.
+- **Why the change was needed**: cooperative kernels launch only when their entire grid is
+  resident. With the fixed 5090 constants, a smaller SM120 part cannot host the tuned cooperative
+  grids, so the launch failed with `cudaErrorCooperativeLaunchTooLarge` on the first inference
+  step, before any token was produced.
+- **Smaller SM120 parts** (e.g. the 48-SM RTX PRO 4000 Blackwell): the planner keeps the tuned
+  route table but walks a per-geometry split ladder (split 8/4/2 for the 27B geometry,
+  split 16/8/4/2 for the 35B) from the tuned route down to the first fully resident cooperative
+  schedule, falling back to the unsplit route; the fused RMSNorm+gating split32 route is used only
+  while its grid is resident. Scheduling degrades stepwise as the SM count drops instead of
+  failing, and the same `.ninfer` artifact runs on all supported parts.
+- **RTX 5090 compatibility**: on the 170-SM 5090 the derived limits equal the tuned 340/680 CTAs
+  exactly, so schedules, workspace sizes, and outputs are unchanged by this work. The published
+  performance and evaluation tables in this README apply to the 5090.
+
 ### Monitoring and tooling
 
 - **/stats endpoint**: runtime gauges, KV transfer counters, pressure metrics, cache reuse paths.
@@ -137,9 +161,10 @@ See [docs/cli.md](docs/cli.md) and [docs/serving.md](docs/serving.md) for the fu
 list and ranges.
 
 
-## Quick start
+## Build and run
 
-NInfer requires 64-bit Linux, an NVIDIA GeForce RTX 5090, CUDA Toolkit 13.1 or newer, CMake 3.28 or
+NInfer requires 64-bit Linux, an SM120 Blackwell GPU (tuned and measured on the RTX 5090; smaller
+parts such as the RTX PRO 4000 Blackwell are supported), CUDA Toolkit 13.1 or newer, CMake 3.28 or
 newer, a C++20 host compiler, Ninja, `pkg-config`, FFmpeg development libraries
 (`libavformat >= 60`, `libavcodec >= 60`, `libavutil >= 58`, and `libswscale >= 7`), and
 `libcurl >= 7.85`. The build rejects CUDA architectures other than `sm_120a`.
@@ -360,7 +385,7 @@ The 35B-A3B target additionally supports text-only DFlash with draft windows fro
 
 The product boundary remains intentionally small:
 
-- one RTX 5090 and one resident model per Engine;
+- one SM120 Blackwell GPU and one resident model per Engine (tuned for the RTX 5090);
 - a startup-fixed capacity of one to eight active requests with bounded FIFO ingress;
 - no request preemption, priority/QoS, active-request swapping, weight offload, multi-GPU, or
   distributed serving;
