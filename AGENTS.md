@@ -108,7 +108,8 @@ NInfer is a from-scratch C++/CUDA inference engine for maximum single-GPU infere
 a small set of explicitly registered checkpoint artifacts. The supported identities are
 `qwen3.6-27b/groupwise-int`, `qwen3.6-27b/nvfp4`, `qwen3.8-27b/groupwise-int`,
 `qwen3.8-27b/nvfp4`, and `qwen3.6-35b-a3b/groupwise-int`. The current implementation is compiled
-for `sm_120a` and tuned and measured on NVIDIA GeForce RTX 5090. All identities execute Text,
+for `sm_120a` and deployed on RTX PRO 4000 Blackwell-class SM120 hardware; its tuning and
+measurement corpus was collected on an NVIDIA GeForce RTX 5090. All identities execute Text,
 image/video Vision, MTP, prefix reuse, CLI, OpenAI/Anthropic serving, and measurement through the
 same public `.ninfer` Engine route; the 35B-A3B target additionally supports text-only DFlash.
 
@@ -316,7 +317,7 @@ These are conventional project resources, not a checklist of resources every tas
 | conversion report | `out/qwen3_6_27b.ninfer.conversion.json` |
 | normal build | `build/` |
 | profiler output | `profiles/ncu/`, `profiles/nsys/`, `profiles/bench/` |
-| hardware/toolchain | RTX 5090, `sm_120a`, CUDA 13.1 |
+| hardware/toolchain | RTX PRO 4000 Blackwell, `sm_120a`, CUDA 13.1 |
 
 Use the selected Python 3.11 interpreter explicitly. Do not install or upgrade dependencies unless
 the task requires it. Never select an artifact by glob, modification time, or an unqualified
