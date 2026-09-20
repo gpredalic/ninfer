@@ -1010,9 +1010,13 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         if (host_state_images) {
             host_kv_safety_net.set_state_slot_releaser(
                 [pool = host_state_images.get()](const HostKVSafetyNetEntry& entry) {
-                    if (entry.state_slot) { pool->release(*entry.state_slot); }
+                    // Each slot is released exactly once (here, or by the
+                    // program's restore-failure path); the pool's release is a
+                    // generation-checked no-op on stale handles, so the ack is
+                    // informational.
+                    if (entry.state_slot) { (void)pool->release(*entry.state_slot); }
                     if (entry.checkpoint_state_slot) {
-                        pool->release(*entry.checkpoint_state_slot);
+                        (void)pool->release(*entry.checkpoint_state_slot);
                     }
                 });
         }
@@ -5027,7 +5031,10 @@ std::uint32_t ProgramImplCore::relieve_kv_fit(const KvReliefSkip& skip) noexcept
         backend_kv_pages ? backend_kv_pages->physical_pool().available_pages() : 0;
     if (do_shared) {
         try {
-            release_shared_prefix_state(shared_victim, SharedPrefixSlotRole::Catalogued);
+            // Throws on any pinned/invalid state (caught below); the returned
+            // resources are diagnostic only — the freed pages are measured from
+            // the physical pools immediately after.
+            (void)release_shared_prefix_state(shared_victim, SharedPrefixSlotRole::Catalogued);
         } catch (...) { return 0; }
         const std::uint32_t freed =
             (text_kv_pages->physical_pool().available_pages() - free_text_before) +
@@ -6320,7 +6327,9 @@ void ProgramImplCore::prepare_pressure_work(MaterializationTransaction::Pressure
                 // (the store's own fallback only frees dual-resident
                 // replicas). Evict the coldest retained unit — whole
                 // {KV + state} unit, three-tier policy — and retry once.
-                host_kv_safety_net.make_room_for_state_slots(1);
+                // The freed-slot count is informational: the retry below is
+                // what decides whether the pool now fits.
+                (void)host_kv_safety_net.make_room_for_state_slots(1);
                 std::optional<StateImageTransfer> retry =
                     state_store->begin_device_to_host(*source, device.transfer_stream);
                 if (retry) { transfer.emplace(std::move(*retry)); }
@@ -6936,7 +6945,10 @@ bool ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index,
                         // (shared with the store's demoted replicas). Evict
                         // the coldest retained unit (whole {KV + state} unit,
                         // three-tier policy) and retry once.
-                        host_kv_safety_net.make_room_for_state_slots(1);
+                        // The freed-slot count is informational: the retry
+                        // allocate below decides (a still-empty pool degrades
+                        // to no retention).
+                        (void)host_kv_safety_net.make_room_for_state_slots(1);
                         new_slot = host_state_images ? host_state_images->allocate() : std::nullopt;
                     }
                     if (!new_slot) {
@@ -6953,7 +6965,9 @@ bool ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index,
                                         host_view->data, state_bytes);
                             state_slot = std::move(new_slot);
                         } else {
-                            host_state_images->release(*new_slot);
+                            // Freshly allocated and released exactly once here — the
+                            // pool ack is informational.
+                            (void)host_state_images->release(*new_slot);
                             state_bytes = 0;  // host view invalid — skip
                         }
                     } else {
@@ -7022,7 +7036,10 @@ bool ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index,
                     if (!new_slot) {
                         // P2.5 make-room: the pool is exhausted by slot count;
                         // evict the coldest retained unit and retry once.
-                        host_kv_safety_net.make_room_for_state_slots(1);
+                        // The freed-slot count is informational: the retry
+                        // allocate below decides (a still-empty pool degrades
+                        // to no checkpoint capture).
+                        (void)host_kv_safety_net.make_room_for_state_slots(1);
                         new_slot = host_state_images ? host_state_images->allocate() : std::nullopt;
                     }
                     if (!new_slot) {
@@ -7055,7 +7072,9 @@ bool ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index,
                         checkpoint_valid = true;
                         checkpoint_frontier = sequence.rewrite_checkpoint.frontier;
                     } else {
-                        host_state_images->release(*new_slot);
+                        // Freshly allocated and released exactly once here — the
+                        // pool ack is informational.
+                        (void)host_state_images->release(*new_slot);
                         checkpoint_state_bytes = 0;
                     }
                 }
@@ -7128,10 +7147,11 @@ bool ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index,
                          index, sequence.execution_frontier);
             // P2.4 Increment 2: the state images were captured into pool slots
             // before the KV check — return them to the pool (a dropped handle
-            // would leak the slot).
-            if (state_slot && host_state_images) { host_state_images->release(*state_slot); }
+            // would leak the slot; the pool release is a generation-checked
+            // no-op on stale handles, so its success ack is informational).
+            if (state_slot && host_state_images) { (void)host_state_images->release(*state_slot); }
             if (checkpoint_state_slot && host_state_images) {
-                host_state_images->release(*checkpoint_state_slot);
+                (void)host_state_images->release(*checkpoint_state_slot);
             }
             return false;
         }
@@ -7193,8 +7213,13 @@ bool ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index,
                              "ledger=%zu identity=%zu\n",
                              index, entry.execution_frontier, static_cast<int>(checkpoint_valid),
                              checkpoint_frontier, entry.ledger.size(), entry.prefix_identity.size());
-                host_kv_safety_net.add(std::move(entry));
-                return true;
+                // add() rejects an incomplete unit or one over the host-state
+                // budget and returns the entry's resources itself (state slots
+                // via the releaser, arena bytes via the allocation destructors).
+                // Propagate the result: a rejected spill is an eviction (unit
+                // lost), not a demotion (unit retained) - the caller's log and
+                // relief counters must say so.
+                return host_kv_safety_net.add(std::move(entry));
             } else {
                 // A thinking session with an uncaptured checkpoint cannot
                 // serve its next (rewound) turn from an endpoint-only unit,
@@ -7207,12 +7232,13 @@ bool ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index,
                              index, sequence.execution_frontier,
                              sequence.rewrite_checkpoint.frontier);
                 // P2.4 Increment 2: the captured state slot dies with the entry —
-                // return it to the pool.
+                // return it to the pool (the pool release is a generation-checked
+                // no-op on stale handles, so the success ack is informational).
                 if (entry.state_slot && host_state_images) {
-                    host_state_images->release(*entry.state_slot);
+                    (void)host_state_images->release(*entry.state_slot);
                 }
                 if (entry.checkpoint_state_slot && host_state_images) {
-                    host_state_images->release(*entry.checkpoint_state_slot);
+                    (void)host_state_images->release(*entry.checkpoint_state_slot);
                 }
             }
         } else if (checkpoint_valid && entry.checkpoint_state_bytes > 0 &&
@@ -7266,8 +7292,8 @@ bool ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index,
                          "unit retained complete at its checkpoint frontier\n",
                          index, entry.execution_frontier, frontier,
                          entry.ledger.size(), entry.prefix_identity.size());
-            host_kv_safety_net.add(std::move(entry));
-            return true;
+            // Propagate the add() result (eviction vs demotion) as above.
+            return host_kv_safety_net.add(std::move(entry));
         } else {
             std::fprintf(stderr,
                          "[safety-spill] ABORT: index=%u frontier=%u reason=no_state_image — no "
@@ -7285,10 +7311,12 @@ bool ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index,
         std::fprintf(stderr,
                      "[safety-spill] FAIL: index=%u frontier=%u what=%s\n",
                      index, continuation_states[index].execution_frontier, e.what());
-        // P2.4 Increment 2: return any captured state slots to the pool.
-        if (state_slot && host_state_images) { host_state_images->release(*state_slot); }
+        // P2.4 Increment 2: return any captured state slots to the pool
+        // (noexcept cleanup — the release cannot throw and its success
+        // ack is not actionable from a catch handler).
+        if (state_slot && host_state_images) { (void)host_state_images->release(*state_slot); }
         if (checkpoint_state_slot && host_state_images) {
-            host_state_images->release(*checkpoint_state_slot);
+            (void)host_state_images->release(*checkpoint_state_slot);
         }
         try { cudaStreamSynchronize(device.transfer_stream); } catch (...) {}
     } catch (...) {
@@ -7296,10 +7324,12 @@ bool ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index,
         std::fprintf(stderr,
                      "[safety-spill] FAIL: index=%u frontier=%u what=unknown\n",
                      index, continuation_states[index].execution_frontier);
-        // P2.4 Increment 2: return any captured state slots to the pool.
-        if (state_slot && host_state_images) { host_state_images->release(*state_slot); }
+        // P2.4 Increment 2: return any captured state slots to the pool
+        // (noexcept cleanup — the release cannot throw and its success
+        // ack is not actionable from a catch handler).
+        if (state_slot && host_state_images) { (void)host_state_images->release(*state_slot); }
         if (checkpoint_state_slot && host_state_images) {
-            host_state_images->release(*checkpoint_state_slot);
+            (void)host_state_images->release(*checkpoint_state_slot);
         }
         try { cudaStreamSynchronize(device.transfer_stream); } catch (...) {}
     }
@@ -8037,11 +8067,34 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
         // attempt before retrying. Without this, stale reserved_state_count
         // causes a logic_error crash in the retry's guard check.
         for (std::uint32_t i = 0; i < transaction.reserved_state_count; ++i) {
-            try { state_store->release(transaction.reserved_states[i]); } catch (...) {}
+            // These reserved objects must be releasable: the failed prepare
+            // left them unpinned. release() is noexcept, so the try/catch is
+            // defensive only. A refusal means the object is still in use
+            // (pending replica transfer, checkpoint reference, source pin)
+            // and the handle is dropped below - the object, its device slot
+            // and its host slot leak. A stale handle is harmless (the slots
+            // were already returned), so only a valid-but-unreleasable
+            // handle is reported.
+            try {
+                if (state_store->valid(transaction.reserved_states[i]) &&
+                    !state_store->release(transaction.reserved_states[i])) {
+                    std::fprintf(stderr,
+                                 "[materialize] OOM cleanup: reserved StateImage #%u still "
+                                 "in use - state slots leaked\n",
+                                 i);
+                }
+            } catch (...) {}
         }
         transaction.reserved_state_count = 0;
         if (transaction.state_fork_destination) {
-            try { state_store->release(*transaction.state_fork_destination); } catch (...) {}
+            try {
+                if (state_store->valid(*transaction.state_fork_destination) &&
+                    !state_store->release(*transaction.state_fork_destination)) {
+                    std::fprintf(stderr,
+                                 "[materialize] OOM cleanup: fork-destination StateImage "
+                                 "still in use - state slots leaked\n");
+                }
+            } catch (...) {}
             transaction.state_fork_destination.reset();
         }
         transaction.text_activation.reset();
@@ -12002,7 +12055,17 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
             // The rewrite-restore path gets its active state from the source,
             // not from reserved_states.
             if (sequence.reserved_state) {
-                state_store->release(*sequence.reserved_state);
+                // A stale reserved_state must be releasable: it is a
+                // ReservedDestination from a previous turn with no pins or
+                // checkpoint references. If it is still in use, dropping the
+                // handle leaks the object, its device slot and its host slot
+                // - fail the restore exactly like the superseded-endpoint
+                // release below (whose throw is the established convention
+                // for an unreleasable StateImage).
+                if (!state_store->release(*sequence.reserved_state)) {
+                    throw std::logic_error(
+                        "stale reserved StateImage could not be released");
+                }
                 sequence.reserved_state.reset();
             }
             if (sequence.endpoint_valid && sequence.state.read == checkpoint) {
@@ -12443,9 +12506,11 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
             // in-flight H2D copies before continuing.
             try { cudaStreamSynchronize(device.transfer_stream); } catch (...) {}
             // P2.4 Increment 2: the taken entry's state slots died with the
-            // entry — return them to the pool.
+            // entry — return them to the pool (the pool release is a
+            // generation-checked no-op on stale handles, so the ack is
+            // informational).
             for (const auto& s : net_restore_state_slots) {
-                if (s && host_state_images) { host_state_images->release(*s); }
+                if (s && host_state_images) { (void)host_state_images->release(*s); }
             }
             net_restore_state_slots = {};
             // P1.7(b): if the restore failed after an adoption, the address

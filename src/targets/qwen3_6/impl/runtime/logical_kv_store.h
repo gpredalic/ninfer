@@ -1537,7 +1537,23 @@ public:
             if (pages_->active_address_references(logical) != 0) {
                 pages_->release_active_reference(logical);
             }
-            pages_->release_reference(logical, false);
+            // Ownership assumption: after the active-reference release above,
+            // this plain reference is this address space's last claim on the
+            // adopted (shared) page, so the release must succeed. A refusal
+            // (source pin, pending transfer destination, or an all-active
+            // reference set) leaves the reference unreleasable forever -
+            // membership is erased below and no later path touches this page
+            // from this address space: the page and its device replica leak.
+            // This noexcept fallback path only reports the refusal (the
+            // root-prefill fallback must still run); cf. the terminate()
+            // convention for release failures in HostKVExtentStore, below.
+            if (!pages_->release_reference(logical, false)) {
+                std::fprintf(stderr,
+                             "[kv] release_adopted_prefix: adopted page %u of address %u "
+                             "refused reference release - device page retained, "
+                             "reference leaked\n",
+                             page, handle.index_);
+            }
             membership(address, page) = {};
         }
         for (std::uint32_t page = adopted; page < address.page_count; ++page) {
@@ -1549,7 +1565,18 @@ public:
             if (pages_->can_dematerialize(logical)) {
                 pages_->dematerialize(logical, address.reservation);
             } else {
-                pages_->release_reference(logical, pages_->writer_references(logical) != 0);
+                // Dematerialization was refused (shared/pinned/mid-transfer
+                // page). The reference release is then the only way this
+                // address space can give the page back; if it is refused too,
+                // membership is erased below and the page keeps its device
+                // replica forever with this address space's reference leaked.
+                if (!pages_->release_reference(logical, pages_->writer_references(logical) != 0)) {
+                    std::fprintf(stderr,
+                                 "[kv] release_adopted_prefix: fresh page %u of address %u "
+                                 "refused reference release - device replica retained, "
+                                 "reference leaked\n",
+                                 page, handle.index_);
+                }
             }
             membership(address, page) = {};
         }

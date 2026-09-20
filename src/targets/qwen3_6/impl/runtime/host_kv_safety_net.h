@@ -1118,7 +1118,8 @@ public:
         entries_.push_back(std::move(entry));
         // P2.5 Increment 3 (O2): keep the net under the soft ceiling by reaping
         // stale (dead) entries — the just-added entry is fresh, so it is safe.
-        reap_stale_above_ceiling();
+        // The reaped count is diagnostic only: add() succeeds either way.
+        (void)reap_stale_above_ceiling();
         return true;
     }
 

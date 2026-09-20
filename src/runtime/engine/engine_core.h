@@ -84,8 +84,11 @@ public:
             !options.context_cache.max_shared_prefixes) {
             throw std::logic_error("target admission capacity does not match the Engine");
         }
-        std::signal(SIGSEGV, [](int sig) { const char msg[] = "[engine] CRASH: SIGSEGV\n"; ::write(2, msg, sizeof(msg)-1); std::signal(sig, SIG_DFL); ::raise(sig); });
-        std::signal(SIGABRT, [](int sig) { const char msg[] = "[engine] CRASH: SIGABRT\n"; ::write(2, msg, sizeof(msg)-1); std::signal(sig, SIG_DFL); ::raise(sig); });
+        // Crash notes are best effort: the handler runs async-signal-safe code
+        // that immediately restores SIG_DFL and re-raises, so a short or
+        // partial write has no actionable outcome and is dropped deliberately.
+        std::signal(SIGSEGV, [](int sig) { const char msg[] = "[engine] CRASH: SIGSEGV\n"; (void)::write(2, msg, sizeof(msg)-1); std::signal(sig, SIG_DFL); ::raise(sig); });
+        std::signal(SIGABRT, [](int sig) { const char msg[] = "[engine] CRASH: SIGABRT\n"; (void)::write(2, msg, sizeof(msg)-1); std::signal(sig, SIG_DFL); ::raise(sig); });
         std::promise<void> startup;
         std::future<void> started = startup.get_future();
         worker_                   = std::thread([this, startup = std::move(startup)]() mutable {
