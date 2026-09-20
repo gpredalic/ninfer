@@ -18,7 +18,9 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <mutex>
 #include <stdexcept>
+#include <string>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -256,9 +258,30 @@ constexpr int kExpertBK                = 64;
 constexpr int kExpertStages            = 2;
 constexpr int kExpertWarps             = 8;
 constexpr int kExpertThreads           = 32 * kExpertWarps;
-constexpr int kRtx5090SmCount          = 170;
-constexpr int kPrefillBlocksPerSm      = 3;
-constexpr int kPrefillPersistentBlocks = kPrefillBlocksPerSm * kRtx5090SmCount;
+// The persistent expert-GEMM kernels declare __launch_bounds__(threads, 3): the sm_120a build
+// guarantees three resident CTAs per SM, and the SM120 architecture fixes per-SM resources, so
+// only the SM count varies across parts. Querying the running device instead of assuming the
+// 170 SMs of the tuned 5090 keeps the persistent grid one wave on any SM120 part, e.g. the
+// smaller RTX PRO 4000 Blackwell.
+constexpr int kPrefillBlocksPerSm = 3;
+
+int prefill_persistent_blocks() {
+    static std::once_flag once;
+    static int blocks = 0;
+    std::call_once(once, [] {
+        int device = 0;
+        if (cudaGetDevice(&device) != cudaSuccess) { device = 0; }
+        int sm = 0;
+        const cudaError_t err =
+            cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, device);
+        if (err != cudaSuccess || sm <= 0) {
+            throw std::runtime_error(std::string("sparse_moe prefill: cannot query SM count: ") +
+                                     cudaGetErrorString(err));
+        }
+        blocks = kPrefillBlocksPerSm * sm;
+    });
+    return blocks;
+}
 
 template <int ExpertWarps, int ExpertBN>
 __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_q4_gate_up_kernel(
@@ -1185,16 +1208,17 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         }
         CUDA_CHECK(cudaGetLastError());
 
+        const int persistent_blocks = prefill_persistent_blocks();
         const dim3 routed_gate_grid(kIntermediate / (kExpertBM / 2), kExperts);
         if (weights.routed_gate_up.qtype == QType::Q4G64_F16S) {
             if (wide_plan) {
                 sparse_moe_prefill_q4_gate_up_kernel<8, 64>
-                    <<<kPrefillPersistentBlocks, 8 * 32, 0, stream>>>(
+                    <<<persistent_blocks, 8 * 32, 0, stream>>>(
                         grouped_io, offsets, route_job_experts, route_job_columns, route_job_count,
                         routed_gate_codes, routed_gate_scales, routed_activation);
             } else {
                 sparse_moe_prefill_q4_gate_up_kernel<4, 32>
-                    <<<kPrefillPersistentBlocks, 4 * 32, 0, stream>>>(
+                    <<<persistent_blocks, 4 * 32, 0, stream>>>(
                         grouped_io, offsets, route_job_experts, route_job_columns, route_job_count,
                         routed_gate_codes, routed_gate_scales, routed_activation);
             }
@@ -1228,13 +1252,13 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         case QType::Q5G64_F16S:
             if (wide_plan) {
                 sparse_moe_prefill_qx_down_kernel<Q5DownMma, 8, 64>
-                    <<<kPrefillPersistentBlocks, 8 * 32, 0, stream>>>(
+                    <<<persistent_blocks, 8 * 32, 0, stream>>>(
                         routed_activation, offsets, route_job_experts, route_job_columns,
                         route_job_count, routed_down_codes, routed_down_high, routed_down_scales,
                         grouped_io);
             } else {
                 sparse_moe_prefill_qx_down_kernel<Q5DownMma, 4, 32>
-                    <<<kPrefillPersistentBlocks, 4 * 32, 0, stream>>>(
+                    <<<persistent_blocks, 4 * 32, 0, stream>>>(
                         routed_activation, offsets, route_job_experts, route_job_columns,
                         route_job_count, routed_down_codes, routed_down_high, routed_down_scales,
                         grouped_io);
@@ -1243,13 +1267,13 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         case QType::Q6G64_F16S:
             if (wide_plan) {
                 sparse_moe_prefill_qx_down_kernel<Q6DownMma, 8, 64>
-                    <<<kPrefillPersistentBlocks, 8 * 32, 0, stream>>>(
+                    <<<persistent_blocks, 8 * 32, 0, stream>>>(
                         routed_activation, offsets, route_job_experts, route_job_columns,
                         route_job_count, routed_down_codes, routed_down_high, routed_down_scales,
                         grouped_io);
             } else {
                 sparse_moe_prefill_qx_down_kernel<Q6DownMma, 4, 32>
-                    <<<kPrefillPersistentBlocks, 4 * 32, 0, stream>>>(
+                    <<<persistent_blocks, 4 * 32, 0, stream>>>(
                         routed_activation, offsets, route_job_experts, route_job_columns,
                         route_job_count, routed_down_codes, routed_down_high, routed_down_scales,
                         grouped_io);
