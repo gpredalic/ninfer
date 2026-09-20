@@ -1,225 +1,97 @@
-<!-- fork-changelog -->
-## Fork changes vs upstream
+# NInfer
 
-This fork targets **reliable 555k-context inference with 3 concurrent agentic sessions** (Claude Code, etc.) on a single RTX 5090 with NVFP4 KV. It is a clean divergence — upstream has its own host-KV cache implementation; ours is independently developed and battle-tested with real workloads.
+NInfer is a C++/CUDA inference engine built for a single GPU. It runs a small set of Qwen
+checkpoints — Qwen3.6-27B, Qwen3.8-27B, and Qwen3.6-35B-A3B — for text, image/video, tool
+calling, and long-context workloads on one SM120 Blackwell GPU.
 
-### Context cache and eviction
+It is written from scratch. With one model resident on one GPU, there is no framework overhead
+to hide behind — every millisecond of latency comes from the engine itself. NInfer handles the
+whole path: hand-tuned attention and linear-attention (GDN) kernels, CUDA Graph decode,
+speculative heads shipped in the checkpoint, and a context cache that moves KV pages and state
+together between device and pinned host memory. There is no Python runtime, no plugin layer, and
+no weight repacking at load time — the model arrives as one `.ninfer` file and runs as-is.
 
-- **Host-KV safety net** (`--host-kv-mib`, `--host-state-slots`): when device KV is full, evicted continuations are spilled to a pinned host arena (D2H) and restored via H2D on cache reuse. Scatter-gather allocation handles arena fragmentation. Smallest-first eviction with pinned-entry protection. Verified across 140+ requests with 3 concurrent 330k–470k sessions.
-- **Rewrite checkpoint at turn boundary**: checkpoint is captured where the prompt ends (before reasoning begins), not at the execution frontier. Follow-up prompts with `preserve_thinking=off` match the stored ledger up to the checkpoint.
-- **Token stability with `preserve_thinking=off`**: reasoning is dropped from ALL assistant messages when `preserve_thinking=off`, keeping prompt tokens stable across turns. Without this, the last assistant message's reasoning was kept on its turn but dropped on the next, shifting all subsequent tokens and breaking prefix reuse.
-- **Unified checkpoint host demotion**: KV and checkpoint state move together to host, or not at all. The pressure planner evicts entire continuations (KV + state) instead of dropping rewrite checkpoints. State-only safety net entries replace the old `dropped_checkpoint_captures_` side store. Backend KV spill uses scatter-gather (no fragmentation failures). No artificial count or fragment limits.
-- **Pressure accounting fix**: `complete_pressure_delta` no longer overwrites actual freed resources with planned values. Bad_alloc retry path cleans up partial allocations (state images, KV activations, root addresses, restore vectors) before retrying.
+Three design choices stand out:
 
-### Engine robustness
+- **One engine for every surface.** The CLI, the OpenAI-compatible server, and the
+  Anthropic-compatible server all run the same code and the same numerics — behavior never
+  depends on which one you use.
+- **The artifact is the model.** Weights, tokenizer, chat template, and metadata ship in one
+  file; identity is read from the file, not from configuration, so there is nothing to mismatch.
+- **Long context is a first-class feature.** 262k tokens natively, roughly 600k on a 32 GB GPU
+  with YaRN scaling, NVFP4 KV, and host-memory caching.
 
-- **OOM recovery** (`std::bad_alloc` catch): materialization reserve and worker loop catch OOM, clear active state while preserving pending requests, back off admission for 4 iterations, fail all after 8 consecutive recoveries. Bad_alloc retry cleans up partial allocations before retrying `prepare_materialization`.
+## Features
 
-### Context and model
+- **Reasoning control.** Toggle thinking on or off, set reasoning effort, and cap thinking
+  budgets.
+- **Multimodal input.** Send images and video from the CLI or over HTTP — local paths, URLs, or
+  data URIs.
+- **Tool calling.** Function tools are parsed and returned to the client; a tolerant mode
+  recovers calls with malformed wrappers.
+- **Fast decoding.** Speculative decoding (MTP, draft windows 1–5) on every target; text-only
+  DFlash (windows 1–15) on 35B-A3B.
+- **Flexible KV cache.** Choose the format that fits your memory budget: BF16, INT8 group-64,
+  row-scaled FP8, or NVFP4.
+- **Long context.** 262,144 tokens out of the box, extendable with YaRN linear position scaling.
+- **Context reuse.** Repeated prefixes — shared system prompts, private multi-turn history — are
+  cached on device and pinned host instead of recomputed.
+- **Memory headroom.** When memory gets tight, inactive sessions spill to pinned host memory and
+  restore on reuse.
+- **Concurrent decoding.** Up to eight active requests via CUDA Graph decode and chunked
+  prefill.
+- **Compatible APIs.** OpenAI Chat Completions and Responses Core, Anthropic Messages —
+  streaming, token counting, usage, local response state, `/health`, and `/stats`.
+- **Tunable sampling.** Defaults come from the model, with per-request overrides; a post-thinking
+  preset lowers temperature after the reasoning block closes.
+- **Reproducible results.** Deterministic seeds, greedy mode, stop conditions, and an offline
+  perplexity evaluator.
 
-- **YaRN context extension** (`--rope-scaling-factor`, `--rope-scaling-original-context`): linear RoPE scaling to 555k context (c=3+vision) or 600k (c=1). No quality loss measured up to 600k.
-- **NVFP4 KV cache** (`--kv-dtype nvfp4`): 4-bit E2M1 codes + E4M3 group-16 scales. 45% less KV VRAM than int8.
-- **Froggeric v22.5 chat template**: executed from the template file with no-dangling-intent enforcement, effort aliases, leading system-message merge, tool-error tiering, and think-close variant handling.
-- **Tolerant tool-call recovery** (`--tolerant-tool-calls`): recovers complete Qwen calls with malformed wrappers.
-- **Reasoning-effort tier mapping**: High/Max map to XHigh instead of rejecting.
-- **Post-thinking sampling**: a thinking request switches to a dedicated lower-temperature preset
-  from the token after the model closes its reasoning block (e.g. temperature 1.0 while
-  reasoning, 0.2 for the answer). Registered per model; override with
-  `--post-thinking-temperature/-top-p/-top-k` or the request's `post_thinking` field.
+## Quick Start
 
-### GPU scheduling
-
-- **Device-adaptive GDN scheduling**: the Gated DeltaNet (GDN) launch paths no longer assume the
-  tuned part's geometry. The BF16 gating-projection planner queries the active device's SM count
-  and derives cooperative split-K residency from it using the per-SM CTA occupancy of the
-  registered `sm_120a` build (two CTAs/SM for the 27B routes and the 35B split32 route, four for
-  the 35B split16/8/4/2 routes); the GDN chunked output launcher balances its grid to one wave of
-  the active device (SM count times four CTAs). This replaces the previously hardcoded 5090
-  constants (170 SMs, 340/680-CTA cooperative residency, 680-CTA one-wave target) with values
-  derived from the running GPU. Kernels, numerics, and artifacts are unchanged.
-- **Why the change was needed**: cooperative kernels launch only when their entire grid is
-  resident. With the fixed 5090 constants, a smaller SM120 part cannot host the tuned cooperative
-  grids, so the launch failed with `cudaErrorCooperativeLaunchTooLarge` on the first inference
-  step, before any token was produced.
-- **Smaller SM120 parts** (e.g. the 48-SM RTX PRO 4000 Blackwell): the planner keeps the tuned
-  route table but walks a per-geometry split ladder (split 8/4/2 for the 27B geometry,
-  split 16/8/4/2 for the 35B) from the tuned route down to the first fully resident cooperative
-  schedule, falling back to the unsplit route; the fused RMSNorm+gating split32 route is used only
-  while its grid is resident. Scheduling degrades stepwise as the SM count drops instead of
-  failing, and the same `.ninfer` artifact runs on all supported parts.
-- **RTX 5090 compatibility**: on the 170-SM 5090 the derived limits equal the tuned 340/680 CTAs
-  exactly, so schedules, workspace sizes, and outputs are unchanged by this work. The published
-  performance and evaluation tables in this README apply to the 5090.
-
-### Monitoring and tooling
-
-- **/stats endpoint**: runtime gauges, KV transfer counters, pressure metrics, cache reuse paths.
-- **Dedicated stats port** (`--stats-port`): a single-thread server for `/stats` + `/health` on a second port, so pollers (dashboards, health checks) never queue behind streaming handlers during long prefills.
-- **Monitoring dashboard** (`tools/monitor/`): live GPU/util/decode/prefill/TTFT graphs, KV cache occupancy, request log, 12VHPWR sensor.
-- **E2E test suite** (`tools/e2e/`): multi-phase KV eviction, device-KV pressure, slot pressure, trash mode.
-- **Request-log rotation** (`--request-log-max-mib`, `--request-log-keep`): size-based JSONL rotation.
-
-Details: [docs/maintainer/kv-nvfp4-yarn.md](docs/maintainer/kv-nvfp4-yarn.md)
-
-<!-- /fork-changelog -->
-
-
-## Supported Models and Templates
-
-> **⚠️ Artifact incompatibility notice:** This fork is **NOT compatible** with the
-> maintainer's upstream artifact
-> [neroued/Qwen3.8-27B-nvfp4-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer)
-> (23.7 GB). That artifact requires upstream revision `385b30ce` and uses a newer
-> tensor descriptor format that this fork does not support.
->
-> **Use QUASAR or Ostfralla artifacts instead.** Both maintain quality at a
-> significantly smaller size (~17.5 GB vs 23.7 GB):
-> - [MirkoCovizzi/Qwen3.8-27B-QUASAR-NVFP4-NInfer](https://huggingface.co/MirkoCovizzi/Qwen3.8-27B-QUASAR-NVFP4-NInfer/tree/16ccfe7c18f232fd44c56a61e05678ad9bbd711c)
-> - [Ostfralla/Qwen3.8-27B-NVFP4-NInfer](https://huggingface.co/Ostfralla/Qwen3.8-27B-NVFP4-NInfer)
-
-This fork works with any Qwen3.8-27B NVFP4 `.ninfer` artifact from QUASAR or
-Ostfralla converters. The binding auto-detects the GDN control layout (split
-`a_projection`/`b_projection` vs fused `a_b_projection`) and quantization format
-(NVFP4 vs BF16) per layer, so both Ostfralla and QUASAR images work with
-`--weights-profile qwen36-nvfp4`.
-
-### Quick start
+Build (Linux, SM120 Blackwell GPU, CUDA 13.1 or newer):
 
 ```bash
-./build/apps/ninfer-serve <model.ninfer> \
-   --host 0.0.0.0 --port 8080 --kv-dtype nvfp4 --vision \
-   --spec mtp --draft-tokens 5 --lm-head-draft \
-   --tolerant-tool-calls --host-kv-mib 30720 \
-   --rope-scaling-factor 2.12 --rope-scaling-original-context 262144 \
-   --chat-template tests/fixtures/frontend/froggeric_v225_chat_template.jinja \
-   --chat-template-semantics froggeric \
-   --weights-profile qwen36-nvfp4
-```
-
-### Chat template loading
-
-**`--chat-template PATH`** loads a jinja template from disk, overriding the artifact's
-embedded template. No artifact patching needed — any `.ninfer` image works with any
-template. The file is executed: it is the renderer, so its prompt text, tool-instruction
-wording, and message composition are what the engine emits. The engine implements the
-HuggingFace Jinja environment plus the constructs these templates use; an unsupported
-filter fails loudly at load instead of silently rendering different text.
-
-**`--chat-template-semantics MODE`** selects the advertised prompt capabilities and the
-registered-template diagnostic: `auto` (hash-match, default), `froggeric`,
-`thinking-toggle`, `reasoning-effort`, `generic` (accept any template with ThinkingToggle
-capabilities). It no longer selects a separate C++ renderer, because the template is the
-only renderer.
-
-The Froggeric v22.5 template (`tests/fixtures/frontend/froggeric_v225_chat_template.jinja`)
-improves tool-call reliability for agentic workloads with stricter instructions,
-no-dangling-intent enforcement, and think-close variant handling.
-
-### Weights profile
-
-**`--weights-profile PROFILE`** overrides the weights profile resolved from artifact
-identity: `qwen36-nvfp4`, `qwen38-nvfp4`, `qwen36-groupwise-int`, `qwen38-groupwise-int`.
-Use `qwen36-nvfp4` for Ostfralla and QUASAR artifacts that carry the Qwen3.6 NVFP4
-tensor layout (W8G32 embedding + NVFP4 quantization). The binding auto-detects
-per-layer layout differences (fused vs split GDN control, NVFP4 vs BF16 attention).
-
-### Post-thinking sampling
-
-Registered Qwen models carry a **post-thinking preset** (temperature 0.2, top-p 0.95,
-top-k 20). For a thinking request, the engine resolves the normal thinking preset at
-submission and switches to the post-thinking preset from the token after the model closes
-its reasoning block. The answer and tool calls are therefore sampled with the lower
-temperature while reasoning keeps the higher one. Non-thinking requests and models
-without a registered preset are unaffected.
-
-Override per request or per server:
-
-```bash
-# CLI: explicit post-thinking fields, or the combined form
-./build/apps/ninfer model.ninfer --prompt "..." \
-  --post-thinking-temperature 0.2 --post-thinking-top-p 0.95 --post-thinking-top-k 20
-#   --post-thinking-sampler temp=0.2,top_p=0.95,top_k=20
-
-# HTTP: optional post_thinking object (OpenAI Chat, OpenAI Responses, Anthropic Messages)
-curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' \
-  -d '{
-    "model": "qwen3.8-27b",
-    "messages": [{"role": "user", "content": "Hello"}],
-    "temperature": 1.0,
-    "post_thinking": {"temperature": 0.2, "top_p": 0.95, "top_k": 20}
-  }'
-```
-
-Omitted `post_thinking` fields fall back to the model's registered preset; an omitted
-seed inherits the request's resolved seed. `--greedy` forces both phases to exact argmax.
-
-The lower emission temperature is a reliability setting rather than a quality one: see
-[the post-thinking temperature study](docs/maintainer/post-thinking-temperature.md) for the measured
-effect - neutral on accuracy across BFCL v4, AIME and IFBench, with reproducibility of long-form
-answers under load as the measurable contribution.
-See [docs/cli.md](docs/cli.md) and [docs/serving.md](docs/serving.md) for the full field
-list and ranges.
-
-
-## Build and run
-
-NInfer requires 64-bit Linux, an SM120 Blackwell GPU (tuned and measured on the RTX 5090; smaller
-parts such as the RTX PRO 4000 Blackwell are supported), CUDA Toolkit 13.1 or newer, CMake 3.28 or
-newer, a C++20 host compiler, Ninja, `pkg-config`, FFmpeg development libraries
-(`libavformat >= 60`, `libavcodec >= 60`, `libavutil >= 58`, and `libswscale >= 7`), and
-`libcurl >= 7.85`. The build rejects CUDA architectures other than `sm_120a`.
-
-Build the product binaries:
-
-```bash
-git clone https://github.com/Neroued/ninfer.git
-cd ninfer
-
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
-Tests, benchmarks, and maintainer tools are excluded from the default build. There is no install
-target or packaged binary distribution; run NInfer from its source build tree.
-
-Download a compatible QUASAR or Ostfralla artifact with the Hugging Face CLI:
+Download an artifact and send a one-shot request:
 
 ```bash
-# QUASAR (recommended — smaller, tuned for agentic workloads)
-hf download MirkoCovizzi/Qwen3.8-27B-QUASAR-NVFP4-NInfer \
-  --revision 16ccfe7c18f232fd44c56a61e05678ad9bbd711c \
-  --local-dir models
+hf download neroued/Qwen3.8-27B-NVFP4-NInfer --local-dir models
 
-# Ostfralla (abliterated variant)
-hf download Ostfralla/Qwen3.8-27B-NVFP4-NInfer \
-  --local-dir models
+./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
+  --prompt "Explain speculative decoding in two sentences." \
+  --max-context 8192 --max-new 256 \
+  --kv-dtype fp8 --spec mtp --draft-tokens 3 --lm-head-draft
 ```
 
-After download, pass the `.ninfer` file to `ninfer-serve` (filename varies by repo).
+The answer streams to stdout. Loading progress, reasoning, timings, and throughput go to stderr,
+so you can keep them separate (`> answer.txt 2> run.log`). Run `--help` on any binary for its
+options; [docs/cli.md](docs/cli.md) covers thinking, sampling, vision, and media in depth.
 
-Start a long-running text/agent server with two active-request lanes and explicit Device/Host
-checkpoint capacity:
+## Running a Server
+
+`ninfer-serve` loads one artifact and serves OpenAI- and Anthropic-compatible HTTP endpoints.
+Here is a long-running configuration: 240k context, two concurrent requests, MTP speculative
+decoding (3 draft tokens), FP8 KV, and a host cache that holds inactive sessions:
 
 ```bash
 ./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
-  --max-context 240000 \
-  --kv-capacity 240000 \
+  --host 127.0.0.1 --port 8080 \
+  --max-context 240000 --kv-capacity auto \
   --max-concurrency 2 \
   --kv-dtype fp8 \
-  --device-state-slots 2 \
-  --host-state-slots 8 \
-  --host-kv-mib 8192 \
-  --spec mtp --draft-tokens 3 \
-  --lm-head-draft \
+  --spec mtp --draft-tokens 3 --lm-head-draft \
+  --device-state-slots 2 --host-state-slots 8 --host-kv-mib 8192 \
   --preserve-thinking
 ```
 
-Each request has a 240,000-token logical ceiling. A shared 240,000-token Device KV pool serves
-admitted requests; two requests run concurrently when their combined reservations fit. The cache
-tiers provide two Device checkpoint slots, eight pinned Host State slots, and 8 GiB of pinned Host
-KV beyond the two active StateImages.
-
-Send an OpenAI-style request:
+`--kv-capacity auto` sizes the shared KV pool from the memory left after weights, leaving 1 GiB
+of headroom. `--preserve-thinking` keeps a session's closed reasoning in later prompts, which is
+what agent clients want. Add `--vision` for image/video input, `--api-key` to require a bearer
+token, and `--request-log-jsonl` for full-precision per-request records.
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions \
@@ -231,204 +103,172 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   }'
 ```
 
-Run a one-shot CLI request with a 32,768-token allocation:
+[docs/serving.md](docs/serving.md) is the full reference for endpoints, streaming, tools, state,
+token counting, and options.
+
+## Long Context
+
+Long context lets you process more input at once — longer documents, longer conversations —
+without splitting them up. The registered models have a native 262,144-token context. On a 32 GB
+RTX 5090 you can go well beyond it with three settings:
+
+- **KV format** sets the VRAM cost per cached token. NVFP4 KV is 144 bytes per token per KV head
+  versus 264 for INT8 — about 45% less, so more context fits in the same VRAM.
+- **YaRN scaling** (`--rope-scaling-factor`) raises the context ceiling itself; the published
+  checkpoints handle it with no measured quality loss in the tested range.
+- **Host cache** is the safety net: when the device pool is full, inactive sessions — KV pages
+  and checkpoint state together — move to pinned host memory and restore on reuse.
+
+On a 32 GB RTX 5090, the practical ceilings are about 555k tokens per session with three
+concurrent sessions and vision (YaRN factor 2.12), and about 600k for a single session (YaRN
+factor 2.30).
+
+A working configuration for the 555k case:
 
 ```bash
-./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
-  --prompt "Explain prefill and decode, then give a concise conclusion." \
-  --max-context 32768 \
-  --max-new 8192 \
-  --kv-dtype fp8 \
-  --spec mtp --draft-tokens 3 \
-  --lm-head-draft
+./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
+  --host 127.0.0.1 --port 8080 \
+  --max-context 555000 --kv-capacity auto \
+  --max-concurrency 3 \
+  --kv-dtype nvfp4 \
+  --spec mtp --draft-tokens 5 --lm-head-draft \
+  --vision \
+  --rope-scaling-factor 2.12 --rope-scaling-original-context 262144 \
+  --host-kv-mib 36864
 ```
 
-Answer content is written to stdout. Loading progress, reasoning, timings, throughput, memory, and
-speculative-decoding statistics are written to stderr. Use `--messages FILE` and `--vision` for
-structured image/video input; see the [CLI guide](docs/cli.md) and [committed examples](examples/cli/).
+[docs/maintainer/kv-nvfp4-yarn.md](docs/maintainer/kv-nvfp4-yarn.md) has the full VRAM math,
+quality checks, and pressure-test results.
 
-## Resource-aware long-context reuse
+## Performance Features
 
-A reusable prefix checkpoint contains KV and the complete continuation state for its exact prompt
-frontier. A Device-resident checkpoint resumes directly. Under pressure, the planner weighs Device
-retention, pinned Host State/KV, and eviction by immediate restore work and later reuse cost. Active
-requests retain their completion reservations.
+### NVFP4 KV cache
 
-See [Resource scheduling and context cache](docs/maintainer/resource-scheduling-and-context-cache.md)
-for the algorithm and [Serve TTFT benchmark](tools/bench/ttft/) for public-HTTP coverage of hot
-reuse, Host resume, eviction, shared prefixes, scheduling boundaries, and multimodal load.
+The KV cache does not have to be 16-bit. NVFP4 gives the same math with about 45% less cache
+memory: 144 bytes per token per KV head, versus 264 for INT8 group-64 and 512 for BF16. Select it
+with `--kv-dtype nvfp4`. Under the hood, each value is a 4-bit E2M1 code with an E4M3 scale per
+16 elements; queries and keys run quantized directly on Tensor Cores, and values are dequantized
+to BF16 before the value projection.
 
-## Performance
+### MTP speculative decoding
 
-Published measurements use an RTX 5090. [Performance](docs/performance.md) records the exact
-benchmark profiles and methodology.
+Speculative decoding makes generation faster: a small head proposes draft tokens, and the full
+model verifies several of them in one forward pass instead of one token at a time. The published
+checkpoints carry this head built in. Each decode step, it proposes up to *k* draft tokens;
+accepted tokens commit together. Draft windows run 1–5 with `--spec mtp --draft-tokens N`, and
+`--lm-head-draft` loads the optimized proposal head. Published measurements put draft acceptance
+at 45–71% depending on model and workload. On 35B-A3B, the text-only DFlash backend proposes
+1–15-token windows with `--spec dflash --draft-tokens N`.
 
-### Concurrent MTP3 decode
+### Host-KV caching
 
-Saturated decode used INT8 group-64 KV, CUDA Graphs, MTP3, and one 8,192-token generation per active
-request. Values are aggregate committed decode throughput and MTP acceptance from complete
-intervals whose actual decode batch equaled the configured concurrency.
+Host KV caching keeps more sessions alive than VRAM can hold. When the shared device pool cannot
+retain a session, the whole unit — KV pages and checkpoint state together — moves to pinned host
+memory instead of being discarded. When a later request reuses that prefix, the unit restores
+once and runs on device again. It is a tiered cache, not a swap. Size it with `--host-kv-mib`
+(arena size in MiB) and `--host-state-slots` (state images), or give a single `--host-cache-mib`
+budget that splits itself between the two.
 
-| Model profile | C=1 tok/s / accept | C=2 tok/s / accept | C=4 tok/s / accept | C=8 tok/s / accept | C8 / C1 |
-|---|---:|---:|---:|---:|---:|
-| Qwen3.6-27B `groupwise-int` | 185.8 / 68.2% | 247.0 / 69.0% | 309.5 / 68.4% | 535.0 / 68.3% | 2.88× |
-| Qwen3.6-27B `nvfp4` | 202.4 / 69.3% | 399.7 / 71.4% | 699.7 / 69.3% | 1,146.9 / 68.6% | 5.67× |
-| Qwen3.6-35B-A3B `groupwise-int` | 593.0 / 67.2% | 877.7 / 68.2% | 1,166.0 / 69.8% | 1,313.8 / 67.3% | 2.22× |
-| Qwen3.8-27B `nvfp4` | 143.8 / 48.9% | 267.6 / 48.1% | 461.1 / 45.8% | 766.6 / 46.0% | 5.33× |
+### YaRN context extension
 
-### Single-request serving
+YaRN scaling extends the context window beyond the length the model was trained on — the
+difference between "the model stops at 262k" and "the model stops when the KV pool does." It
+compresses RoPE positions beyond the trained context with a linear ramp: positions up to
+`--rope-scaling-original-context` (default 262,144) stay unchanged, and positions beyond are
+divided by `--rope-scaling-factor`. For these checkpoints linear scaling is enough — the RoPE
+configuration means no frequency wrapping in the tested range.
 
-The serial serving corpus used INT8 group-64 KV, CUDA Graphs, a 1,024-token prefill chunk, and five
-fixed seeds after warm-up. The table keeps one short-prefill, one extreme-prefill, and one
-structured-output MTP3 point for each published profile; the full context and scenario matrices are
-in the performance document.
+## Models
 
-| Model profile | 7,680-token prefill | 260,096-token prefill | Structured MTP3 decode |
-|---|---:|---:|---:|
-| Qwen3.6-35B-A3B `groupwise-int` | 15,544.3 tok/s | 5,157.1 tok/s | 770.9 tok/s |
-| Qwen3.6-27B `groupwise-int` | 3,218.1 tok/s | 1,614.8 tok/s | 193.0 tok/s |
-| Qwen3.6-27B `nvfp4` | 11,191.5 tok/s | 2,510.6 tok/s | 252.2 tok/s |
-| Qwen3.8-27B `groupwise-int` | 3,274.7 tok/s | 1,609.7 tok/s | 224.4 tok/s |
-| Qwen3.8-27B `nvfp4` | 8,340.4 tok/s | 2,203.1 tok/s | 219.8 tok/s |
+A model is a single `.ninfer` file — weights, tokenizer, chat template, and metadata in one
+container. Any NInfer binary takes it as its first argument; the model and weight profile are read
+from the file, so there is no configuration and no separate weight download.
 
-## Evaluation
+| Model | Weights | Artifact | Download | Model card |
+|---|---|---|---|---|
+| Qwen3.6-27B | `groupwise-int` | `qwen3_6_27b.ninfer` | [neroued/Qwen3.6-27B-NInfer](https://huggingface.co/neroued/Qwen3.6-27B-NInfer) | [card](model-cards/Qwen3.6-27B-NInfer/README.md) |
+| Qwen3.6-27B | `nvfp4` | `qwen3_6_27b_nvfp4.ninfer` | [neroued/Qwen3.6-27B-nvfp4-NInfer](https://huggingface.co/neroued/Qwen3.6-27B-nvfp4-NInfer) | [card](model-cards/Qwen3.6-27B-nvfp4-NInfer/README.md) |
+| Qwen3.8-27B | `groupwise-int` | `qwen3_8_27b.ninfer` | [neroued/Qwen3.8-27B-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | [card](model-cards/Qwen3.8-27B-NInfer/README.md) |
+| Qwen3.8-27B | `nvfp4` | `qwen3_8_27b_nvfp4.ninfer` | [neroued/Qwen3.8-27B-nvfp4-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) | [card](model-cards/Qwen3.8-27B-nvfp4-NInfer/README.md) |
+| Qwen3.6-35B-A3B | `groupwise-int` | `qwen3_6_35b_a3b.ninfer` | [neroued/Qwen3.6-35B-A3B-NInfer](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer) | [card](model-cards/Qwen3.6-35B-A3B-NInfer/README.md) |
 
-> **Note:** The scores below were measured with the upstream maintainer's artifact.
-> QUASAR and Ostfralla artifacts use the same base model (Qwen3.8-27B) and are
-> expected to produce comparable results (Ostfralla is an abliterated variant with
-> modified refusal behavior). The upstream artifact is not compatible with this
-> fork's current build — see the [artifact notice](#supported-models-and-templates) above.
+All five support the same text, vision, MTP, prefix-reuse, and serving features; 35B-A3B
+additionally supports the text-only DFlash backend. `groupwise-int` is the INT8 weight format
+and `nvfp4` is the 4-bit NVFP4 format with the same mathematics — on a 32 GB GPU the nvfp4
+artifacts leave the most headroom for context. The weight profile is normally resolved from
+artifact identity; `--weights-profile` on the server overrides it for alternative builds of the
+same model.
 
-Capability scores were measured through NInfer's OpenAI-compatible serving route with thinking
-enabled, MTP3, and EvalScope 1.9.0 (0-shot, rule scoring, one sample per problem):
+## Compatibility
 
-| Model profile | AIME 2025 | AIME 2026 | GPQA-Diamond | ERQA | RealWorldQA |
-|---|---:|---:|---:|---:|---:|
-| [Qwen3.6-27B groupwise-int](model-cards/Qwen3.6-27B-NInfer/README.md) | 86.67% | 93.33% | 86.87% | — | — |
-| [Qwen3.6-27B NVFP4](model-cards/Qwen3.6-27B-nvfp4-NInfer/README.md) | 93.33% | 93.33% | 84.34% | — | — |
-| [Qwen3.6-35B-A3B groupwise-int](model-cards/Qwen3.6-35B-A3B-NInfer/README.md) | 90.00% | 90.00% | 85.35% | — | — |
-| [Qwen3.8-27B groupwise-int](model-cards/Qwen3.8-27B-NInfer/README.md) | 96.67% | 96.67% | 87.37% | 66.25% | 82.22% |
-| [Qwen3.8-27B NVFP4](model-cards/Qwen3.8-27B-nvfp4-NInfer/README.md) | 96.67% | 96.67% | 90.40% | 66.25% | 83.53% |
+**Hardware.** 64-bit Linux, one SM120 Blackwell GPU, CUDA Toolkit 13.1 or newer. The build
+targets `sm_120a` and is tuned on the RTX 5090, but it adapts to the GPU it finds at startup —
+smaller SM120 parts (for example RTX PRO 4000 Blackwell) run the same artifacts.
 
-The Qwen3.6 rows used temperature 0.6 and presence penalty 1.0; the Qwen3.8 rows used temperature
-1.0 and presence penalty 0.0. Multimodal evaluation used `--vision` and an 81,920-token context
-limit. Text evaluation used 262,144 tokens except Qwen3.8-27B NVFP4, which used 252,928 tokens to
-fit the RTX 5090 after weights. Each score is one sample per problem; model cards contain the
-correct/total counts and evaluation notes.
+**Clients.** Any OpenAI- or Anthropic-compatible SDK works — point it at the server's base URL
+and set the API key when one is configured:
 
-### Perplexity
+- OpenAI Chat Completions: history, streaming, tools, usage
+- OpenAI Responses Core: typed items, local response state, prompt token counting
+- Anthropic Messages: messages, streaming, counting
+- `/health` and `/stats` for liveness and an operational snapshot
 
-Run the fixed four-domain quick corpus through the artifact's tokenizer and Text model:
+Tool calls are parsed and returned; NInfer does not execute tools. Vision arrives as
+`image_url` / `video_url` parts on a server started with `--vision`.
+
+**Scope.** One GPU and one resident model per process. Up to eight active requests, served in
+arrival order: no preemption, no priority, no weight offload, no multi-GPU. One shared KV pool
+serves every active request and every retained prefix.
+
+## Building
+
+Requirements: 64-bit Linux, an SM120 Blackwell GPU, CUDA 13.1 or newer, CMake 3.28 or newer, a
+C++20 host compiler, Ninja, `pkg-config`, FFmpeg development libraries (`libavformat`,
+`libavcodec`, `libavutil`, `libswscale`), and `libcurl`. The build rejects CUDA architectures
+other than `sm_120a`.
 
 ```bash
-./build/apps/ninfer-perplexity models/qwen3_8_27b_nvfp4.ninfer \
-  --corpus eval/corpora/perplexity-1m/manifest.json \
-  --quick --kv-dtype fp8
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
 ```
 
-The evaluator reports token-weighted fixed-window causal perplexity and writes a complete JSON
-record under `profiles/perplexity/`. See [Perplexity evaluation](docs/perplexity.md) for the metric,
-corpus, custom-text mode, and comparison rules.
+This produces `build/apps/ninfer` (one-shot CLI), `build/apps/ninfer-serve` (HTTP server), and
+`build/apps/ninfer-perplexity` (offline perplexity evaluator). Tests, benchmarks, and maintainer
+tools are off by default; run the binaries from the build tree — there is no install target.
 
-## Startup notes
-
-GPU residency is fixed at process startup. `--spec` selects speculative decoding residency, and
-`--vision` selects Vision residency. DFlash is available for text-only Qwen3.6-35B-A3B execution.
-
-## Docker
-
-Build the runtime image on a host with the NVIDIA Container Toolkit:
+A Docker build is included (requires the NVIDIA Container Toolkit):
 
 ```bash
 docker build --tag ninfer:local .
+docker run --rm --gpus '"device=0"' -p 8080:8080 -v "$PWD/models:/models:ro" ninfer:local \
+  ninfer-serve /models/qwen3_8_27b_nvfp4.ninfer --host 0.0.0.0
 ```
 
-Mount the downloaded model and run the same example server profile:
+## Contributing
 
-```bash
-docker run --rm \
-  --gpus '"device=0"' \
-  --publish 8080:8080 \
-  --volume "$PWD/models:/models:ro" \
-  ninfer:local \
-  ninfer-serve /models/qwen3_8_27b_nvfp4.ninfer \
-  --host 0.0.0.0 \
-  --max-context 240000 \
-  --kv-capacity 240000 \
-  --max-concurrency 2 \
-  --kv-dtype fp8 \
-  --device-state-slots 2 \
-  --host-state-slots 8 \
-  --host-kv-mib 8192 \
-  --spec mtp --draft-tokens 3 \
-  --lm-head-draft \
-  --preserve-thinking
-```
-
-## Capabilities and limits
-
-All registered model IDs support:
-
-- text generation with thinking and non-thinking prompt modes;
-- image, multi-image, video, and mixed multimodal messages;
-- chunked prefill, exact-batch CUDA Graph decode, and startup-bounded batched decode;
-- MTP speculative decoding with draft windows from one to five;
-- BF16, INT8 group-64, and row-scaled FP8 E4M3 KV storage;
-- offline causal-perplexity scoring with the same Text model and selectable KV storage;
-- private and shared exact-prefix reuse with Device/Host State and KV retention;
-- model-aware sampling defaults, explicit sampler overrides, and a registered post-thinking
-  preset that takes over from the token after the model closes its reasoning block;
-- OpenAI Responses Core, OpenAI Chat Completions, and Anthropic Messages, including streaming,
-  tools, local response state, token counting, and usage accounting.
-
-The 35B-A3B target additionally supports text-only DFlash with draft windows from one to fifteen.
-
-The product boundary remains intentionally small:
-
-- one SM120 Blackwell GPU and one resident model per Engine (tuned for the RTX 5090);
-- a startup-fixed capacity of one to eight active requests with bounded FIFO ingress;
-- no request preemption, priority/QoS, active-request swapping, weight offload, multi-GPU, or
-  distributed serving;
-- one shared startup-fixed KV pool across active requests and retained prefixes;
-- no runtime model discovery or unregistered checkpoint fallback;
-- parsed tool calls are returned to the client; NInfer does not execute tools;
-- the in-tree C++ headers are not distributed as an installed SDK.
-
-`--max-context` is each sequence's logical limit. `--kv-capacity` sizes the shared Main Text KV pool
-used by active requests and retained prefixes; `auto` resolves the largest legal capacity at
-startup from the memory remaining after weights while keeping 1 GiB of sizing headroom. Explicit
-capacities remain fixed for the process lifetime.
+Start with an Issue that describes the problem, the affected contract, and the expected behavior.
+[CONTRIBUTING.md](CONTRIBUTING.md) covers bug reports, the performance-evidence bar, and how scope
+decisions are made; the [maintainer docs](docs/maintainer/) are the reference for architecture and
+Op contracts.
 
 ## Documentation
 
-- [Documentation index](docs/README.md)
-- [CLI](docs/cli.md)
-- [HTTP serving](docs/serving.md)
-- [Performance](docs/performance.md)
-- [Perplexity evaluation](docs/perplexity.md)
-- [Resource scheduling and context cache](docs/maintainer/resource-scheduling-and-context-cache.md)
-- [Serve TTFT benchmark](tools/bench/ttft/)
-- [CLI examples](examples/cli/)
-- [Contributing](CONTRIBUTING.md)
+| Document | What it covers |
+|---|---|
+| [docs/README.md](docs/README.md) | full documentation map |
+| [CLI](docs/cli.md) | text, chat history, image/video input, sampling, MTP, runtime options |
+| [HTTP serving](docs/serving.md) | endpoints, streaming, tools, state, token counting, options |
+| [Performance](docs/performance.md) | RTX 5090 measurements, MTP/DFlash results, methodology |
+| [Perplexity](docs/perplexity.md) | offline causal perplexity evaluation |
+| [Context cache](docs/maintainer/resource-scheduling-and-context-cache.md) | KV capacity, checkpoint ownership, Device/Host replica policy |
+| [NVFP4 KV + YaRN](docs/maintainer/kv-nvfp4-yarn.md) | long-context storage and scaling |
+| [CLI examples](examples/cli/) | committed text, multimodal, and long-context inputs |
+| [Model cards](model-cards/) | per-artifact evaluation notes |
 
-Run the relevant `--help` for the exact current option contract.
+For exact option names and defaults, run `--help`.
 
 ## License
 
-NInfer is licensed under the [Apache License 2.0](LICENSE).
-
-The published artifacts are derived from
-[Qwen/Qwen3.6-27B](https://huggingface.co/Qwen/Qwen3.6-27B),
-[Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B), and
-[Qwen/Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B). This fork uses QUASAR and
-Ostfralla NVFP4 artifacts for Qwen3.8-27B, which maintain quality at a significantly smaller
-size than the upstream maintainer's artifact:
-[MirkoCovizzi/Qwen3.8-27B-QUASAR-NVFP4-NInfer](https://huggingface.co/MirkoCovizzi/Qwen3.8-27B-QUASAR-NVFP4-NInfer/tree/16ccfe7c18f232fd44c56a61e05678ad9bbd711c)
-and
-[Ostfralla/Qwen3.8-27B-NVFP4-NInfer](https://huggingface.co/Ostfralla/Qwen3.8-27B-NVFP4-NInfer).
-The Qwen3.8-27B NVFP4 weights are derived from
-[unsloth/Qwen3.8-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4). The Qwen3.6-27B NVFP4 artifact
-also uses the fixed packed weights from
-[rdtand/Qwen3.6-27B-PrismaSCOUT-Blackwell-NVFP4-BF16-vllm](https://huggingface.co/rdtand/Qwen3.6-27B-PrismaSCOUT-Blackwell-NVFP4-BF16-vllm).
-These source repositories are distributed under Apache-2.0. Vendored dependencies retain their own license files
-under `third_party/`.
+NInfer is licensed under [Apache-2.0](LICENSE). Published artifacts are derived from Qwen
+checkpoints distributed under Apache-2.0; the model cards record per-artifact provenance.
+Vendored dependencies retain their own licenses under `third_party/`.
