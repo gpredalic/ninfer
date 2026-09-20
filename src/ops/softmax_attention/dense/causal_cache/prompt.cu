@@ -29,22 +29,43 @@ void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor&
         cudaFuncSetAttribute(causal_attention_prompt_i8_kernel<Geometry, Metadata>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, kCausalPromptI8SmemBytes);
     CUDA_CHECK(attr_i8);
+    static const cudaError_t attr_i8_gqa =
+        cudaFuncSetAttribute(causal_attention_prompt_i8_gqa_kernel<Geometry, Metadata>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, kCausalPromptI8SmemBytes);
+    CUDA_CHECK(attr_i8_gqa);
 
     const auto tokens = static_cast<std::int32_t>(q.ne[2]);
     if (cache.dtype == DType::I8) {
-        const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kCausalPromptI8Br)),
-                                  static_cast<unsigned>(Geometry::QHeads), 1u);
         const Tensor& cache_k_scale = cache.k_scale_pages;
         const Tensor& cache_v_scale = cache.v_scale_pages;
-        causal_attention_prompt_i8_kernel<Geometry, Metadata>
-            <<<attention_grid, kCausalPromptI8Threads, kCausalPromptI8SmemBytes, stream>>>(
-                static_cast<const __nv_bfloat16*>(q.data),
-                static_cast<const std::int8_t*>(cache_k.data),
-                static_cast<const std::int8_t*>(cache_v.data),
-                static_cast<const __half*>(cache_k_scale.data),
-                static_cast<const __half*>(cache_v_scale.data), metadata,
-                static_cast<const std::int32_t*>(positions.data), scale,
-                static_cast<__nv_bfloat16*>(out.data), tokens);
+        if constexpr (Geometry::GroupSize > 1) {
+            // PackGQA: one CTA per KV head. The Br=64 rows pack (token, qh-in-group) pairs, so
+            // every K/V tile is loaded once and shared by all G Q heads of the group.
+            const dim3 attention_grid(
+                static_cast<unsigned>(div_up(tokens * Geometry::GroupSize, kCausalPromptI8Br)),
+                static_cast<unsigned>(Geometry::KVHeads), 1u);
+            causal_attention_prompt_i8_gqa_kernel<Geometry, Metadata>
+                <<<attention_grid, kCausalPromptI8Threads, kCausalPromptI8SmemBytes, stream>>>(
+                    static_cast<const __nv_bfloat16*>(q.data),
+                    static_cast<const std::int8_t*>(cache_k.data),
+                    static_cast<const std::int8_t*>(cache_v.data),
+                    static_cast<const __half*>(cache_k_scale.data),
+                    static_cast<const __half*>(cache_v_scale.data), metadata,
+                    static_cast<const std::int32_t*>(positions.data), scale,
+                    static_cast<__nv_bfloat16*>(out.data), tokens);
+        } else {
+            const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kCausalPromptI8Br)),
+                                      static_cast<unsigned>(Geometry::QHeads), 1u);
+            causal_attention_prompt_i8_kernel<Geometry, Metadata>
+                <<<attention_grid, kCausalPromptI8Threads, kCausalPromptI8SmemBytes, stream>>>(
+                    static_cast<const __nv_bfloat16*>(q.data),
+                    static_cast<const std::int8_t*>(cache_k.data),
+                    static_cast<const std::int8_t*>(cache_v.data),
+                    static_cast<const __half*>(cache_k_scale.data),
+                    static_cast<const __half*>(cache_v_scale.data), metadata,
+                    static_cast<const std::int32_t*>(positions.data), scale,
+                    static_cast<__nv_bfloat16*>(out.data), tokens);
+        }
     } else {
         const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kCausalPromptBr)),
                                   static_cast<unsigned>(Geometry::QHeads), 1u);
