@@ -27,8 +27,8 @@ Three design choices stand out:
   budgets.
 - **Multimodal input.** Send images and video from the CLI or over HTTP — local paths, URLs, or
   data URIs.
-- **Tool calling.** Function tools are parsed and returned to the client; a tolerant mode
-  recovers calls with malformed wrappers.
+- **Tool calling.** Function tools are parsed and returned to the client; well-formed calls
+  recover as structured tool calls even when wrapped in prose or quoted in values.
 - **Fast decoding.** Speculative decoding (MTP, draft windows 1–5) on every target; text-only
   DFlash (windows 1–15) on 35B-A3B.
 - **Flexible KV cache.** Choose the format that fits your memory budget: BF16, INT8 group-64,

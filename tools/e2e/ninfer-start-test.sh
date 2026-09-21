@@ -38,7 +38,7 @@ nohup bash -c './build/apps/ninfer-serve "$1" \
   --max-concurrency 3 --max-context 32768 --kv-capacity 65536 \
   --default-max-tokens 131072 --pending-timeout-ms 900000 \
   --kv-dtype nvfp4 --spec mtp --draft-tokens 5 --lm-head-draft \
-  --tolerant-tool-calls --host-kv-mib $HOST_KV_MIB --max-shared-prefixes 6 --max-private-continuations $MAX_CONTINUATIONS \
+  --host-kv-mib $HOST_KV_MIB --max-shared-prefixes 6 --max-private-continuations $MAX_CONTINUATIONS \
   --temperature 1.0 --top-p 0.95 --top-k 20 \
   --rope-scaling-factor 2.12 --rope-scaling-original-context 262144 \
   --request-log-jsonl ~/ninfer-requests.jsonl --request-log-max-mib 64 --request-log-keep 4 \

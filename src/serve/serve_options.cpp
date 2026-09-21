@@ -82,7 +82,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--default-max-tokens N] [--default-thinking-budget N] "
            "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] "
-           "[--tolerant-tool-calls] [--cors] "
+           "[--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy] [--post-thinking-temperature F]\n"
            "       serves OpenAI Responses/Chat Completions and Anthropic Messages endpoints\n"
@@ -105,8 +105,6 @@ std::string serve_usage_text(const char* argv0) {
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
-           "       --tolerant-tool-calls recovers complete Qwen calls with malformed wrapper/suffix output\n"
-"       or when the request declared no tools (any syntactically valid tool name is accepted)\n"
            "       context cache defaults: device-state=max-concurrency, private=2x concurrency, "
            "shared=concurrency, anchors=2; Host state=8 slots, Host KV=8192 MiB\n"
            "       --device-state-slots is extra checkpoint capacity beyond active lanes; "
@@ -331,8 +329,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.allow_prefix_reuse = false;
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
-        } else if (arg == "--tolerant-tool-calls") {
-            options.tolerant_tool_calls = true;
         } else if (arg == "--no-thinking") {
             options.enable_thinking = false;
         } else if (arg == "--preserve-thinking") {

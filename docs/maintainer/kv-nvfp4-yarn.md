@@ -169,7 +169,7 @@ At 7.7M tokens, scaled RoPE position is 20% of the 38M period — no wrapping.
 ## Production Configuration
 
 ```bash
-./build/apps/ninfer-serve ~/ninfer-models/qwen3_8_27b_nvfp4-froggeric.ninfer   --host 0.0.0.0 --port 8080   --max-concurrency 3 --max-context 555000 --kv-capacity auto   --default-max-tokens 131072 --pending-timeout-ms 900000   --kv-dtype nvfp4 --spec mtp --draft-tokens 5 --lm-head-draft   --tolerant-tool-calls --vision --host-kv-mib 36864   --temperature 0.7 --top-p 0.8   --rope-scaling-factor 2.12 --rope-scaling-original-context 262144   --request-log-jsonl ~/ninfer-requests.jsonl   --request-log-max-mib 64 --request-log-keep 4
+./build/apps/ninfer-serve ~/ninfer-models/qwen3_8_27b_nvfp4-froggeric.ninfer   --host 0.0.0.0 --port 8080   --max-concurrency 3 --max-context 555000 --kv-capacity auto   --default-max-tokens 131072 --pending-timeout-ms 900000   --kv-dtype nvfp4 --spec mtp --draft-tokens 5 --lm-head-draft   --vision --host-kv-mib 36864   --temperature 0.7 --top-p 0.8   --rope-scaling-factor 2.12 --rope-scaling-original-context 262144   --request-log-jsonl ~/ninfer-requests.jsonl   --request-log-max-mib 64 --request-log-keep 4
 ```
 
 - c=3 concurrent sessions with vision support

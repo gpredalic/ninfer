@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <optional>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
@@ -248,9 +249,64 @@ std::string_view remove_parameter_framing_newlines(std::string_view text) {
     return text.substr(begin, end - begin);
 }
 
+// Tolerant-mode JSON repair for the malformed-argument class observed in production: a
+// dropped outer bracket (e.g. `"ls ..."]` — an array string missing its `[`). The bracket
+// families are balanced outside JSON strings; a deficit of exactly one opening bracket (or a
+// surplus of one closing bracket) is repaired by adding it. A candidate is only accepted when
+// the repaired text fully parses, so a repair can never change a valid value.
+std::optional<Json> repair_json_brackets(std::string_view value) {
+    const auto balance = [](std::string_view text, char open, char close) {
+        int result = 0;
+        bool in_string = false;
+        for (std::size_t i = 0; i < text.size(); ++i) {
+            const char c = text[i];
+            if (in_string) {
+                if (c == '\\' && i + 1 < text.size()) { ++i; }
+                else if (c == '"') { in_string = false; }
+            } else if (c == '"') {
+                in_string = true;
+            } else if (c == open) {
+                ++result;
+            } else if (c == close) {
+                --result;
+            }
+        }
+        return result;
+    };
+    const auto try_parse = [](std::string_view candidate) {
+        Json parsed = Json::parse(candidate, nullptr, false);
+        return parsed.is_discarded() ? std::optional<Json>{}
+                                     : std::make_optional(std::move(parsed));
+    };
+    const int square = balance(value, '[', ']');
+    const int curly  = balance(value, '{', '}');
+    if (square == -1 && curly == 0) {
+        if (auto repaired = try_parse("[" + std::string(value))) { return repaired; }
+    } else if (square == 1 && curly == 0) {
+        if (auto repaired = try_parse(std::string(value) + "]")) { return repaired; }
+    } else if (curly == -1 && square == 0) {
+        if (auto repaired = try_parse("{" + std::string(value))) { return repaired; }
+    } else if (curly == 1 && square == 0) {
+        if (auto repaired = try_parse(std::string(value) + "}")) { return repaired; }
+    }
+    return std::nullopt;
+}
+
+// Qwen's format anchors each structural open tool-call marker to the start of a line.
+// Prose that quotes the format does not, and those quoted markers must not become
+// recovery candidates.
+bool is_line_anchored_marker(std::string_view text, std::size_t marker) {
+    for (std::size_t i = marker; i > 0; --i) {
+        const char c = text[i - 1];
+        if (c == '\n') { return true; }
+        if (c != ' ' && c != '\t' && c != '\r') { return false; }
+    }
+    return true; // start of the whole output
+}
+
 bool parse_parameter(std::string_view inner, std::size_t& pos, Json& args,
                      std::string_view tool_name, const ToolArgumentTypeContracts& contracts,
-                     bool last_close) {
+                     bool last_close, bool tolerant) {
     constexpr std::string_view kParamOpen  = "<parameter=";
     constexpr std::string_view kParamClose = "</parameter>";
     if (!starts_with_at(inner, pos, kParamOpen)) { return false; }
@@ -285,6 +341,9 @@ bool parse_parameter(std::string_view inner, std::size_t& pos, Json& args,
     if (contract == nullptr) {
         const std::string legacy_value = trim_ascii(encoded_value);
         Json parsed                    = Json::parse(legacy_value, nullptr, false);
+        if (parsed.is_discarded() && tolerant) {
+            parsed = repair_json_brackets(legacy_value).value_or(std::move(parsed));
+        }
         args[key] = parsed.is_discarded() ? Json(legacy_value) : std::move(parsed);
     } else {
         const std::string value(remove_parameter_framing_newlines(encoded_value));
@@ -292,6 +351,9 @@ bool parse_parameter(std::string_view inner, std::size_t& pos, Json& args,
             args[key] = value;
         } else {
             Json parsed = Json::parse(value, nullptr, false);
+            if (parsed.is_discarded() && tolerant) {
+                parsed = repair_json_brackets(value).value_or(std::move(parsed));
+            }
             if (parsed.is_discarded()) { return false; }
             args[key] = std::move(parsed);
         }
@@ -334,7 +396,7 @@ bool parse_one_tool_call(std::string_view block, std::size_t max_name_length,
     for (;;) {
         skip_ws(params, param_pos);
         if (param_pos >= params.size()) { break; }
-        if (!parse_parameter(params, param_pos, args, name, contracts, recovered)) {
+        if (!parse_parameter(params, param_pos, args, name, contracts, recovered, tolerant)) {
             return false;
         }
     }
@@ -381,6 +443,55 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
     constexpr std::string_view kToolOpen  = "<tool_call>";
     constexpr std::string_view kToolClose = "</tool_call>";
 
+    if (tolerant) {
+        // Recovery scan: every line-anchored open tool-call marker is a candidate. A
+        // failed candidate consumes only its own marker, so valid calls before or after a
+        // malformed region are still recovered; any unrecoverable text is kept in
+        // `content` verbatim.
+        ParsedToolCallOutput out;
+        std::size_t pos       = 0;
+        std::size_t gap_begin = 0;
+        auto flush_gap = [&](std::size_t end) {
+            const std::string trimmed = trim_ascii(text.substr(gap_begin, end - gap_begin));
+            if (!trimmed.empty()) {
+                if (!out.content.empty()) { out.content += '\n'; }
+                out.content += trimmed;
+            }
+        };
+        while (true) {
+            const std::size_t marker = text.find(kToolOpen, pos);
+            if (marker == std::string::npos) { break; }
+            if (!is_line_anchored_marker(text, marker)) {
+                pos = marker + kToolOpen.size();
+                continue;
+            }
+            const std::size_t inner_begin = marker + kToolOpen.size();
+            // A depth-matched close bounds the region when the markers are balanced;
+            // unbalanced quoted markers break the depth scan, in which case the rest of
+            // the output is the candidate region and parse_one_tool_call anchors its own
+            // structural close.
+            std::size_t region_end = text.size();
+            const std::size_t depth_close = find_matching_close(text, inner_begin, 1, 0, kToolClose);
+            if (depth_close != std::string_view::npos) { region_end = depth_close; }
+            GeneratedToolCall call;
+            if (parse_one_tool_call(text.substr(inner_begin, region_end - inner_begin),
+                                    max_tool_name_length, contracts, true, call)) {
+                out.tool_calls.push_back(std::move(call));
+                flush_gap(marker);
+                // A depth-matched region ends at the close marker; an unbalanced region
+                // runs to the end of the output.
+                gap_begin = region_end + (depth_close != std::string_view::npos ? kToolClose.size() : 0);
+                pos       = gap_begin;
+                continue;
+            }
+            pos = inner_begin;
+        }
+        flush_gap(text.size());
+        if (out.tool_calls.empty()) { return fallback(text); }
+        out.is_tool_call_response = true;
+        return out;
+    }
+
     const std::size_t first = text.find(kToolOpen);
     if (first == std::string::npos) { return fallback(text); }
 
@@ -391,31 +502,22 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
     while (pos < text.size()) {
         skip_ws(text, pos);
         if (pos >= text.size()) { break; }
-        if (!starts_with_at(text, pos, kToolOpen)) {
-            if (tolerant && !out.tool_calls.empty()) { break; }
-            return fallback(text);
-        }
+        if (!starts_with_at(text, pos, kToolOpen)) { return fallback(text); }
         const std::size_t inner_begin = pos + kToolOpen.size();
         // The call may contain balanced nested markers (e.g. a parameter value
         // quoting the tool-call format), so locate the matching close by depth
         // rather than the first occurrence.
         const std::size_t close = find_matching_close(text, inner_begin, 1, 0, kToolClose);
-        if (close == std::string::npos && !tolerant) { return fallback(text); }
-        const std::size_t block_end = close == std::string::npos ? text.size() : close;
+        if (close == std::string::npos) { return fallback(text); }
         GeneratedToolCall call;
-        if (!parse_one_tool_call(std::string_view(text).substr(inner_begin, block_end - inner_begin),
-                                 max_tool_name_length, contracts, tolerant, call)) {
-            // Once one complete call has been recovered, do not discard it just
-            // because Qwen started a malformed second call or added a suffix.
-            if (tolerant && !out.tool_calls.empty()) { break; }
+        if (!parse_one_tool_call(std::string_view(text).substr(inner_begin, close - inner_begin),
+                                 max_tool_name_length, contracts, /*tolerant=*/false, call)) {
             return fallback(text);
         }
         out.tool_calls.push_back(std::move(call));
-        if (close == std::string::npos) { break; }
         pos = close + kToolClose.size();
     }
 
-    if (out.tool_calls.empty()) { return fallback(text); }
     out.is_tool_call_response = true;
     return out;
 }
@@ -483,7 +585,8 @@ ToolCallOutputDecoder::Terminal ToolCallOutputDecoder::finish() {
         trailing_whitespace_.clear();
         tool_region_.clear();
         marker_prefix_bytes_ = 0;
-        return Terminal{.content = {}, .tool_calls = std::move(parsed.tool_calls)};
+        return Terminal{.content = std::move(parsed.content),
+                        .tool_calls = std::move(parsed.tool_calls)};
     }
 
     constexpr std::string_view kToolOpen = "<tool_call>";

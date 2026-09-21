@@ -438,6 +438,13 @@ NInfer does not execute functions or enforce JSON Schema through constrained dec
 tools are rejected. Deferred loading, output schemas, and caller restrictions that exclude direct
 invocation are also rejected because their semantics cannot be honored.
 
+Structured call recovery is always enabled. The model's native text-form calls are line-anchored
+XML: an open tool-call marker, a function-name block, and one parameter block per argument.
+Recovery returns every structurally complete call as structured output, including calls wrapped
+in prose, parameter values that quote unbalanced markers, and JSON arguments missing a single
+outer bracket. Prose that quotes the format mid-line is not treated as a call, and unrecoverable
+text stays in the reply as ordinary content.
+
 ### Response object and usage
 
 A terminal wire response has `object: "response"`, one of `completed`, `incomplete`, or
@@ -493,8 +500,9 @@ The normal lifecycle is:
 Function arguments use `response.function_call_arguments.delta` and `.done`. IDs, output indices,
 and content indices remain stable, and concatenated deltas equal the terminal Item. Responses SSE
 does not emit the Chat Completions `[DONE]` sentinel. With tools enabled, ordinary answer text still
-streams immediately; only an ambiguous `<tool_call>` suffix or the structured tool region is held.
-Malformed tool markup is flushed back as ordinary text without losing bytes.
+streams immediately; only an ambiguous tool-call suffix or the structured tool region is held.
+Unrecoverable tool markup is flushed back as ordinary text without losing bytes, while
+structurally complete calls are recovered as structured output.
 
 ### Local response state and resources
 

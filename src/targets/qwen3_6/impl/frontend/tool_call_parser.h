@@ -49,17 +49,21 @@ struct ParsedToolCallOutput {
 [[nodiscard]] std::shared_ptr<const ToolCallOutputContract>
 build_tool_call_output_contract(std::span<const std::string> tool_jsons, bool enabled);
 
-// Parse Qwen's XML-like tool-call format. In tolerant mode, a complete function
-// call is recovered even when the model adds wrapper garbage or suffix text, or
-// quotes unbalanced call markers inside a parameter value (recovery anchors on the
-// last structural close).
+// Parse Qwen's XML-like tool-call format. In strict mode the whole output must be
+// well-formed or nothing is recovered. In tolerant mode every structurally complete
+// call is recovered individually: prose before, between, or after calls stays in
+// `content`, prose-quoted markers (not anchored at a line start) are ignored,
+// unbalanced markers quoted inside parameter values do not break the region
+// boundaries, a JSON argument missing one outer bracket is repaired, and a
+// malformed call never discards the valid calls around it.
 [[nodiscard]] ParsedToolCallOutput
 parse_qwen_tool_call_output(const std::string& text, std::size_t max_tool_name_length,
                             const ToolArgumentTypeContracts& contracts, bool tolerant = false);
 
 // Incrementally publishes bytes that are provably outside a possible terminal Qwen tool-call
-// suffix. At terminal time, valid calls are retained structurally; malformed output is restored
-// verbatim.
+// suffix. At terminal time, valid calls are retained structurally; unrecoverable output is
+// restored verbatim, and in tolerant mode the recovered prose gaps are returned as terminal
+// content.
 class ToolCallOutputDecoder {
 public:
     struct Terminal {

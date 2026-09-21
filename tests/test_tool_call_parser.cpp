@@ -371,10 +371,10 @@ int test_nested_markers_in_value() {
 
 
 int test_tolerant_no_tools_declared() {
-    // When the request declares no tools but --tolerant-tool-calls is on,
-    // build_tool_call_output_contract is called with an empty tool_jsons span
-    // and enabled=true. The resulting contract must accept any tool name
-    // (enforce_declared_names=false) so the parser can recover the call.
+    // When the request declares no tools, serving still enables tolerant recovery
+    // unconditionally, so build_tool_call_output_contract is called with an empty
+    // tool_jsons span and enabled=true. The resulting contract must accept any tool
+    // name (enforce_declared_names=false) so the parser can recover the call.
     const std::shared_ptr<const fi::ToolCallOutputContract> contract =
         fi::build_tool_call_output_contract(std::span<const std::string>(), true);
 
@@ -539,6 +539,212 @@ except Exception as e:
     return failures;
 }
 
+int test_tolerant_prose_around_calls() {
+    // Fixture class [461]: a valid call between prose; the call is recovered and the
+    // surrounding prose is preserved in `content`.
+    const std::string text =
+        "Sure, I'll check that for you.\n"
+        "<tool_call>\n"
+        "<function=bash>\n"
+        "<parameter=command>\nls -la\n"
+        "</parameter>\n"
+        "</function>\n"
+        "</tool_call>\n"
+        "Let me know if you need anything else.";
+    const std::shared_ptr<const fi::ToolCallOutputContract> contract =
+        fi::build_tool_call_output_contract(std::span<const std::string>(), true);
+    const fi::ParsedToolCallOutput parsed =
+        fi::parse_qwen_tool_call_output(text, 64, contract->argument_types, /*tolerant=*/true);
+    int failures = 0;
+    failures += check(parsed.is_tool_call_response, "prose around: classified as tool output");
+    failures += check(parsed.tool_calls.size() == 1, "prose around: one call recovered");
+    if (parsed.tool_calls.size() == 1) {
+        failures += check(parsed.tool_calls[0].name == "bash", "prose around: name");
+        const Json args = Json::parse(parsed.tool_calls[0].arguments_json);
+        failures += check(args.at("command") == "ls -la", "prose around: argument preserved");
+    }
+    failures += check(parsed.content ==
+                          "Sure, I'll check that for you.\n"
+                          "Let me know if you need anything else.",
+                      "prose around: surrounding prose preserved in content");
+    const fi::ParsedToolCallOutput strict =
+        fi::parse_qwen_tool_call_output(text, 64, contract->argument_types, /*tolerant=*/false);
+    failures += check(!strict.is_tool_call_response, "prose around: strict stays text");
+    failures += check(strict.content == text, "prose around: strict keeps the full text");
+    return failures;
+}
+
+int test_tolerant_malformed_argument_repaired() {
+    // Fixture class [290]: an argument missing its leading `[`. The repaired candidate is
+    // accepted only because it fully parses; a second well-formed call shows recovery
+    // continues after the repaired one.
+    const std::string text =
+        "Checking status.\n"
+        "<tool_call>\n"
+        "<function=bash>\n"
+        "<parameter=command>\n\"ls -la\", \"pwd\"]\n"
+        "</parameter>\n"
+        "</function>\n"
+        "</tool_call>\n"
+        "Then the second check.\n"
+        "<tool_call>\n"
+        "<function=bash>\n"
+        "<parameter=command>\nmake -j4\n"
+        "</parameter>\n"
+        "</function>\n"
+        "</tool_call>";
+    const std::shared_ptr<const fi::ToolCallOutputContract> contract =
+        fi::build_tool_call_output_contract(std::span<const std::string>(), true);
+    const fi::ParsedToolCallOutput parsed =
+        fi::parse_qwen_tool_call_output(text, 64, contract->argument_types, /*tolerant=*/true);
+    int failures = 0;
+    failures += check(parsed.is_tool_call_response, "repaired argument: classified as tool output");
+    failures += check(parsed.tool_calls.size() == 2, "repaired argument: both calls recovered");
+    if (parsed.tool_calls.size() == 2) {
+        const Json args1 = Json::parse(parsed.tool_calls[0].arguments_json);
+        failures += check(args1.at("command").is_array() && args1.at("command").size() == 2 &&
+                              args1.at("command").at(0) == "ls -la" &&
+                              args1.at("command").at(1) == "pwd",
+                          "repaired argument: single missing bracket repaired to an array");
+        const Json args2 = Json::parse(parsed.tool_calls[1].arguments_json);
+        failures += check(args2.at("command") == "make -j4", "repaired argument: second call intact");
+    }
+    failures += check(parsed.content == "Checking status.\nThen the second check.",
+                      "repaired argument: prose gaps preserved in content");
+    const fi::ParsedToolCallOutput strict =
+        fi::parse_qwen_tool_call_output(text, 64, contract->argument_types, /*tolerant=*/false);
+    failures += check(!strict.is_tool_call_response, "repaired argument: strict stays text");
+    return failures;
+}
+
+int test_tolerant_prose_quotes_format() {
+    // Fixture class [456]: prose quotes the format before the real call. A quoted
+    // line-anchored open marker with no matching close is not a call; a mid-line quoted
+    // marker is not even a candidate.
+    const std::string text =
+        "Qwen marks tool use with a line like\n"
+        "<tool_call>\n"
+        "followed by a closing tag at the end of the block.\n"
+        "The actual call follows.\n"
+        "<tool_call>\n"
+        "<function=get_time>\n"
+        "<parameter=city>\nBerlin\n"
+        "</parameter>\n"
+        "</function>\n"
+        "</tool_call>";
+    const std::shared_ptr<const fi::ToolCallOutputContract> contract =
+        fi::build_tool_call_output_contract(std::span<const std::string>(), true);
+    const fi::ParsedToolCallOutput parsed =
+        fi::parse_qwen_tool_call_output(text, 64, contract->argument_types, /*tolerant=*/true);
+    int failures = 0;
+    failures += check(parsed.is_tool_call_response, "quoted format: classified as tool output");
+    failures += check(parsed.tool_calls.size() == 1, "quoted format: only the real call");
+    if (parsed.tool_calls.size() == 1) {
+        failures += check(parsed.tool_calls[0].name == "get_time", "quoted format: name");
+        const Json args = Json::parse(parsed.tool_calls[0].arguments_json);
+        failures += check(args.at("city") == "Berlin", "quoted format: argument preserved");
+    }
+    failures += check(parsed.content ==
+                          "Qwen marks tool use with a line like\n"
+                          "<tool_call>\n"
+                          "followed by a closing tag at the end of the block.\n"
+                          "The actual call follows.",
+                      "quoted format: prose kept verbatim in content");
+
+    const std::string mid_line =
+        "The format uses "
+        "<tool_call>"
+        " and a function tag inline.\n"
+        "<tool_call>\n"
+        "<function=bash>\n"
+        "<parameter=command>\necho hi\n"
+        "</parameter>\n"
+        "</function>\n"
+        "</tool_call>";
+    const fi::ParsedToolCallOutput mid =
+        fi::parse_qwen_tool_call_output(mid_line, 64, contract->argument_types, /*tolerant=*/true);
+    failures += check(mid.is_tool_call_response && mid.tool_calls.size() == 1,
+                      "mid-line quote: real call recovered");
+    failures += check(mid.content == "The format uses "
+                                     "<tool_call>"
+                                     " and a function tag inline.",
+                      "mid-line quote: prose kept verbatim");
+    return failures;
+}
+
+static std::string tc_call(const std::string& cmd, bool close_fn) {
+    std::string s = "<tool_call>\n<function=bash>\n<parameter=command>\n";
+    if (!cmd.empty()) s += cmd + "\n";
+    s += "</parameter>\n";
+    if (close_fn) s += "</function>\n";
+    s += "</tool_call>\n";
+    return s;
+}
+
+int test_tolerant_malformed_call_between_valid() {
+    // both valid calls are recovered, malformed region stays in content.
+    const std::string text =
+        "First.\n" + tc_call("echo one", true) + tc_call("", false) +
+        tc_call("echo three", true) + "Done.";
+    const auto contract =
+        fi::build_tool_call_output_contract(std::span<const std::string>(), true);
+    const auto parsed =
+        fi::parse_qwen_tool_call_output(text, 64, contract->argument_types, true);
+    int failures = 0;
+    failures += check(parsed.is_tool_call_response, "malformed middle: tool output");
+    failures += check(parsed.tool_calls.size() == 2, "malformed middle: two calls");
+    if (parsed.tool_calls.size() == 2) {
+        failures += check(Json::parse(parsed.tool_calls[0].arguments_json)
+                          .at("command") == "echo one", "first intact");
+        failures += check(Json::parse(parsed.tool_calls[1].arguments_json)
+                          .at("command") == "echo three", "third intact");
+    }
+    failures += check(parsed.content == "First.\n" + tc_call("", false) + "Done.",
+                      "content");
+    return failures;
+}
+
+int test_tolerant_decoder_prose_gaps() {
+    // Leading prose streams as text; trailing prose comes from finish().
+    const auto contract =
+        fi::build_tool_call_output_contract(std::span<const std::string>(), true);
+    fi::ToolCallOutputDecoder decoder(contract, 64, true);
+    std::string visible;
+    visible += decoder.feed("Intro.\n<tool_call>\n<function=bash>\n");
+    visible += decoder.feed("<parameter=command>\necho hi\n</parameter>\n");
+    visible += decoder.feed("</function>\n</tool_call>\nOutro.");
+    const auto terminal = decoder.finish();
+    int failures = 0;
+    failures += check(visible == "Intro.", "decoder gaps: leading prose streamed");
+    failures += check(terminal.content == "Outro.", "decoder gaps: trailing prose in finish");
+    failures += check(terminal.tool_calls.size() == 1, "decoder gaps: one call");
+    if (terminal.tool_calls.size() == 1) {
+        failures += check(terminal.tool_calls[0].name == "bash", "decoder gaps: name");
+        failures += check(Json::parse(terminal.tool_calls[0].arguments_json)
+                          .at("command") == "echo hi", "decoder gaps: argument");
+    }
+    return failures;
+}
+
+int test_tolerant_plain_text_untouched() {
+    // Plain text without tool markers is returned verbatim, in both modes.
+    const std::string text = "No tool calls here, just prose.";
+    const auto contract =
+        fi::build_tool_call_output_contract(std::span<const std::string>(), true);
+    const auto tolerant =
+        fi::parse_qwen_tool_call_output(text, 64, contract->argument_types, true);
+    const auto strict =
+        fi::parse_qwen_tool_call_output(text, 64, contract->argument_types, false);
+    int failures = 0;
+    failures += check(!tolerant.is_tool_call_response, "plain text: tolerant not tool output");
+    failures += check(tolerant.content == text, "plain text: tolerant verbatim");
+    failures += check(tolerant.tool_calls.empty(), "plain text: tolerant no calls");
+    failures += check(!strict.is_tool_call_response, "plain text: strict not tool output");
+    failures += check(strict.content == text, "plain text: strict verbatim");
+    return failures;
+}
+
+
 } // namespace
 
 int main() {
@@ -560,6 +766,12 @@ int main() {
     failures += test_tolerant_no_tools_decoder_incremental();
     failures += test_tolerant_unbalanced_marker_in_value();
     failures += test_tolerant_incident_fixture();
+    failures += test_tolerant_prose_around_calls();
+    failures += test_tolerant_malformed_argument_repaired();
+    failures += test_tolerant_prose_quotes_format();
+    failures += test_tolerant_malformed_call_between_valid();
+    failures += test_tolerant_decoder_prose_gaps();
+    failures += test_tolerant_plain_text_untouched();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }
