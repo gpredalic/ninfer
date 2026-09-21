@@ -2890,10 +2890,25 @@ private:
         return std::nullopt;
     }
 
-    [[nodiscard]] std::size_t session_insert_cell(const CacheSessionKey& key) const {
-        if (session_index_.empty()) {
-            throw std::logic_error("session publication has no index capacity");
+    // A cell is live only while the catalog entry it names still exists with
+    // the same identity and revision — the same test the admission triple-match
+    // applies before trusting a binding. A cleared, retired, or superseded
+    // owner leaves the cell stale: it binds nothing (admission treats the
+    // candidate as an unbound retained prefix) and it is reclaimable for
+    // another session.
+    [[nodiscard]] bool session_cell_live(std::size_t cell) const noexcept {
+        const SessionIndexEntry& cell_entry = session_index_[cell];
+        if (cell_entry.state != SessionIndexState::Occupied ||
+            cell_entry.slot >= catalog_count_) {
+            return false;
         }
+        const CatalogEntry& entry = catalog_[cell_entry.slot];
+        return entry.state == CatalogState::Catalogued && entry.id == cell_entry.owner_id &&
+               entry.revision == cell_entry.revision;
+    }
+
+    [[nodiscard]] std::optional<std::size_t> session_insert_cell(const CacheSessionKey& key) const {
+        if (session_index_.empty()) { return std::nullopt; }
         const std::size_t begin = session_hash(key) % session_index_.size();
         std::optional<std::size_t> deleted;
         for (std::size_t probe = 0; probe < session_index_.size(); ++probe) {
@@ -2903,8 +2918,14 @@ private:
             if (entry.state == SessionIndexState::Deleted && !deleted) { deleted = cell; }
             if (entry.state == SessionIndexState::Empty) { return deleted.value_or(cell); }
         }
-        if (deleted) { return *deleted; }
-        throw std::logic_error("session index is full");
+        // No empty or deleted cell: every cell is occupied. Stale cells (their
+        // published owner no longer exists) bind nothing, so reclaim one
+        // instead of refusing the publication — a refusal here would fail the
+        // terminal finish of every new session until the index is reset.
+        for (std::size_t cell = 0; cell < session_index_.size(); ++cell) {
+            if (!session_cell_live(cell)) { return cell; }
+        }
+        return std::nullopt;
     }
 
     void erase_session_if_owner(std::uint64_t owner_id) noexcept {
@@ -2935,8 +2956,16 @@ private:
     [[nodiscard]] bool publish_session(const CacheSessionKey& key, std::uint32_t slot,
                                        std::uint64_t owner_id, std::uint64_t revision,
                                        std::uint64_t publication_order) {
-        const std::size_t cell   = session_insert_cell(key);
-        SessionIndexEntry& entry = session_index_[cell];
+        const std::optional<std::size_t> cell = session_insert_cell(key);
+        if (!cell) {
+            // The index is full of live bindings: no session-publication
+            // capacity. The continuation is already catalogued by the caller
+            // and stays reusable through prefix/identity admission; only the
+            // direct session binding is lost, so the caller drops the session
+            // key and the entry keeps its default RecentPrivate retention.
+            return false;
+        }
+        SessionIndexEntry& entry = session_index_[*cell];
         std::optional<SessionIndexEntry> previous;
         if (entry.state == SessionIndexState::Occupied) {
             if (entry.publication_order > publication_order) { return false; }

@@ -12496,8 +12496,19 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
             // recency only matters when comparing units of similar size.
             entry.pinned = false;
             entry.created = std::chrono::steady_clock::now();
-            host_kv_safety_net.add(std::move(entry));
-            // The re-added entry owns its state slots again.
+            if (!host_kv_safety_net.add(std::move(entry))) {
+                // add() rejected the re-add (incomplete unit or host-state
+                // budget pressure) and returned the entry's resources itself:
+                // the state slots through the net's releaser, the KV arena
+                // bytes through the allocation destructors. The prefix drops
+                // out of the net; this session's later requests re-prefill it.
+                std::fprintf(stderr,
+                             "[restore] re-add rejected: dropping host cache (frontier=%u)\n",
+                             restore_frontier);
+            }
+            // On success the re-added entry owns its state slots again; on
+            // rejection they were already returned to the pool, so the handles
+            // are stale either way and are dropped, not released.
             net_restore_state_slots = {};
             }
          } catch (...) {

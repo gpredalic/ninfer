@@ -87,8 +87,19 @@ public:
         // Crash notes are best effort: the handler runs async-signal-safe code
         // that immediately restores SIG_DFL and re-raises, so a short or
         // partial write has no actionable outcome and is dropped deliberately.
-        std::signal(SIGSEGV, [](int sig) { const char msg[] = "[engine] CRASH: SIGSEGV\n"; (void)::write(2, msg, sizeof(msg)-1); std::signal(sig, SIG_DFL); ::raise(sig); });
-        std::signal(SIGABRT, [](int sig) { const char msg[] = "[engine] CRASH: SIGABRT\n"; (void)::write(2, msg, sizeof(msg)-1); std::signal(sig, SIG_DFL); ::raise(sig); });
+        // The previous disposition is reported and dropped: the Engine owns
+        // this process's crash reporting, so any pre-existing handler (e.g. an
+        // external debugger's) is superseded on purpose.
+        void (*const previous_segv)(int) =
+            std::signal(SIGSEGV, [](int sig) { const char msg[] = "[engine] CRASH: SIGSEGV\n"; (void)::write(2, msg, sizeof(msg)-1); std::signal(sig, SIG_DFL); ::raise(sig); });
+        void (*const previous_abort)(int) =
+            std::signal(SIGABRT, [](int sig) { const char msg[] = "[engine] CRASH: SIGABRT\n"; (void)::write(2, msg, sizeof(msg)-1); std::signal(sig, SIG_DFL); ::raise(sig); });
+        if (previous_segv != SIG_DFL && previous_segv != SIG_IGN) {
+            (void)std::fprintf(stderr, "[engine] replaced pre-existing SIGSEGV handler\n");
+        }
+        if (previous_abort != SIG_DFL && previous_abort != SIG_IGN) {
+            (void)std::fprintf(stderr, "[engine] replaced pre-existing SIGABRT handler\n");
+        }
         std::promise<void> startup;
         std::future<void> started = startup.get_future();
         worker_                   = std::thread([this, startup = std::move(startup)]() mutable {
