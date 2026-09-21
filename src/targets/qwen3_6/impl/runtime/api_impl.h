@@ -528,6 +528,11 @@ std::uint64_t Program<Variant>::queued_kv_block_request_id() const noexcept {
 }
 
 template <>
+std::chrono::steady_clock::time_point Program<Variant>::queued_kv_block_deadline() const noexcept {
+    return impl_->queued_kv_block_deadline();
+}
+
+template <>
 qwen3_6::QueuedKvBlockProgress
 Program<Variant>::progress_queued_kv_block(bool relief_suppressed) noexcept {
     return impl_->progress_queued_kv_block(relief_suppressed);

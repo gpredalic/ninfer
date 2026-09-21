@@ -4,6 +4,7 @@
 #include "runtime/contract/types.h"
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <array>
@@ -835,6 +836,13 @@ public:
     void clear_queued_kv_block() noexcept;
     [[nodiscard]] bool has_queued_kv_block() const noexcept;
     [[nodiscard]] std::uint64_t queued_kv_block_request_id() const noexcept;
+    // The active block's deadline (blocked_since + the 120s defer deadline).
+    // While the FIFO head is KV-blocked, the engine extends the head's
+    // pending deadline to this point so relief-while-queued gets its full
+    // 120s window instead of being cut off by the generic pending timeout
+    // (default 30s); progress_queued_kv_block()'s deadline abort enforces
+    // the bound with the device-KV-specific error.
+    [[nodiscard]] std::chrono::steady_clock::time_point queued_kv_block_deadline() const noexcept;
     [[nodiscard]] QueuedKvBlockProgress
     progress_queued_kv_block(bool relief_suppressed) noexcept;
     [[nodiscard]] PrefillProgress<Variant>

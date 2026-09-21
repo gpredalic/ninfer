@@ -5135,6 +5135,10 @@ std::uint64_t ProgramImplCore::queued_kv_block_request_id() const noexcept {
     return queued_kv_block_.request_id;
 }
 
+std::chrono::steady_clock::time_point ProgramImplCore::queued_kv_block_deadline() const noexcept {
+    return queued_kv_block_.blocked_since + kKVDeferDeadline;
+}
+
 qwen3_6::QueuedKvBlockProgress
 ProgramImplCore::progress_queued_kv_block(bool relief_suppressed) noexcept {
     QueuedKvBlock& block = queued_kv_block_;

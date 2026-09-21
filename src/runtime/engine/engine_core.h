@@ -1012,11 +1012,21 @@ private:
         {
             std::lock_guard lock(queue_mutex_);
             const auto now = Clock::now();
+            // The active queued-KV block's head owns its own deadline:
+            // try_admit_one extends its pending deadline to the block's 120s
+            // boundary and progress_queued_kv_block() aborts it there with
+            // the device-KV-specific error. Expiring it here — this pass runs
+            // before the queued-progress step in the tick — would replace that
+            // abort with the generic admission message.
+            const bool kv_block_active = instance_.program->has_queued_kv_block();
+            const std::uint64_t kv_block_request =
+                kv_block_active ? instance_.program->queued_kv_block_request_id() : 0;
             for (auto it = pending_.begin(); it != pending_.end();) {
                 if ((*it)->cancelled.load(std::memory_order_acquire)) {
                     cancelled.push_back(*it);
                     it = pending_.erase(it);
-                } else if (now >= (*it)->deadline) {
+                } else if (now >= (*it)->deadline &&
+                           (!kv_block_active || (*it)->id != kv_block_request)) {
                     expired.push_back(*it);
                     it = pending_.erase(it);
                 } else {
@@ -1779,6 +1789,19 @@ private:
                     // changes (completions/expirations), and the 5s
                     // heartbeat in the worker loop.
                     queued_kv_block_rearm_due_ = Clock::now() + std::chrono::seconds(5);
+                    // The queued-KV block bounds this wait at 120s: the
+                    // deadline abort in progress_queued_kv_block() ends it
+                    // with the device-KV-specific error. Extend the head's
+                    // pending deadline to that boundary so relief-while-queued
+                    // gets its full window instead of the generic pending
+                    // timeout (default 30s) expiring the KV-blocked head after
+                    // roughly one relief tick ("expired while waiting for
+                    // admission").
+                    const Clock::time_point kv_block_deadline =
+                        instance_.program->queued_kv_block_deadline();
+                    if (kv_block_deadline > head->deadline) {
+                        head->deadline = kv_block_deadline;
+                    }
                     return AdmissionProgress::ControlProgress;
                 }
                 queued_kv_block_rearm_due_.reset();

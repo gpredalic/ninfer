@@ -756,6 +756,7 @@ public:
     void clear_queued_kv_block() noexcept;
     [[nodiscard]] bool has_queued_kv_block() const noexcept;
     [[nodiscard]] std::uint64_t queued_kv_block_request_id() const noexcept;
+    [[nodiscard]] std::chrono::steady_clock::time_point queued_kv_block_deadline() const noexcept;
     [[nodiscard]] qwen3_6::QueuedKvBlockProgress
     progress_queued_kv_block(bool relief_suppressed) noexcept;
 

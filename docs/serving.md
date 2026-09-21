@@ -856,7 +856,10 @@ CPU/media preparation and completed model results whose response has not yet bee
 capacity returns HTTP 429 with code `server_overloaded`. The absolute
 `--pending-timeout-ms` deadline starts before preparation, covers media acquisition and Engine FIFO
 waiting, and returns HTTP 503 with code `request_queue_timeout` if admission does not occur in time.
-There is no admission ETA or unbounded overflow queue.
+There is no admission ETA or unbounded overflow queue. One bounded exception: a FIFO head whose
+device-KV demand cannot be placed in the pool waits for in-queue relief (15s stall cadence) up to a
+fixed 120s deadline instead of `--pending-timeout-ms`, and fails with the same 503
+`request_queue_timeout` plus a device-KV-specific message if it still cannot be placed by then.
 
 Input memory is bounded by the outstanding-request count and the per-request
 `--max-request-mib` limit. Media requests additionally share one preparation permit, so a waiting
