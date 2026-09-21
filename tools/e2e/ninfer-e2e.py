@@ -61,6 +61,8 @@ class Session:
         self.response_id = None
         self.turns = []
         self.doc = filler(self.rng, seed_tokens)
+        self.last_error = None
+        self.done_at = None
 
     def turn(self, index):
         question = f"Question {index}: Consider the paragraph about '{self.rng.choice(WORDS)}'. Answer briefly."
@@ -393,10 +395,24 @@ def run_round(sessions, r, timeout):
     results = [None] * len(sessions)
     errors = []
     def run(i):
+        sessions[i].last_error = None
         try:
             results[i] = sessions[i].turn(r)
         except Exception as exc:
-            errors.append((sessions[i].name, repr(exc)))
+            detail = repr(exc)
+            # The 503/500 JSON body carries the engine's error message —
+            # capture it so phases can tell the generic pending timeout
+            # ("expired while waiting for admission") apart from the
+            # queued-KV device-KV deadline abort.
+            if isinstance(exc, urllib.error.HTTPError):
+                try:
+                    detail += " body=" + exc.read().decode("utf-8", "replace")
+                except Exception:
+                    pass
+            sessions[i].last_error = detail
+            errors.append((sessions[i].name, detail))
+        finally:
+            sessions[i].done_at = time.monotonic()
     threads = [threading.Thread(target=run, args=(i,)) for i in range(len(sessions))]
     for t in threads: t.start()
     for t in threads: t.join()
@@ -447,6 +463,7 @@ def parse_serve_log(path, skip_lines=0):
         "kv_occupancy_block",
         "queued_kv_relief",
         "queued_kv_deadline",
+        "kv_deadline_client",
         "pressure_expansion_fail",
         "state_replan",
         "entitlement_mismatch",
@@ -567,6 +584,13 @@ def parse_serve_log(path, skip_lines=0):
                     d["queued_kv_relief"] += 1
                 if "queued KV block deadline exceeded" in line:
                     d["queued_kv_deadline"] += 1
+                # Client-side manifestation of the same 120s abort: the 503
+                # request_queue_timeout whose message names the device-KV
+                # deadline (the generic pending timeout says "expired while
+                # waiting for admission" instead — the regression this phase
+                # guards against).
+                if "] error inference request expired waiting for device-KV capacity" in line:
+                    d["kv_deadline_client"] += 1
                 # P4.2: the pressure planner's expansion-capacity limit — a
                 # known self-recovering class (triaged 2026-09-16), not a
                 # saturated-restore failure.
@@ -1563,6 +1587,34 @@ def phase_13(args):
     return all_verdicts
 
 
+def queued_kv_head_verdict(round_sessions):
+    """Regression guard for the queued-KV pending-deadline extension: a FIFO
+    head that a device-KV occupancy block keeps in the queue must wait for
+    in-queue relief up to the 120s device-KV deadline, not die under the
+    generic --pending-timeout-ms ("expired while waiting for admission").
+    A generic pending timeout on a session whose round predecessors had all
+    already terminated (it was the head) is the pre-fix failure; a follower
+    consuming its own timeout behind a still-running head is the legitimate
+    per-request contract (the 120s exception covers the blocked head only).
+    """
+    for i, s in enumerate(round_sessions):
+        if not s.last_error or "expired while waiting for admission" not in s.last_error:
+            continue
+        ahead_gone = all(p.done_at is not None and p.done_at < s.done_at
+                         for p in round_sessions[:i])
+        if ahead_gone:
+            return ("FAIL: " + s.name + " (the FIFO head) expired under the generic "
+                    "pending timeout — a queued-KV-blocked head must get relief-while-queued "
+                    "up to the 120s device-KV deadline, not the --pending-timeout-ms expiration")
+    followers = [s.name for s in round_sessions
+                 if s.last_error and "expired while waiting for admission" in s.last_error]
+    if followers:
+        return ("WARN: " + ", ".join(followers) + " expired under their own pending timeout "
+                "while a head was still running (legitimate per-request timeout; the "
+                "queued-KV 120s exception covers the blocked head only)")
+    return None
+
+
 def phase_14(args):
     all_verdicts = []
     # Phase 14: queued-relief — P1.5(d) Increment 2.
@@ -1583,12 +1635,18 @@ def phase_14(args):
     for r in range(1, 4):
         print(f"Round {r}:")
         errors = run_round(s14, r, args.timeout)
+        verdict = queued_kv_head_verdict(s14)
+        if verdict:
+            all_verdicts.append(("queued-relief", verdict))
         if errors:
             for n, e in errors: print(f"  ERROR {n}: {e}")
             print("  Retrying failed sessions...")
             time.sleep(3)
             failed = [s for s in s14 if s.name in [n for n, _ in errors]]
             errors2 = run_round(failed, r, args.timeout)
+            verdict = queued_kv_head_verdict(failed)
+            if verdict:
+                all_verdicts.append(("queued-relief", verdict))
             if errors2:
                 for n, e in errors2: print(f"  ERROR {n}: {e}")
             continue
@@ -1613,6 +1671,11 @@ def phase_14(args):
             f"WARN: {log14['queued_kv_deadline']} request(s) hit the 120s queued-KV deadline (structural over-commit — the gap could not be closed)"))
     else:
         all_verdicts.append(("queued-relief", "PASS: no queued-KV deadline aborts"))
+    if log14["kv_deadline_client"] > 0 and log14["kv_deadline_client"] != log14["queued_kv_deadline"]:
+        all_verdicts.append(("queued-relief",
+            f"WARN: {log14['kv_deadline_client']} client-side device-KV deadline errors vs "
+            f"{log14['queued_kv_deadline']} engine-side deadline aborts — each 120s queued-KV "
+            f"abort should reach its client exactly once"))
     if log14["bad_alloc"] > 0 or log14["worker_recover"] > 0:
         all_verdicts.append(("queued-relief",
             f"FAIL: {log14['bad_alloc']} bad_alloc / {log14['worker_recover']} worker recoveries under queueing"))
