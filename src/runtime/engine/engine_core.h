@@ -91,9 +91,9 @@ public:
         // this process's crash reporting, so any pre-existing handler (e.g. an
         // external debugger's) is superseded on purpose.
         void (*const previous_segv)(int) =
-            std::signal(SIGSEGV, [](int sig) { const char msg[] = "[engine] CRASH: SIGSEGV\n"; (void)::write(2, msg, sizeof(msg)-1); std::signal(sig, SIG_DFL); ::raise(sig); });
+            std::signal(SIGSEGV, [](int sig) { const char msg[] = "[engine] CRASH: SIGSEGV\n"; const ssize_t written = ::write(2, msg, sizeof(msg)-1); (void)written; std::signal(sig, SIG_DFL); ::raise(sig); });
         void (*const previous_abort)(int) =
-            std::signal(SIGABRT, [](int sig) { const char msg[] = "[engine] CRASH: SIGABRT\n"; (void)::write(2, msg, sizeof(msg)-1); std::signal(sig, SIG_DFL); ::raise(sig); });
+            std::signal(SIGABRT, [](int sig) { const char msg[] = "[engine] CRASH: SIGABRT\n"; const ssize_t written = ::write(2, msg, sizeof(msg)-1); (void)written; std::signal(sig, SIG_DFL); ::raise(sig); });
         if (previous_segv != SIG_DFL && previous_segv != SIG_IGN) {
             (void)std::fprintf(stderr, "[engine] replaced pre-existing SIGSEGV handler\n");
         }
