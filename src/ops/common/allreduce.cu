@@ -23,6 +23,7 @@
 // expressed through the API that CUDA graph capture accepts.
 #include "ninfer/ops/allreduce.h"
 
+#include "ops/common/split_launch.h" // detail::CurrentDeviceScope
 #include "ops/launcher/residual_add.h" // detail::residual_add_launch
 
 #include <cstddef>
@@ -65,29 +66,6 @@ cudaError_t pull_peer(void* destination, const void* source, std::size_t bytes,
     return cudaMemcpyAsync(destination, source, bytes, cudaMemcpyDeviceToDevice, stream);
 }
 
-// Current-device save/restore. Both collectives issue work for each device in turn and must not
-// leave the caller's current device changed.
-class CurrentDeviceGuard {
-public:
-    CurrentDeviceGuard() { CUDA_CHECK(cudaGetDevice(&previous_)); }
-
-    ~CurrentDeviceGuard() {
-        const cudaError_t status = cudaSetDevice(previous_);
-        if (status != cudaSuccess) {
-            std::fprintf(stderr, "CUDA cleanup failed during cudaSetDevice: %s: %s\n",
-                         cudaGetErrorName(status), cudaGetErrorString(status));
-        }
-    }
-
-    CurrentDeviceGuard(const CurrentDeviceGuard&)            = delete;
-    CurrentDeviceGuard& operator=(const CurrentDeviceGuard&) = delete;
-
-    static void set(int device) { CUDA_CHECK(cudaSetDevice(device)); }
-
-private:
-    int previous_ = 0;
-};
-
 #ifndef NDEBUG
 // Debug-only residency and aliasing predicates. These cost a driver round trip per pointer, so
 // they are compiled out of the Release build the product ships; a wrong-device or self-overlapping
@@ -122,9 +100,9 @@ bool enable_peer_access(const ExecutionContext& ec) {
     // staged path rather than enabling one direction only.
     if (forward == 0 || reverse == 0) { return false; }
 
-    const CurrentDeviceGuard guard;
+    const detail::CurrentDeviceScope guard;
     for (int rank = 0; rank < 2; ++rank) {
-        CurrentDeviceGuard::set(pair[rank]);
+        detail::CurrentDeviceScope::set(pair[rank]);
         const cudaError_t status = cudaDeviceEnablePeerAccess(pair[1 - rank], 0);
         if (status == cudaErrorPeerAccessAlreadyEnabled) {
             // Already enabled by an earlier call; clear the sticky runtime error so the next
@@ -139,9 +117,12 @@ bool enable_peer_access(const ExecutionContext& ec) {
 
 PeerEvents::PeerEvents(const ExecutionContext& ec) {
     require_two_devices(ec, "PeerEvents: requires an ExecutionContext with two distinct devices");
-    const CurrentDeviceGuard guard;
+    const detail::CurrentDeviceScope guard;
     // Create through a local table so a mid-way failure destroys what was already created instead
-    // of leaking it; only a fully constructed set is published into the members.
+    // of leaking it; only a fully constructed set is published into the members. Every event is
+    // created with cudaEventDisableTiming because each one is waited on from the OTHER device's
+    // stream (see the PeerEvents note in the header): a cross-device cudaStreamWaitEvent is only
+    // supported for non-timing events, so the flag is a correctness requirement, not a hint.
     cudaEvent_t created[4] = {nullptr, nullptr, nullptr, nullptr};
     for (int slot = 0; slot < 4; ++slot) {
         const int rank             = slot % 2;
@@ -220,12 +201,12 @@ void allreduce_sum(const std::array<Tensor, 2>& buffer, const std::array<Tensor,
     }
 #endif
 
-    const CurrentDeviceGuard guard;
+    const detail::CurrentDeviceScope guard;
 
     // Phase A: publish "my operand is complete" on each stream, before any wait observes it.
     for (int rank = 0; rank < 2; ++rank) {
         const DeviceContext& local = *ec.dev[rank];
-        CurrentDeviceGuard::set(local.device);
+        detail::CurrentDeviceScope::set(local.device);
         CUDA_CHECK(cudaEventRecord(events.inputs_ready(rank), local.stream));
     }
 
@@ -233,7 +214,7 @@ void allreduce_sum(const std::array<Tensor, 2>& buffer, const std::array<Tensor,
     // are issued before either rank waits again, so the two directions overlap.
     for (int rank = 0; rank < 2; ++rank) {
         const DeviceContext& local = *ec.dev[rank];
-        CurrentDeviceGuard::set(local.device);
+        detail::CurrentDeviceScope::set(local.device);
         CUDA_CHECK(cudaStreamWaitEvent(local.stream, events.inputs_ready(1 - rank), 0));
         CUDA_CHECK(pull_peer(staging[rank].data, buffer[1 - rank].data, bytes, local.stream));
         CUDA_CHECK(cudaEventRecord(events.pull_done(rank), local.stream));
@@ -243,7 +224,7 @@ void allreduce_sum(const std::array<Tensor, 2>& buffer, const std::array<Tensor,
     // reading it. That same wait is what makes the next call's phase B safe.
     for (int rank = 0; rank < 2; ++rank) {
         const DeviceContext& local = *ec.dev[rank];
-        CurrentDeviceGuard::set(local.device);
+        detail::CurrentDeviceScope::set(local.device);
         CUDA_CHECK(cudaStreamWaitEvent(local.stream, events.pull_done(1 - rank), 0));
         Tensor accumulator = buffer[rank];
         detail::residual_add_launch(staging[rank], accumulator, local.stream);
@@ -292,12 +273,12 @@ void allgather_rows(const std::array<Tensor, 2>& destination, const std::array<T
     }
 #endif
 
-    const CurrentDeviceGuard guard;
+    const detail::CurrentDeviceScope guard;
 
     // Phase A: publish "my block is complete".
     for (int rank = 0; rank < 2; ++rank) {
         const DeviceContext& local = *ec.dev[rank];
-        CurrentDeviceGuard::set(local.device);
+        detail::CurrentDeviceScope::set(local.device);
         CUDA_CHECK(cudaEventRecord(events.inputs_ready(rank), local.stream));
     }
 
@@ -305,7 +286,7 @@ void allgather_rows(const std::array<Tensor, 2>& destination, const std::array<T
     // stream, so destination[r] has exactly one writer.
     for (int rank = 0; rank < 2; ++rank) {
         const DeviceContext& local = *ec.dev[rank];
-        CurrentDeviceGuard::set(local.device);
+        detail::CurrentDeviceScope::set(local.device);
         CUDA_CHECK(cudaStreamWaitEvent(local.stream, events.inputs_ready(1 - rank), 0));
         CUDA_CHECK(cudaMemcpyAsync(byte_offset(destination[rank].data, offset[rank]),
                                    part[rank].data, block[rank], cudaMemcpyDeviceToDevice,
@@ -320,7 +301,7 @@ void allgather_rows(const std::array<Tensor, 2>& destination, const std::array<T
     // host synchronization.
     for (int rank = 0; rank < 2; ++rank) {
         const DeviceContext& local = *ec.dev[rank];
-        CurrentDeviceGuard::set(local.device);
+        detail::CurrentDeviceScope::set(local.device);
         CUDA_CHECK(cudaStreamWaitEvent(local.stream, events.pull_done(1 - rank), 0));
     }
 }

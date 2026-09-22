@@ -102,9 +102,14 @@ inline void require_rank_residency([[maybe_unused]] const ExecutionContext& ec,
 
 // Issues `body(rank)` for rank 0 then rank 1 with that rank's device current, restoring the
 // caller's current device afterwards. Rank order is fixed and the calls are enqueue-only, so two
-// ranks' kernels overlap on the device even though the host issues them in sequence.
+// ranks' kernels overlap on the device even though the host issues them in sequence. Requires a
+// valid tp == 2 context (see require_split_context); a tp == 1 or malformed context is rejected
+// with std::invalid_argument rather than dereferencing an empty optional.
 template <class Body>
 void for_each_rank(const ExecutionContext& ec, Body&& body) {
+    require_split_context(ec,
+                          "for_each_rank: requires a tp == 2 ExecutionContext with two distinct "
+                          "devices");
     const CurrentDeviceScope scope;
     for (int rank = 0; rank < 2; ++rank) {
         CurrentDeviceScope::set(ec.dev[rank]->device);

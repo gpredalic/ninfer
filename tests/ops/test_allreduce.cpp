@@ -366,6 +366,191 @@ int run_microbenchmark(const ExecutionContext& ec, const ops::PeerEvents& events
     return failures;
 }
 
+// CUDA Graph capture/replay qualification for the collectives on the NON-PEER (host-staged)
+// transport. This is the assumption the production decode program relies on: the per-token
+// collective sequence is captured once and replayed every token, and on the target GeForce-class
+// hardware the device-to-device copies stage through host memory (peer access is refused). If
+// that staged path were not capturable, the whole tensor-parallel decode program would be
+// uncapturable. This test proves the capture/replay round trip on the staged path directly.
+//
+// The transport is forced to the staged path by disabling any peer access main() enabled: the
+// copies then stage through host memory regardless of the host's P2P capability, so the
+// qualification holds on both GeForce-class (no P2P) and datacenter (P2P) hardware.
+int run_graph_capture_case(const ExecutionContext& ec, const ops::PeerEvents& events) {
+    constexpr std::int32_t n = 5120;
+    const std::size_t count = static_cast<std::size_t>(n);
+    const std::size_t bytes = count * sizeof(std::uint16_t);
+
+    // Deterministic inputs, rounded to the BF16 grid so the oracle reads exactly what the device
+    // reads.
+    std::vector<float> a(count), b(count);
+    fill_uniform(a, 777u, -8.0f, 8.0f);
+    fill_uniform(b, 778u, -8.0f, 8.0f);
+    round_to_bf16(a);
+    round_to_bf16(b);
+    const auto a_bits = encode_bf16(a);
+    const auto b_bits = encode_bf16(b);
+    const auto expected = allreduce_sum_oracle(a, b);
+
+    int failures = 0;
+
+    // Force the non-peer (host-staged) transport. main() may have enabled direct P2P on hardware
+    // that supports it; the production target refuses it and stages through host memory, so the
+    // capture must be qualified on the staged path. Disabling any enabled peer access makes the
+    // device-to-device copies below stage through host memory on every host.
+    for (int rank = 0; rank < 2; ++rank) {
+        cuda_check(cudaSetDevice(ec.dev[rank]->device), "cudaSetDevice (disable peer)");
+        const cudaError_t st = cudaDeviceDisablePeerAccess(ec.dev[1 - rank]->device);
+        if (st == cudaSuccess) { continue; } // was enabled; now staged.
+        // cudaDeviceDisablePeerAccess documents only cudaSuccess, cudaErrorPeerAccessNotEnabled,
+        // and cudaErrorInvalidDevice: a device that never had peer access enabled reports
+        // cudaErrorPeerAccessNotEnabled (NOT cudaErrorNotSupported, which is the enable-path code).
+        if (st == cudaErrorPeerAccessNotEnabled) { cudaGetLastError(); continue; } // never enabled; staged.
+        std::cerr << "graph_capture: unexpected cudaDeviceDisablePeerAccess: "
+                  << cudaGetErrorString(st) << '\n';
+        ++failures;
+    }
+
+    // Buffers on each device. part aliases buffer: the allgather reads the post-allreduce sum.
+    set_device(ec, 0);
+    DeviceBuffer buffer_0(bytes), staging_0(bytes), gathered_0(2 * bytes);
+    buffer_0.copy_from_host(a_bits.data(), bytes);
+    staging_0.fill(0);
+    gathered_0.fill(0);
+    set_device(ec, 1);
+    DeviceBuffer buffer_1(bytes), staging_1(bytes), gathered_1(2 * bytes);
+    buffer_1.copy_from_host(b_bits.data(), bytes);
+    staging_1.fill(0);
+    gathered_1.fill(0);
+
+    const std::array<Tensor, 2> buffer{Tensor(buffer_0.p, DType::BF16, {n}),
+                                       Tensor(buffer_1.p, DType::BF16, {n})};
+    const std::array<Tensor, 2> staging{Tensor(staging_0.p, DType::BF16, {n}),
+                                        Tensor(staging_1.p, DType::BF16, {n})};
+    const std::array<Tensor, 2> gathered{Tensor(gathered_0.p, DType::BF16, {n, 2}),
+                                         Tensor(gathered_1.p, DType::BF16, {n, 2})};
+    const std::array<Tensor, 2> part{Tensor(buffer_0.p, DType::BF16, {n, 1}),
+                                     Tensor(buffer_1.p, DType::BF16, {n, 1})};
+
+    retire_staging(ec);
+
+    // Dedicated fork/join events for enrolling the peer stream in the capture. Each is created on
+    // the device whose stream records it (cudaEventRecord requires the event and stream to share a
+    // context), with cudaEventDisableTiming -- a hard requirement, since each is waited across
+    // devices exactly like the PeerEvents. The captured graph references them in its event
+    // record/wait nodes, so they must outlive the graph and are destroyed only after
+    // cudaGraphExecDestroy below.
+    set_device(ec, 0);
+    cudaEvent_t fork_event = nullptr;
+    cuda_check(cudaEventCreateWithFlags(&fork_event, cudaEventDisableTiming), "cudaEventCreate fork");
+    set_device(ec, 1);
+    cudaEvent_t join_event = nullptr;
+    cuda_check(cudaEventCreateWithFlags(&join_event, cudaEventDisableTiming), "cudaEventCreate join");
+
+    const cudaStream_t s0 = ec.dev[0]->stream;
+    const cudaStream_t s1 = ec.dev[1]->stream;
+
+    // Begin capture on rank 0's stream (the origin) and enroll rank 1's stream with an event fork.
+    set_device(ec, 0);
+    cuda_check(cudaStreamBeginCapture(s0, cudaStreamCaptureModeThreadLocal), "cudaStreamBeginCapture");
+    cuda_check(cudaEventRecord(fork_event, s0), "cudaEventRecord (fork)");
+    cuda_check(cudaStreamWaitEvent(s1, fork_event, 0), "cudaStreamWaitEvent (fork)");
+
+    // The captured body: one allreduce_sum and one allgather_rows, the per-token collective pair.
+    ops::allreduce_sum(buffer, staging, ec, events);
+    ops::allgather_rows(gathered, part, ec, events);
+
+    // Join rank 1 back to the origin so the capture is a single connected graph.
+    cuda_check(cudaEventRecord(join_event, s1), "cudaEventRecord (join)");
+    cuda_check(cudaStreamWaitEvent(s0, join_event, 0), "cudaStreamWaitEvent (join)");
+
+    cudaGraph_t graph = nullptr;
+    const cudaError_t capture_status = cudaStreamEndCapture(s0, &graph);
+    if (capture_status != cudaSuccess || graph == nullptr) {
+        std::cerr << "graph_capture: cudaStreamEndCapture failed: "
+                  << cudaGetErrorString(capture_status) << '\n';
+        // The capture produced no graph, so the events are unreferenced; release them.
+        set_device(ec, 0);
+        cudaEventDestroy(fork_event);
+        set_device(ec, 1);
+        cudaEventDestroy(join_event);
+        return failures + 1;
+    }
+    std::cout << "graph_capture: capture succeeded on the host-staged (non-peer) transport\n";
+
+    cudaGraphExec_t exec = nullptr;
+    cuda_check(cudaGraphInstantiate(&exec, graph, 0), "cudaGraphInstantiate");
+    cudaGraphDestroy(graph);
+    // Replay the captured graph and verify the results. The graph reads the current buffer
+    // contents, so re-stage the inputs before each replay, as the decode loop does every token.
+    auto stage_inputs = [&]() {
+        set_device(ec, 0);
+        buffer_0.copy_from_host(a_bits.data(), bytes);
+        staging_0.fill(0);
+        gathered_0.fill(0);
+        set_device(ec, 1);
+        buffer_1.copy_from_host(b_bits.data(), bytes);
+        staging_1.fill(0);
+        gathered_1.fill(0);
+        retire_staging(ec);
+    };
+
+    auto replay_and_verify = [&](const char* label) -> int {
+        stage_inputs();
+        cuda_check(cudaGraphLaunch(exec, s0), "cudaGraphLaunch");
+        cuda_check(cudaStreamSynchronize(s0), "cudaStreamSynchronize (launch stream)");
+        for (int rank = 0; rank < 2; ++rank) {
+            cuda_check(cudaSetDevice(ec.dev[rank]->device), "cudaSetDevice (sync)");
+            cuda_check(cudaDeviceSynchronize(), "cudaDeviceSynchronize (replay)");
+        }
+
+        int local = 0;
+        set_device(ec, 0);
+        const auto got_0 = from_device_bf16(buffer_0.p, count);
+        const auto buf0_bits = from_device<std::uint16_t>(buffer_0.p, count);
+        const auto gath0_bits = from_device<std::uint16_t>(gathered_0.p, 2 * count);
+        set_device(ec, 1);
+        const auto got_1 = from_device_bf16(buffer_1.p, count);
+        const auto buf1_bits = from_device<std::uint16_t>(buffer_1.p, count);
+        const auto gath1_bits = from_device<std::uint16_t>(gathered_1.p, 2 * count);
+
+        local += verify_pointwise((std::string(label) + " device 0 buffer").c_str(),
+                                 got_0, expected, allreduce_sum_bf16_criterion());
+        local += verify_pointwise((std::string(label) + " device 1 buffer").c_str(),
+                                 got_1, expected, allreduce_sum_bf16_criterion());
+
+        // The allgather is an exact relocation: each gathered half is bit-for-bit the buffer it
+        // came from, and both buffers hold the identical sum.
+        local += verify_exact((std::string(label) + " buffers identical").c_str(), buf0_bits,
+                              buf1_bits);
+        std::vector<std::uint16_t> gath0_first(count), gath0_second(count);
+        std::copy(gath0_bits.begin(), gath0_bits.begin() + count, gath0_first.begin());
+        std::copy(gath0_bits.begin() + count, gath0_bits.end(), gath0_second.begin());
+        local += verify_exact((std::string(label) + " device 0 gathered[0]==buffer0").c_str(),
+                              gath0_first, buf0_bits);
+        local += verify_exact((std::string(label) + " device 0 gathered[1]==buffer1").c_str(),
+                              gath0_second, buf1_bits);
+        std::vector<std::uint16_t> gath1_first(count), gath1_second(count);
+        std::copy(gath1_bits.begin(), gath1_bits.begin() + count, gath1_first.begin());
+        std::copy(gath1_bits.begin() + count, gath1_bits.end(), gath1_second.begin());
+        local += verify_exact((std::string(label) + " device 1 gathered[0]==buffer0").c_str(),
+                              gath1_first, buf0_bits);
+        local += verify_exact((std::string(label) + " device 1 gathered[1]==buffer1").c_str(),
+                              gath1_second, buf1_bits);
+        return local;
+    };
+
+    failures += replay_and_verify("graph replay 1");
+    failures += replay_and_verify("graph replay 2");
+
+    cudaGraphExecDestroy(exec);
+    // The graph (and its event record/wait nodes) is gone; release the fork/join events.
+    set_device(ec, 0);
+    cudaEventDestroy(fork_event);
+    set_device(ec, 1);
+    cudaEventDestroy(join_event);
+    return failures;
+}
 } // namespace
 
 int main() {
@@ -408,6 +593,7 @@ int main() {
 
     failures += run_chained_case(ec, events);
     failures += run_microbenchmark(ec, events);
+    failures += run_graph_capture_case(ec, events);
 
     std::cout << (failures ? "FAIL" : "OK") << " allreduce\n";
     return failures ? 1 : 0;

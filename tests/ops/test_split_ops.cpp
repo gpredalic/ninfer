@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 
 using namespace ninfer;
@@ -52,6 +53,37 @@ int run_context_guard_case(const ExecutionContext& ec) {
     } catch (const std::exception& e) {
         std::cerr << "split_ops: require_split_context rejected a valid tp==2 context: "
                   << e.what() << '\n';
+        ++failures;
+    }
+    return failures;
+}
+
+// for_each_rank must self-validate: a tp == 1 (or otherwise malformed) context is rejected with
+// std::invalid_argument -- the intended diagnostic -- rather than bad_optional_access from
+// dereferencing an empty optional. A valid tp == 2 context is accepted.
+int run_for_each_rank_validation_case(const ExecutionContext& ec) {
+    int failures = 0;
+
+    const ExecutionContext single({0}); // tp == 1
+    bool rejected_single = false;
+    try {
+        detail::for_each_rank(single, [](int) {});
+    } catch (const std::invalid_argument&) {
+        rejected_single = true;
+    } catch (const std::bad_optional_access&) {
+        std::cerr << "split_ops: for_each_rank threw bad_optional_access instead of "
+                     "invalid_argument for a tp==1 context\n";
+        ++failures;
+    }
+    if (!rejected_single) {
+        std::cerr << "split_ops: for_each_rank accepted a tp==1 context\n";
+        ++failures;
+    }
+
+    try {
+        detail::for_each_rank(ec, [](int) {});
+    } catch (const std::exception& e) {
+        std::cerr << "split_ops: for_each_rank rejected a valid tp==2 context: " << e.what() << '\n';
         ++failures;
     }
     return failures;
@@ -141,6 +173,7 @@ int main() {
     const ExecutionContext ec({0, 1});
     int failures = 0;
     failures += run_context_guard_case(ec);
+    failures += run_for_each_rank_validation_case(ec);
     failures += run_device_selection_case(ec);
     failures += run_rank_residency_case(ec);
     failures += run_device_restore_case(ec);

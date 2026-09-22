@@ -93,8 +93,16 @@ namespace ninfer::ops {
 // stream-ordered and not graph-capturable; it must never appear in a hot path.
 bool enable_peer_access(const ExecutionContext& ec);
 
-// The reusable cross-device ordering events: two per device, created on that device with timing
-// disabled.
+// The reusable cross-device ordering events: two per device, created on that device with
+// cudaEventDisableTiming. The non-timing flag is a hard requirement, not a performance nicety:
+// every wait these events take is a CROSS-DEVICE cudaStreamWaitEvent (rank r waits on an event
+// recorded on rank 1-r's device), and the driver supports waiting on another device's event only
+// when that event was created with cudaEventDisableTiming -- a timing-enabled event would need
+// cross-device clock synchronization, which CUDA does not provide, so the wait would fail. The
+// constructor is the single creation site and always passes the flag, so a timing-enabled
+// PeerEvents cannot be constructed; the requirement is enforced by construction, and this note
+// exists so a future refactor that creates the events elsewhere does not silently drop the flag
+// and turn every cross-device wait into an opaque failure.
 //
 //   inputs_ready(r) - recorded on rank r's stream once the inputs rank r contributes are complete;
 //                     the peer waits on it before reading them.
