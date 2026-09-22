@@ -336,6 +336,15 @@ ninfer_add_op_test(ninfer_mtp_round_test
 ninfer_add_op_test(ninfer_speculative_round_test
   SOURCES ops/test_speculative_round.cpp
   LIBRARIES ninfer_ops)
+
+# Cross-device tensor-parallel (tp == 2) collectives and split mechanics. These require two CUDA
+# devices in one process and skip (return 77) when fewer are visible.
+ninfer_add_op_test(ninfer_allreduce_test
+  SOURCES ops/test_allreduce.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_split_ops_test
+  SOURCES ops/test_split_ops.cpp
+  LIBRARIES ninfer_ops)
 ninfer_add_linear_test(ninfer_linear_q4_a16_test ops/linear/test_q4_a16.cpp)
 ninfer_add_linear_test(ninfer_linear_q5_a16_test ops/linear/test_q5_a16.cpp)
 ninfer_add_linear_test(ninfer_linear_q6_a16_test ops/linear/test_q6_a16.cpp)
