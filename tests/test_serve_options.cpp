@@ -121,6 +121,25 @@ int main() {
     } catch (const std::invalid_argument&) { implicit_backend_rejected = true; }
     failures += check(implicit_backend_rejected, "--draft-tokens selected a backend implicitly");
 
+    // Regression: --tolerant-tool-calls was dropped from the flag set when structured
+    // tool-call recovery became unconditional in serving. Existing command lines (systemd
+    // units, Docker images, scripts) still pass it, so it must keep parsing as a no-op.
+    const ServeOptions tolerant_alias =
+        parse({"ninfer-serve", "model.ninfer", "--tolerant-tool-calls"});
+    failures += check(tolerant_alias.allow_prefix_reuse == defaults.allow_prefix_reuse &&
+                          tolerant_alias.enable_vision == defaults.enable_vision &&
+                          tolerant_alias.preserve_thinking == defaults.preserve_thinking &&
+                          tolerant_alias.max_context == defaults.max_context &&
+                          tolerant_alias.speculative.backend == defaults.speculative.backend &&
+                          tolerant_alias.speculative.draft_tokens ==
+                              defaults.speculative.draft_tokens &&
+                          tolerant_alias.speculative.proposal_head ==
+                              defaults.speculative.proposal_head,
+                      "--tolerant-tool-calls altered parsed serve options");
+    failures += check(
+        serve_usage_text("ninfer-serve").find("--tolerant-tool-calls") != std::string::npos,
+        "serve help omits the deprecated --tolerant-tool-calls alias");
+
     const ServeOptions configured = parse({"ninfer-serve",
                                            "model.ninfer",
                                            "--no-prefix-reuse",

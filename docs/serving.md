@@ -443,7 +443,8 @@ XML: an open tool-call marker, a function-name block, and one parameter block pe
 Recovery returns every structurally complete call as structured output, including calls wrapped
 in prose, parameter values that quote unbalanced markers, and JSON arguments missing a single
 outer bracket. Prose that quotes the format mid-line is not treated as a call, and unrecoverable
-text stays in the reply as ordinary content.
+text stays in the reply as ordinary content. The former `--tolerant-tool-calls` flag is accepted
+for backward compatibility and has no effect.
 
 ### Response object and usage
 
