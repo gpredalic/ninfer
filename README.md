@@ -11,6 +11,11 @@ speculative heads shipped in the checkpoint, and a context cache that moves KV p
 together between device and pinned host memory. There is no Python runtime, no plugin layer, and
 no weight repacking at load time — the model arrives as one `.ninfer` file and runs as-is.
 
+NInfer is validated in production on a 24 GB RTX PRO 4000 Blackwell serving Qwen3.6-27B; the
+performance and long-context numbers in the docs were collected on a 32 GB RTX 5090. The
+[Tested Configuration](#tested-configuration) section describes the setup we recommend starting
+from.
+
 Three design choices stand out:
 
 - **One engine for every surface.** The CLI, the OpenAI-compatible server, and the
@@ -47,6 +52,9 @@ Three design choices stand out:
 - **Reproducible results.** Deterministic seeds, greedy mode, stop conditions, and an offline
   perplexity evaluator.
 
+These are the capabilities the engine implements. What we actually run in production, and where
+each capability has been tested, is in [Tested Configuration](#tested-configuration).
+
 ## Quick Start
 
 Build (Linux, SM120 Blackwell GPU, CUDA 13.1 or newer):
@@ -59,12 +67,12 @@ cmake --build build -j
 Download an artifact and send a one-shot request:
 
 ```bash
-hf download neroued/Qwen3.8-27B-NVFP4-NInfer --local-dir models
+hf download neroued/Qwen3.6-27B-nvfp4-NInfer --local-dir models
 
-./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
+./build/apps/ninfer models/qwen3_6_27b_nvfp4.ninfer \
   --prompt "Explain speculative decoding in two sentences." \
   --max-context 8192 --max-new 256 \
-  --kv-dtype fp8 --spec mtp --draft-tokens 3 --lm-head-draft
+  --kv-dtype nvfp4 --spec mtp --draft-tokens 3 --lm-head-draft
 ```
 
 The answer streams to stdout. Loading progress, reasoning, timings, and throughput go to stderr,
@@ -74,30 +82,39 @@ options; [docs/cli.md](docs/cli.md) covers thinking, sampling, vision, and media
 ## Running a Server
 
 `ninfer-serve` loads one artifact and serves OpenAI- and Anthropic-compatible HTTP endpoints.
-Here is a long-running configuration: 240k context, two concurrent requests, MTP speculative
-decoding (3 draft tokens), FP8 KV, and a host cache that holds inactive sessions:
+The configuration below is the one we run in production — see [Tested Configuration](#tested-configuration)
+for the environment and workloads it has been validated on:
 
 ```bash
-./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
-  --host 127.0.0.1 --port 8080 \
-  --max-context 240000 --kv-capacity auto \
-  --max-concurrency 2 \
-  --kv-dtype fp8 \
+./build/apps/ninfer-serve models/qwen3_6_27b_nvfp4.ninfer \
+  --host 0.0.0.0 --port 8080 \
+  --max-context 262144 --kv-capacity 262144 \
+  --default-max-tokens 32768 \
+  --max-concurrency 1 \
+  --kv-dtype nvfp4 \
   --spec mtp --draft-tokens 3 --lm-head-draft \
-  --device-state-slots 2 --host-state-slots 8 --host-kv-mib 8192 \
-  --preserve-thinking
+  --device-state-slots 1 --host-state-slots 16 --host-kv-mib 24000 \
+  --weights-profile qwen36-nvfp4 \
+  --rope-scaling-factor 2.12 --rope-scaling-original-context 262144 \
+  --preserve-thinking \
+  --temperature 0.5 --top-p 0.9
 ```
 
-`--kv-capacity auto` sizes the shared KV pool from the memory left after weights, leaving 1 GiB
-of headroom. `--preserve-thinking` keeps a session's closed reasoning in later prompts, which is
-what agent clients want. Add `--vision` for image/video input, `--api-key` to require a bearer
-token, and `--request-log-jsonl` for full-precision per-request records.
+This serves Qwen3.6-27B NVFP4 with the full 262,144-token context, one active request, NVFP4 KV,
+MTP speculative decoding (3 draft tokens), and a pinned-host cache that retains inactive
+sessions. `--kv-capacity 262144` pins the shared KV pool to the context ceiling; `auto` sizes it
+from the memory left after weights instead. `--preserve-thinking` keeps a session's closed
+reasoning in later prompts, which is what agent clients want. `--weights-profile` is normally
+resolved from the artifact identity and is shown here because the production launch pins it
+explicitly. The YaRN flags are carried for context extension but are inactive at the native
+262k ceiling. Add `--vision` for image/video input, `--api-key` to require a bearer token, and
+`--request-log-jsonl` for full-precision per-request records.
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "qwen3.8-27b",
+    "model": "qwen3.6-27b",
     "messages": [{"role": "user", "content": "Reply with one short sentence."}],
     "max_tokens": 64
   }'
@@ -105,6 +122,37 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 [docs/serving.md](docs/serving.md) is the full reference for endpoints, streaming, tools, state,
 token counting, and options.
+
+## Tested Configuration
+
+This is the setup we actually run, and the one the rest of this document is validated against.
+It is also the configuration we recommend starting from.
+
+**Hardware and software.** One NVIDIA RTX PRO 4000 Blackwell (24 GB, SM120) on 64-bit Linux
+with CUDA 13.x. NInfer is a single SM120 build; the same artifacts also run on the 32 GB
+RTX 5090, where the performance and long-context measurements in the docs were collected.
+
+**Model.** Qwen3.6-27B in the NVFP4 weight profile (`qwen3_6_27b_nvfp4.ninfer`).
+
+**Serving.** The command in [Running a Server](#running-a-server): native 262,144-token context,
+one active request, NVFP4 KV, MTP speculative decoding with three draft tokens, and a
+pinned-host cache (16 state slots, 24,000 MiB of host KV) that retains inactive sessions.
+
+**Context lengths.** Requests run up to the full 262,144-token ceiling. The YaRN extension that
+takes the 32 GB card to 555k–600k tokens is not exercised here; at 262k the scaling factor is a
+no-op.
+
+**Workloads.** Text: single-turn and multi-turn chat, function tool-calling, and agent-style
+sessions that build on `--preserve-thinking`. Tool-calling quality was additionally checked
+against the BFCL v4 suite on the 5090 bench ([results](docs/performance.md)). Vision (image/video)
+is implemented and tested on the 32 GB RTX 5090 but is not part of this text-only deployment.
+
+To be clear about what each claim rests on: the deployment above is **validated** daily on the
+24 GB card. Concurrency above one, vision, DFlash on 35B-A3B, the other four artifacts, and the
+extended-context ceilings are **tested** on the 32 GB RTX 5090 bench
+([performance](docs/performance.md), [NVFP4 KV + YaRN](docs/maintainer/kv-nvfp4-yarn.md)).
+Everything else in [Features](#features) is **implemented** and covered by the test suite, but is
+not part of the production deployment.
 
 ## Long Context
 
@@ -121,7 +169,9 @@ RTX 5090 you can go well beyond it with three settings:
 
 On a 32 GB RTX 5090, the practical ceilings are about 555k tokens per session with three
 concurrent sessions and vision (YaRN factor 2.12), and about 600k for a single session (YaRN
-factor 2.30).
+factor 2.30). On the 24 GB RTX PRO 4000 in our production deployment, the validated context is
+the native 262,144 tokens with NVFP4 KV; the higher ceilings above need the extra VRAM of the
+32 GB card.
 
 A working configuration for the 555k case:
 
@@ -156,8 +206,9 @@ Speculative decoding makes generation faster: a small head proposes draft tokens
 model verifies several of them in one forward pass instead of one token at a time. The published
 checkpoints carry this head built in. Each decode step, it proposes up to *k* draft tokens;
 accepted tokens commit together. Draft windows run 1–5 with `--spec mtp --draft-tokens N`, and
-`--lm-head-draft` loads the optimized proposal head. Published measurements put draft acceptance
-at 45–71% depending on model and workload. On 35B-A3B, the text-only DFlash backend proposes
+`--lm-head-draft` loads the optimized proposal head. Measurements on the RTX 5090 put draft
+acceptance at 45–71% depending on model and workload ([methodology](docs/performance.md)). On
+35B-A3B, the text-only DFlash backend proposes
 1–15-token windows with `--spec dflash --draft-tokens N`.
 
 ### Host-KV caching
@@ -202,11 +253,12 @@ same model.
 ## Compatibility
 
 **Hardware.** 64-bit Linux, one SM120 Blackwell GPU, CUDA Toolkit 13.1 or newer. The build
-targets `sm_120a` and is tuned on the RTX 5090, but it adapts to the GPU it finds at startup —
-smaller SM120 parts (for example RTX PRO 4000 Blackwell) run the same artifacts.
+targets `sm_120a` and is a single configuration for all SM120 parts. It is validated in
+production on the 24 GB RTX PRO 4000 Blackwell, and the performance corpus in the docs was
+collected on the 32 GB RTX 5090; both run the same artifacts.
 
-**Clients.** Any OpenAI- or Anthropic-compatible SDK works — point it at the server's base URL
-and set the API key when one is configured:
+**Clients.** Any OpenAI- or Anthropic-compatible SDK can point at the server's base URL; set the
+API key when one is configured:
 
 - OpenAI Chat Completions: history, streaming, tools, usage
 - OpenAI Responses Core: typed items, local response state, prompt token counting
