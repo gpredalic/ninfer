@@ -107,10 +107,61 @@ std::size_t post_mixer_workspace_bytes(QType gate_up_qtype, QType down_qtype,
     }
     {
         auto scope = layout.scope();
-        (void)layout.alloc_bytes(ops::linear_add_workspace_capacity_bytes(
+                (void)layout.alloc_bytes(ops::linear_add_workspace_capacity_bytes(
             down_qtype, TextConfig::hidden, TextConfig::intermediate, policy, first, last));
     }
     return layout.peak_bytes(1);
+}
+
+// tp2 weight-form agreement: the storage form (fused vs split) is resolved from rank 0 and required
+// to agree on rank 1: both ranks bind the same artifact objects through the same profile, so a
+// disagreement is a loader bug, not a supported configuration.
+template <class Payload, class Weights>
+std::array<const Payload*, 2> require_same_alternative(const std::array<const Weights*, 2>& w,
+                                                        const char* label) {
+    const auto* a = std::get_if<Payload>(w[0]);
+    const auto* b = std::get_if<Payload>(w[1]);
+    if (a == nullptr || b == nullptr) {
+        throw std::logic_error(std::string(label) + ": tp2 ranks disagree on weight storage form");
+    }
+    return {a, b};
+}
+
+std::array<Weight, 2> pair_of(const Weight& a, const Weight& b) { return {a, b}; }
+
+// Current-device save/restore around a per-rank kernel issue.
+class CurrentDevice {
+public:
+    CurrentDevice() { CUDA_CHECK(cudaGetDevice(&previous_)); }
+
+    ~CurrentDevice() { (void)cudaSetDevice(previous_); }
+
+    CurrentDevice(const CurrentDevice&)            = delete;
+    CurrentDevice& operator=(const CurrentDevice&) = delete;
+
+private:
+    int previous_ = 0;
+};
+
+template <class Body>
+void for_each_rank(const ExecutionContext& ec, Body&& body) {
+    const CurrentDevice restore;
+    for (int rank = 0; rank < 2; ++rank) {
+        CUDA_CHECK(cudaSetDevice(ec.dev[rank]->device));
+        body(rank);
+    }
+}
+
+// Every MTP object is W8G32_F16S in every weights profile, so the MTP split leaves take the
+// A16-only Op forms, which need no transient workspace.
+void require_w8_mtp_shard(const Weight& a, const Weight& b, const char* label) {
+    if (a.qtype != QType::W8G32_F16S || b.qtype != QType::W8G32_F16S) {
+        throw std::logic_error(std::string(label) +
+                              ": tp2 MTP shards are expected to be W8G32_F16S");
+    }
+    if (a.k != b.k || a.n != b.n) {
+        throw std::logic_error(std::string(label) + ": tp2 MTP shards disagree on shape");
+    }
 }
 
 } // namespace

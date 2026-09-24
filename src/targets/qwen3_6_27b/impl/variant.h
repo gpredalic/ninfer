@@ -80,8 +80,82 @@ struct Variant {
     static void post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
                            qwen3_6::TextPhase phase, WorkspaceArena& workspace,
                            cudaStream_t stream);
-    static void mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
+        static void mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
                                Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream);
+
+    // --- tp == 2 leaves ------------------------------------------------------------------------
+    // One call drives BOTH ranks: every argument is an array indexed by rank, holding that rank's
+    // own shard-shaped tensor/weight resident on `ec.dev[rank]` and issued on that rank's stream.
+    // The column-parallel leaves need no communication; the row-parallel leaves carry the block's
+    // single all-reduce inside `ops::linear_add_row_parallel`, which folds the residual in exactly
+    // once, on rank 0, before the reduce. `staging[r]` is scratch of the residual's shape on
+    // `ec.dev[r]`; it receives the peer's partial and its contents afterwards are unspecified.
+    static void attention_projection(const std::array<Tensor, 2>& hidden,
+                                     const std::array<const FullAttentionProjectionWeights*, 2>& w,
+                                     const std::array<Tensor, 2>& query,
+                                     const std::array<Tensor, 2>& gate,
+                                     const std::array<Tensor, 2>& key,
+                                     const std::array<Tensor, 2>& value, qwen3_6::TextPhase phase,
+                                     const std::array<WorkspaceArena*, 2>& workspace,
+                                     const ExecutionContext& ec);
+    static void attention_output_projection(const std::array<Tensor, 2>& attention,
+                                            const std::array<Weight, 2>& weight,
+                                            const std::array<Tensor, 2>& residual,
+                                            const std::array<Tensor, 2>& staging,
+                                            qwen3_6::TextPhase phase,
+                                            const std::array<WorkspaceArena*, 2>& workspace,
+                                            const ExecutionContext& ec, const ops::PeerEvents& ev);
+    static void gdn_input_projection(const std::array<Tensor, 2>& hidden,
+                                     const std::array<const GdnProjectionWeights*, 2>& w,
+                                     const std::array<Tensor, 2>& qkv,
+                                     const std::array<Tensor, 2>& output_gate,
+                                     qwen3_6::TextPhase phase,
+                                     const std::array<WorkspaceArena*, 2>& workspace,
+                                     const ExecutionContext& ec);
+    static void gdn_output_projection(const std::array<Tensor, 2>& hidden,
+                                      const std::array<Weight, 2>& weight,
+                                      const std::array<Tensor, 2>& residual,
+                                      const std::array<Tensor, 2>& staging, qwen3_6::TextPhase phase,
+                                      const std::array<WorkspaceArena*, 2>& workspace,
+                                      const ExecutionContext& ec, const ops::PeerEvents& ev);
+        static void gdn_control_projection(const std::array<Tensor, 2>& hidden,
+                                       const std::array<const GdnProjectionWeights*, 2>& w,
+                                       const std::array<Tensor, 2>& g,
+                                       const std::array<Tensor, 2>& beta,
+                                       const std::array<WorkspaceArena*, 2>& workspace,
+                                       const ExecutionContext& ec);
+    static void mtp_attention_projection(const std::array<Tensor, 2>& hidden,
+                                         const std::array<const MtpAttentionProjectionWeights*, 2>& w,
+                                         const std::array<Tensor, 2>& query,
+                                         const std::array<Tensor, 2>& gate,
+                                         const std::array<Tensor, 2>& key,
+                                         const std::array<Tensor, 2>& value,
+                                         const std::array<WorkspaceArena*, 2>& workspace,
+                                         const ExecutionContext& ec);
+    static void mtp_kv_projection(const std::array<Tensor, 2>& hidden,
+                                  const std::array<const MtpAttentionProjectionWeights*, 2>& w,
+                                  const std::array<Tensor, 2>& key,
+                                  const std::array<Tensor, 2>& value,
+                                  const std::array<WorkspaceArena*, 2>& workspace,
+                                  const ExecutionContext& ec);
+    static void mtp_q_gate_projection(const std::array<Tensor, 2>& hidden,
+                                      const std::array<const MtpAttentionProjectionWeights*, 2>& w,
+                                      const std::array<Tensor, 2>& query,
+                                      const std::array<Tensor, 2>& gate,
+                                      const std::array<WorkspaceArena*, 2>& workspace,
+                                      const ExecutionContext& ec);
+    static void mtp_post_mixer(const std::array<Tensor, 2>& hidden,
+                               const std::array<const MtpPostMixerWeights*, 2>& w,
+                               const std::array<Tensor, 2>& residual,
+                               const std::array<Tensor, 2>& staging,
+                               const std::array<WorkspaceArena*, 2>& workspace,
+                               const ExecutionContext& ec, const ops::PeerEvents& ev);
+    static void post_mixer(const std::array<Tensor, 2>& hidden,
+                           const std::array<const PostMixerWeights*, 2>& w,
+                           const std::array<Tensor, 2>& residual,
+                           const std::array<Tensor, 2>& staging, qwen3_6::TextPhase phase,
+                           const std::array<WorkspaceArena*, 2>& workspace,
+                           const ExecutionContext& ec, const ops::PeerEvents& ev);
     [[nodiscard]] static std::size_t
     mtp_attention_projection_workspace_capacity_bytes(std::int32_t first, std::int32_t last);
     [[nodiscard]] static std::size_t mtp_kv_projection_workspace_capacity_bytes(std::int32_t first,
