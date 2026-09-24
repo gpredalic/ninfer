@@ -87,6 +87,45 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     return options;
 }
 
+// Validates that the requested tensor-parallel configuration is supported by this build.
+// `tp == 2` splits the resident model across two devices; it is rejected when combined with
+// features that have no split path in this build (Vision, DFlash). `tp == 1` is the single-device
+// path and is always supported.
+void require_supported_tp_features(const EngineOptions& options) {
+    if (options.tp != 1 && options.tp != 2) {
+        throw std::invalid_argument("EngineOptions.tp must be 1 or 2");
+    }
+    if (options.tp != 2) {
+        return;
+    }
+    if (options.enable_vision) {
+        throw std::invalid_argument(
+            "--tp 2 does not support Vision in this build; use --tp 1");
+    }
+    if (options.speculative.backend == SpeculativeBackend::DFlash) {
+        throw std::invalid_argument(
+            "--tp 2 does not support the DFlash speculative backend in this build; "
+            "use --tp 1, --spec mtp or --spec none");
+    }
+}
+
+// Resolves EngineOptions.tp/.device/.devices into the device id list ExecutionContext should
+// construct. ExecutionContext itself validates that the ids exist, are DISTINCT, and share a
+// compute capability.
+std::vector<int> resolve_execution_device_ids(const EngineOptions& options) {
+    require_supported_tp_features(options);
+    if (options.devices.empty()) {
+        if (options.tp != 1) {
+            throw std::invalid_argument("--tp 2 requires an explicit --devices list");
+        }
+        return {options.device};
+    }
+    if (options.devices.size() != static_cast<std::size_t>(options.tp)) {
+        throw std::invalid_argument("EngineOptions.devices size must equal tp");
+    }
+    return options.devices;
+}
+
 runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefaults& defaults,
                                                         SamplingMode mode, RequestOptions options) {
     if (options.execution.thinking.budget && *options.execution.thinking.budget == 0) {
@@ -220,7 +259,9 @@ public:
                               std::unique_ptr<ScoreCore27>, std::unique_ptr<ScoreCore35>>;
 
     explicit Impl(EngineOptions engine_options)
-        : options(normalize_engine_options(std::move(engine_options))), device(options.device) {
+        : options(normalize_engine_options(std::move(engine_options))),
+          execution(resolve_execution_device_ids(options)),
+          device(execution.primary()) {
         nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
         auto constructed  = targets::construct_target(options, device);
         active            = std::move(constructed.active);
@@ -250,13 +291,18 @@ public:
     ~Impl() noexcept {
         device.bind_to_current_thread_noexcept();
         core.emplace<std::monostate>();
-        try {
-            device.synchronize();
-        } catch (...) {}
+        for (int rank = execution.tp - 1; rank >= 0; --rank) {
+            try {
+                execution.dev[static_cast<std::size_t>(rank)]->synchronize();
+            } catch (...) {}
+        }
     }
 
     EngineOptions options;
-    DeviceContext device;
+    // One or two devices. `execution.primary()` is rank 0 -- the device the executor thread binds
+    // to, the one that owns request bookkeeping, sampling and the emitted tokens.
+    ExecutionContext execution;
+    DeviceContext& device;
     targets::ActiveTarget active;
     LoadSummary load;
     ModelSamplingDefaults sampling_defaults;

@@ -22,6 +22,9 @@ struct Options {
     KvCapacityPolicy kv_capacity = KvCapacityPolicy::explicit_capacity(2048);
     std::uint32_t prefill_chunk  = 1024;
     int device                   = 0;
+    // Tensor-parallel degree: 1 (default) or 2. `--tp 2` requires `--devices` naming two ids.
+    int tp                        = 1;
+    std::vector<int> devices;
 
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
     float rope_scaling_factor              = 1.0F;

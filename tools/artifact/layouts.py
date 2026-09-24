@@ -31,7 +31,7 @@ from .numeric import (
 
 PLANE_ALIGNMENT = 256
 K_ALIGNMENT = 128
-_PACK_TEMP_BYTES = 4 * 1024 * 1024 * 1024
+_PACK_TEMP_BYTES = 1024 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)

@@ -91,24 +91,39 @@ def quantize_matrix(
 
     geometry = row_split_geometry(spec, weight.shape)
     target = pick_device() if device is None else pick_device(device)
-    logical = weight.detach().to(device=target, dtype=torch.float32)
-    if geometry.k_pad != geometry.k:
-        physical = torch.zeros(
-            (geometry.n, geometry.k_pad), dtype=torch.float32, device=target
-        )
-        physical[:, : geometry.k].copy_(logical)
-        logical = physical
-
-    grouped = logical.reshape(
-        geometry.n, geometry.groups_per_row, spec.group_size
-    )
-    max_abs = grouped.abs().amax(dim=2)
-    host_scales, host_reciprocal = _canonical_scale_words(max_abs, spec.qmax)
-    scales = host_scales.to(target)
-    reciprocal = host_reciprocal.to(target)
-    codes = torch.clamp(
-        torch.round(grouped * reciprocal.unsqueeze(-1)), spec.qmin, spec.qmax
-    ).to(torch.int8)
+    n = geometry.n
+    # Quantize in row-chunks so the live FP32 working set is bounded by one
+    # chunk instead of the whole matrix. Each row's groups are quantized
+    # independently (per-group scales), so this is bit-for-bit identical to the
+    # full-matrix path. The chunk is sized to keep the live working set (FP32
+    # logical + int8 codes) near 1 GiB.
+    bytes_per_row = geometry.k_pad * 5  # FP32 logical + int8 codes
+    chunk_rows = max(1, min(n, (1 << 30) // max(1, bytes_per_row)))
+    codes_chunks: list[torch.Tensor] = []
+    scales_chunks: list[torch.Tensor] = []
+    for start in range(0, n, chunk_rows):
+        end = min(start + chunk_rows, n)
+        rows = end - start
+        logical = weight[start:end].detach().to(device=target, dtype=torch.float32)
+        if geometry.k_pad != geometry.k:
+            physical = torch.zeros(
+                (rows, geometry.k_pad), dtype=torch.float32, device=target
+            )
+            physical[:, : geometry.k].copy_(logical)
+            logical = physical
+        grouped = logical.reshape(rows, geometry.groups_per_row, spec.group_size)
+        # max|x| per group via two small reductions (no full-size abs temporary).
+        max_abs = torch.maximum(grouped.amax(dim=2), grouped.amin(dim=2).abs())
+        host_scales, host_reciprocal = _canonical_scale_words(max_abs, spec.qmax)
+        reciprocal = host_reciprocal.to(target)
+        grouped.mul_(reciprocal.unsqueeze(-1))
+        grouped.round_()
+        grouped.clamp_(spec.qmin, spec.qmax)
+        codes_chunks.append(grouped.to(torch.int8))
+        scales_chunks.append(host_scales.to(target))
+        del logical, grouped, max_abs, reciprocal
+    codes = torch.cat(codes_chunks, dim=0)
+    scales = torch.cat(scales_chunks, dim=0)
     return QuantizedMatrix(codes=codes, scales=scales)
 
 

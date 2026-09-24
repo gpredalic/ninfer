@@ -19,7 +19,23 @@ int parse_nonnegative_int(const char* text, const char* label) {
         value > static_cast<long>(std::numeric_limits<int>::max())) {
         throw std::invalid_argument(std::string("invalid ") + label + ": " + text);
     }
-    return static_cast<int>(value);
+        return static_cast<int>(value);
+}
+
+// Parses a comma-separated list of device ids, e.g. "0,1". Empty input yields an empty list.
+std::vector<int> parse_devices(const char* text) {
+    std::vector<int> devices;
+    std::string_view remaining(text);
+    while (!remaining.empty()) {
+        const std::size_t comma = remaining.find(',');
+        const std::string_view token = comma == std::string_view::npos ? remaining : remaining.substr(0, comma);
+        if (token.empty()) {
+            throw std::invalid_argument("invalid --devices list: " + std::string(text));
+        }
+        devices.push_back(parse_nonnegative_int(std::string(token).c_str(), "device"));
+        remaining = comma == std::string_view::npos ? std::string_view{} : remaining.substr(comma + 1);
+    }
+    return devices;
 }
 
 float parse_float_in(const char* text, const char* label, float lo, float hi) {
@@ -68,7 +84,7 @@ std::string serve_usage_text(const char* argv0) {
            " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
-           "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] "
+           "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] [--tp 1|2 --devices N,M] "
            "[--context-cost-presets FILE] "
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
            "[--media-preprocess-threads N] "
@@ -296,6 +312,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.response_store_max_bytes = static_cast<std::size_t>(mib << 20);
         } else if (arg == "--device") {
             options.device = parse_nonnegative_int(require_value("--device"), "device");
+        } else if (arg == "--tp") {
+            options.tp = parse_nonnegative_int(require_value("--tp"), "tp");
+        } else if (arg == "--devices") {
+            options.devices = parse_devices(require_value("--devices"));
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
         } else if (arg == "--rope-scaling-factor") {

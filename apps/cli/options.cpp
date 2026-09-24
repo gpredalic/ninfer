@@ -41,6 +41,22 @@ int parse_device(const char* text) {
     return static_cast<int>(value);
 }
 
+// Parses a comma-separated list of device ids, e.g. "0,1". Empty input yields an empty list.
+std::vector<int> parse_devices(const char* text) {
+    std::vector<int> devices;
+    std::string_view remaining(text);
+    while (!remaining.empty()) {
+        const std::size_t comma = remaining.find(',');
+        const std::string_view token = comma == std::string_view::npos ? remaining : remaining.substr(0, comma);
+        if (token.empty()) {
+            throw std::invalid_argument("invalid --devices list: " + std::string(text));
+        }
+        devices.push_back(parse_device(std::string(token).c_str()));
+        remaining = comma == std::string_view::npos ? std::string_view{} : remaining.substr(comma + 1);
+    }
+    return devices;
+}
+
 float parse_float(const char* text, std::string_view label, float minimum, float maximum) {
     errno              = 0;
     char* end          = nullptr;
@@ -78,8 +94,8 @@ std::string usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
-           "       [--device N]\n"
-           "       [--kv-dtype bf16|int8|fp8] [--spec mtp|dflash --draft-tokens N]\n"
+           "       [--device N] [--tp 1|2 --devices N,M]\\n"
+           "       [--kv-dtype bf16|int8|fp8] [--spec mtp|dflash --draft-tokens N]\\n"
            "       [--rope-scaling-factor F] [--rope-scaling-original-context N]\n"
            "       [--lm-head-draft]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
@@ -176,6 +192,10 @@ Options parse_options(int argc, char** argv) {
             options.prefill_chunk = parse_u32(value(arg), "prefill-chunk");
         } else if (arg == "--device") {
             options.device = parse_device(value(arg));
+        } else if (arg == "--tp") {
+            options.tp = parse_u32(value(arg), "tp");
+        } else if (arg == "--devices") {
+            options.devices = parse_devices(value(arg));
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_cache(value(arg));
         } else if (arg == "--rope-scaling-factor") {

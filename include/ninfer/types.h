@@ -119,6 +119,14 @@ struct EngineOptions {
     std::filesystem::path artifact_path;
     EnginePurpose purpose              = EnginePurpose::Generation;
     int device                         = 0;
+    // Tensor-parallel degree: 1 (default, single device) or 2. `tp == 2` splits the resident
+    // model across two CUDA devices and requires `devices` to name exactly two distinct ids of
+    // the same compute capability. `tp == 1` is bit-identical to the single-device path.
+    int tp                             = 1;
+    // Explicit device ids, one per tp rank. Empty means "derive from `device`" (i.e. {device});
+    // this lets callers that construct EngineOptions directly (tests, embedders) omit it. When
+    // non-empty its size must equal tp.
+    std::vector<int> devices;
     std::uint32_t max_context          = 2048; // Logical ceiling of one request or score window.
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
     std::uint32_t max_concurrency      = 1;

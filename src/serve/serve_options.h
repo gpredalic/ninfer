@@ -50,6 +50,9 @@ struct ServeOptions {
     std::size_t response_store_max_records = kDefaultResponseStoreRecords;
     std::size_t response_store_max_bytes   = kDefaultResponseStoreBytes;
     int device                             = 0;
+    // Tensor-parallel degree: 1 (default) or 2. `--tp 2` requires `--devices` naming two ids.
+    int tp                                 = 1;
+    std::vector<int> devices;
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     ContextCacheOptions context_cache;

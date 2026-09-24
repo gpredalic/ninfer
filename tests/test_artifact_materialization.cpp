@@ -107,7 +107,7 @@ int main() {
         const auto validation_plan = validation_binder.finish();
         require(validation_plan.object_count == 4 && validation_plan.host_objects.size() == 1 &&
                     validation_plan.device_objects.size() == 1 &&
-                    validation_plan.device_capacity_bytes == kSecondTensor.size(),
+                    validation_plan.device_capacity_bytes[0] == kSecondTensor.size(),
                 "validate-only tensor was included in the materialization plan");
 
         int device_count              = 0;
@@ -148,7 +148,7 @@ int main() {
 
         const ninfer::artifact::MaterializationPlan plan = binder.finish();
         require(plan.object_count == 4 && plan.host_objects.size() == 1 &&
-                    plan.device_objects.size() == 3 && plan.device_capacity_bytes == 772,
+                    plan.device_objects.size() == 3 && plan.device_capacity_bytes[0] == 772,
                 "binder produced the wrong materialization plan");
 
         ninfer::DeviceContext device(0);
@@ -193,8 +193,8 @@ int main() {
                                             ninfer::artifact::Reader::direct_io_alignment +
                                             kTailReadBytes,
                 "materialization statistics are incomplete");
-        require(materialized.device_arena().capacity() == plan.device_capacity_bytes &&
-                    materialized.device_arena().used() == plan.device_capacity_bytes,
+        require(materialized.device_arena().capacity() == plan.device_capacity_bytes[0] &&
+                    materialized.device_arena().used() == plan.device_capacity_bytes[0],
                 "materialized tensor does not own the planned device backing");
         return 0;
     } catch (const std::exception& error) {
