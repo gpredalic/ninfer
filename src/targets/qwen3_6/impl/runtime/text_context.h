@@ -8,6 +8,7 @@
 #include "core/gdn_replay_records.h"
 #include "core/tensor.h"
 #include "core/weight.h"
+#include "ninfer/ops/allreduce.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/softmax_attention.h"
 #include <ninfer/targets/qwen3_6/decoder_state.h>
@@ -70,6 +71,22 @@ struct ModelConfig {
 inline constexpr ModelConfig kCfg{};
 inline constexpr float kAttnScale                     = kAttentionScale;
 inline constexpr std::uint32_t kPrefillChunkAlignment = 128;
+
+// Per-device extents at tp == 2: each one is a model extent divided along an axis the ShardPlan
+// splits, so it names what THIS device actually holds. The query/KV head counts give the
+// head-local attention geometry (the same group ratio as the full model); the GDN head counts give
+// the head-split recurrent state; `kShardVocab` is one half of the row-split output head. Nothing
+// here divides the hidden/residual axis, which is replicated.
+inline constexpr int kTensorParallelWidth = 2;
+inline constexpr int kShardQHeads         = ModelConfig::n_q / kTensorParallelWidth;
+inline constexpr int kShardKvHeads        = ModelConfig::n_kv / kTensorParallelWidth;
+inline constexpr int kShardQSize          = ModelConfig::q_size / kTensorParallelWidth;
+inline constexpr int kShardKvSize         = ModelConfig::kv_size / kTensorParallelWidth;
+inline constexpr int kShardKeyDim         = ModelConfig::key_dim / kTensorParallelWidth;
+inline constexpr int kShardValueDim       = ModelConfig::value_dim / kTensorParallelWidth;
+inline constexpr int kShardGdnVHeads      = ModelConfig::gdn_v_heads / kTensorParallelWidth;
+inline constexpr int kShardGdnKHeads      = ModelConfig::gdn_k_heads / kTensorParallelWidth;
+inline constexpr int kShardVocab          = ModelConfig::vocab / kTensorParallelWidth;
 
 struct MlpW {
     const MlpWeights* payload = nullptr;
@@ -149,24 +166,56 @@ struct DFlashFeatureSink {
 
 class VisionPrefillSession;
 
+// Rank 1's half of a tensor-parallel execution, as seen from a rank-0 TextContext. Null at
+// tp == 1, in which case every schedule entry point behaves exactly as it always has. The TextContext
+// binds rank 1's own shard weights and device state from this view; the schedule owns both frames.
+struct TpExecution {
+    const ExecutionContext* execution = nullptr;
+    const ops::PeerEvents* events     = nullptr;
+    DeviceContext* device             = nullptr;
+    const LoadedModelData* weights    = nullptr;
+    WorkspaceArena* work              = nullptr;
+    LinearAttentionStatePool* state   = nullptr;
+    qwen3_6::RoundState* io           = nullptr;
+    Tensor* prefill_hidden            = nullptr;
+    qwen3_6::PagedKVCacheView kv;
+    const qwen3_6::PagedKVCache* batch_kv = nullptr;
+    // Rank 1's own MTP KV pool and replay-record storage. Both are absent unless the sequence
+    // plan enables MTP; when present they mirror rank 0's exactly, with the head/channel extents
+    // halved, so the two devices' MTP pages and GDN records stay in lockstep by construction.
+    qwen3_6::PagedKVCacheView mtp_kv;
+    const qwen3_6::PagedKVCache* batch_mtp_kv = nullptr;
+    const GdnReplayRecords* replay_records    = nullptr;
+
+    [[nodiscard]] bool complete() const noexcept {
+        return execution != nullptr && events != nullptr && device != nullptr &&
+               weights != nullptr && work != nullptr && state != nullptr && io != nullptr;
+    }
+};
+
 class TextContext {
 public:
-    TextContext(DeviceContext& ctx, const LoadedModelData& weights, WorkspaceArena& work,
+        TextContext(DeviceContext& ctx, const LoadedModelData& weights, WorkspaceArena& work,
                 qwen3_6::PagedKVCacheView kv, LinearAttentionStatePool& state,
                 qwen3_6::RoundState& io, Tensor& prefill_hidden, std::uint32_t prefill_chunk,
                 std::uint32_t text_kv_base,
                 qwen3_6::PagedKVCacheView mtp_kv           = qwen3_6::PagedKVCacheView(),
                 const qwen3_6::PagedKVCache* batch_text_kv = nullptr,
-                const qwen3_6::PagedKVCache* batch_mtp_kv  = nullptr);
+                const qwen3_6::PagedKVCache* batch_mtp_kv  = nullptr,
+                const TpExecution* tp                      = nullptr);
     ~TextContext();
 
     TextContext(const TextContext&)            = delete;
     TextContext& operator=(const TextContext&) = delete;
 
-    void set_proposal_head(const Weight* weight, const std::int32_t* ids, int count) noexcept {
+        void set_proposal_head(const Weight* weight, const std::int32_t* ids, int count) noexcept {
         proposal_head_     = weight;
         proposal_head_ids_ = ids;
         proposal_head_n_   = count;
+        if (weight == nullptr) {
+            proposal_head_peer_     = nullptr;
+            proposal_head_ids_peer_ = nullptr;
+        }
     }
 
     void set_sampling(const ops::SamplingConfig* config) noexcept { sampling_config_ = config; }
@@ -235,9 +284,46 @@ public:
                            int logits_column, Tensor* logits, Tensor* draft_token,
                            const Tensor* explicit_rope_positions = nullptr,
                            const Tensor* input_embeddings        = nullptr);
-    void mtp_forward_ar_step(const Tensor& token, const Tensor& previous_hidden,
+        void mtp_forward_ar_step(const Tensor& token, const Tensor& previous_hidden,
                              const Tensor& position, ops::CausalAttentionExecutionEnvelope envelope,
                              Tensor& mtp_hidden, Tensor& logits, Tensor& draft_token);
+
+    // --- tp == 2 entry points ------------------------------------------------------------------
+    //
+    // Every per-rank tensor is passed explicitly as an array rather than derived here, for the
+    // same reason the split output head takes both destinations: there is no single "the frame",
+    // and an undersized peer destination is an out-of-bounds write on the OTHER device that nothing
+    // local would notice. The schedule owns both frames and is the only place that can name them
+    // correctly.
+    //
+    // `ids` and the draft-token outputs stay single tensors: they belong to rank 0 alone, because
+    // rank 1's MTP stem contracts the normalized-hidden half of the fc input and never embeds a
+    // token, and the proposal leaves through rank 0's egress.
+    void target_verify_batch(const std::array<Tensor, 2>& ids,
+                             const std::array<Tensor, 2>& cache_positions,
+                             const std::array<Tensor, 2>& rope_positions,
+                             const std::array<Tensor, 2>& valid_columns,
+                             const std::array<Tensor, 2>& kv_table_rows,
+                             const std::array<Tensor, 2>& linear_state_source_slots,
+                             const std::array<Tensor, 2>& linear_state_destination_slots,
+                             ops::CausalAttentionExecutionEnvelope envelope,
+                             const std::array<Tensor, 2>& hidden,
+                             const std::array<Tensor, 2>& logits,
+                             const std::array<Tensor, 2>& target_tokens);
+    void mtp_forward_decode_batch(const Tensor& ids, const std::array<Tensor, 2>& hidden,
+                                  const std::array<Tensor, 2>& cache_positions,
+                                  const std::array<Tensor, 2>& rope_positions,
+                                  const std::array<Tensor, 2>& valid_columns,
+                                  const std::array<Tensor, 2>& kv_table_rows,
+                                  ops::CausalAttentionExecutionEnvelope envelope,
+                                  const std::array<Tensor, 2>& mtp_hidden);
+    void mtp_propose_batch(const std::array<Tensor, 2>& hidden,
+                           const std::array<Tensor, 2>& logits, Tensor& draft_tokens);
+    void mtp_forward_ar_step(const Tensor& token, const std::array<Tensor, 2>& previous_hidden,
+                             const std::array<Tensor, 2>& position,
+                             ops::CausalAttentionExecutionEnvelope envelope,
+                             const std::array<Tensor, 2>& mtp_hidden,
+                             const std::array<Tensor, 2>& logits, Tensor& draft_token);
 private:
     void bind();
 
@@ -248,8 +334,24 @@ private:
     [[nodiscard]] const MtpW& mtp_weights() const;
     void attn_mix(const FullLayerW& weights, Tensor& x, int index, Phase phase);
     void gdn_mix(const GdnLayerW& weights, Tensor& x, int index, Phase phase);
-    void mlp_tail(const Tensor* post_norm, const MlpW& weights, Tensor& x, Phase phase);
+        void mlp_tail(const Tensor* post_norm, const MlpW& weights, Tensor& x, Phase phase);
     void run_layers(Tensor& x, Phase phase);
+
+    // --- tp == 2 forward -----------------------------------------------------------------------
+    // Deliberately separate functions rather than branches inside the tp1 ones: the tp1 schedule
+    // stays byte-identical, and the split schedule reads as the linear sequence it is. The
+    // residual `x` is REPLICATED (bitwise identical on both ranks -- the reduce sums the same two
+    // BF16 partials on both sides and IEEE addition is commutative), which is what keeps every
+    // per-device GDN state and KV page in lockstep without any extra synchronization.
+    [[nodiscard]] bool tp2() const noexcept { return tp_ != nullptr; }
+    [[nodiscard]] const ExecutionContext& ec() const noexcept { return *tp_->execution; }
+    void run_layers_tp2(Tensor& x0, Tensor& x1, Phase phase);
+    void attn_mix_tp2(const FullLayerW& w0, const FullLayerW& w1, Tensor& x0, Tensor& x1, int index,
+                      Phase phase);
+    void gdn_mix_tp2(const GdnLayerW& w0, const GdnLayerW& w1, Tensor& x0, Tensor& x1, int index,
+                     Phase phase);
+    void mlp_tail_tp2(const Tensor* post_norm0, const Tensor* post_norm1, const MlpW& w0,
+                      const MlpW& w1, Tensor& x0, Tensor& x1, Phase phase);
     template <class Tap>
     void run_layers(Tensor& x, Phase phase, Tap& tap);
     template <class Tap>
@@ -325,6 +427,15 @@ private:
     Tensor* rewrite_checkpoint_hidden_output_ = nullptr;
     std::uint32_t mtp_proposal_extent_        = 0;
 
+        const TpExecution* tp_                       = nullptr;
+    const Tensor* peer_cache_positions_          = nullptr;
+    const Tensor* peer_rope_positions_           = nullptr;
+    const Tensor* peer_kv_table_rows_            = nullptr;
+    const Tensor* peer_linear_state_source_slots_    = nullptr;
+    const Tensor* peer_linear_state_destination_slots_ = nullptr;
+    const Tensor* peer_valid_columns_            = nullptr;
+    const Tensor* peer_backend_kv_table_rows_    = nullptr;
+
     const Weight* embed_                        = nullptr;
     const Tensor* final_norm_                   = nullptr;
     const Weight* lm_head_                      = nullptr;
@@ -335,6 +446,18 @@ private:
     MtpW mtp_;
     std::array<FullLayerW, TextConfig::full_attention_layers()> full_{};
     std::array<GdnLayerW, TextConfig::gdn_layers()> gdn_{};
+    // Rank 1's own shard bindings; populated only at tp == 2.
+    const Weight* embed_peer_      = nullptr;
+    const Tensor* final_norm_peer_ = nullptr;
+    const Weight* lm_head_peer_    = nullptr;
+    std::array<FullLayerW, TextConfig::full_attention_layers()> full_peer_{};
+    std::array<GdnLayerW, TextConfig::gdn_layers()> gdn_peer_{};
+    MtpW mtp_peer_{};
+    // Rank 1's own vocabulary half of the draft head plus its own device copy of the REPLICATED
+    // id map. Both are cleared together with rank 0's when the request runs on the full LM head
+    // instead (`set_proposal_head(nullptr, ...)`).
+    const Weight* proposal_head_peer_             = nullptr;
+    const std::int32_t* proposal_head_ids_peer_   = nullptr;
     std::array<Weight, TextConfig::gdn_layers()> gdn_in_a_{};
     std::array<Weight, TextConfig::gdn_layers()> gdn_in_b_{};
     std::array<Tensor, TextConfig::gdn_layers()> gdn_conv1d_views_{};
